@@ -79,10 +79,12 @@ def on_toggle_capture(on):
 
 
 def analyze_bg(msgs, title, revision, reply_to=None):
-    """后台线程只跑网络调用，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。"""
-    provider = settings.draft_provider()
-    relay = settings.relay()
+    """后台线程只跑网络调用，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。
+    读设置也放在 try 里：在外面抛的话这里什么都不往队列里丢，state["busy"] 就永远卡在 True，
+    界面一直停在「正在根据新消息整理回复…」，还看不到任何错误。"""
     try:
+        provider = settings.draft_provider()
+        relay = settings.relay()
         results.put(("ok", analyze(msgs, settings.relationship(), context=settings.context(),
                                    provider=provider, reply_to=reply_to,
                                    # 中转的模型名跟着设置走；另外两家留 None 用各自默认
@@ -105,7 +107,8 @@ def check_update_bg():
 
 def config_problem():
     """开跑之前该拦下的配置问题（返回给用户看的一句话）；配好了返回 None。
-    判断那步走哪儿决定要不要 OpenRouter key：判断走中转、中转又配好了，就不需要。"""
+    起草和判断两步各自要什么分头看：判断走中转时 OpenRouter key 不是必需的，但起草还在用
+    OpenRouter 的话它仍然必需——只看判断会放行一个「保存成功、之后每条消息都失败」的配置。"""
     provider = settings.draft_provider()
     relay = settings.relay()
     if provider == "custom":
@@ -113,8 +116,11 @@ def config_problem():
             return "选了第三方中转但没填中转地址，去设置里补上"
         if not settings.has_relay_key():
             return "选了第三方中转但没填中转密钥，去设置里补上"
-    elif provider == "deepseek" and not settings.has_deepseek_key():
-        return "选了 DeepSeek 直连但没填 DeepSeek 密钥，去设置里补上"
+    elif provider == "deepseek":
+        if not settings.has_deepseek_key():
+            return "选了 DeepSeek 直连但没填 DeepSeek 密钥，去设置里补上"
+    elif not settings.has_key():
+        return "请先在设置中配置回复服务"
     if relay["judge"]:
         if not relay["base_url"] or not settings.has_relay_key():
             return "判断走中转但中转没配好，去设置里补上"

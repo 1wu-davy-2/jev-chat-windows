@@ -214,6 +214,9 @@ def draft_candidates(messages: list, relationship: str, provider: str = "openrou
     if provider == "custom":
         if not base_url.strip():
             raise JevError("选了第三方中转但没填中转地址")
+        if not base_url.strip().startswith(("http://", "https://")):
+            # 少了 scheme 的话 urllib 抛的是 "unknown url type: ..."，看不懂也脱不了敏
+            raise JevError(f"中转地址要以 http:// 或 https:// 开头：{base_url.strip()!r}")
         url = chat_url(base_url)
         extra_fn = lambda on: thinking_extra(thinking_style, on)  # noqa: E731
     transcript = "\n".join(_line(m) for m in messages[-keep:])

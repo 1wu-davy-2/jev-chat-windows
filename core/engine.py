@@ -7,12 +7,12 @@ from __future__ import annotations
 
 try:
     from .draft import draft_candidates
-    from .jev_client import ask
+    from .jev_client import JevError, ask
     from .questions import JUDGE_QUESTIONS, build_rank_question, build_state
     from .relay import DEFAULT_JEV_MODEL, KEY_ENV as RELAY_KEY_ENV, judge_url
 except ImportError:
     from draft import draft_candidates
-    from jev_client import ask
+    from jev_client import JevError, ask
     from questions import JUDGE_QUESTIONS, build_rank_question, build_state
     from relay import DEFAULT_JEV_MODEL, KEY_ENV as RELAY_KEY_ENV, judge_url
 
@@ -43,6 +43,9 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     scores 是每条候选的胜出概率（0~1），取自 best_reply.probabilities，取不到记 0.0。
     只有对方最新说话时才有意义调它——是不是该触发由调用方判断（看 latest_from）。
     """
+    if judge_relay and not base_url.strip():
+        # 不拦的话 judge_url 会拼出个 "/api/alpha/decisions"，urllib 再抛一句看不懂的 unknown url type
+        raise JevError("判断走中转但没填中转地址")
     candidates = draft_candidates(messages, relationship, provider=provider,
                                   model=model, timeout=timeout, keep=context, reply_to=reply_to,
                                   style=style, thinking=thinking, base_url=base_url,

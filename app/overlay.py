@@ -712,14 +712,19 @@ class Overlay:
                 self._settings_feedback("选了第三方中转就得填中转地址。", error=True)
                 self.relayEdit.setFocus()
                 return
+            if not relay_base.startswith(("http://", "https://")):
+                self._settings_feedback("中转地址要以 http:// 或 https:// 开头。", error=True)
+                self.relayEdit.setFocus()
+                return
             if not relay_key and not settings.has_relay_key():
                 self._settings_feedback("选了第三方中转就得填中转密钥。", error=True)
                 self.relayKeyEdit.setFocus()
                 return
-        # 判断走中转且中转配好了，OpenRouter key 就不是必需的
-        if not key and not settings.has_key() and not (judge_relay and relay_base
-                                                       and (relay_key or settings.has_relay_key())):
-            self._settings_feedback("请先填写 OpenRouter API 密钥（判断和排序默认走它）。", error=True)
+        # OpenRouter key 什么时候必需：起草还在用它，或者判断没走中转。
+        # 只判「判断走中转」会漏掉「起草=OpenRouter + 判断=中转」这种组合——那样保存得下去，
+        # 但之后每次分析都栽在起草拿不到 key 上。
+        if not key and not settings.has_key() and (provider == "openrouter" or not judge_relay):
+            self._settings_feedback("请先填写 OpenRouter API 密钥（起草或判断还在用它）。", error=True)
             self.keyEdit.setFocus()
             return
         if provider == "deepseek" and not deepseek_key and not settings.has_deepseek_key():

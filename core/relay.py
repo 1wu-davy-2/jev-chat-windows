@@ -52,9 +52,18 @@ def chat_url(base: str) -> str:
     return root(base) + "/v1/chat/completions"
 
 
+def site_root(base: str) -> str:
+    """站点根：root 再去掉尾部的 /api。默认判断路径本身就带 /api，base 里也有的话会叠成 /api/api。"""
+    r = root(base)
+    return r[:-4] if r.endswith("/api") else r
+
+
 def judge_url(base: str, path: str = "") -> str:
-    """判断/排序的口 = 站点根 + 路径。path 留空用 OpenRouter 那个默认；少写开头的斜杠也认。"""
-    p = (path or "").strip() or DEFAULT_JUDGE_PATH
+    """判断/排序的口 = 站点根 + 路径。path 留空用 OpenRouter 那个默认；少写开头的斜杠也认。
+    默认路径按站点根拼（它自带 /api），用户自己填的路径按 API 根拼（他多半是照着报错原文抄的）。"""
+    p = (path or "").strip()
+    if not p:
+        return site_root(base) + DEFAULT_JUDGE_PATH
     return root(base) + (p if p.startswith("/") else "/" + p)
 
 
@@ -65,8 +74,12 @@ if __name__ == "__main__":
         assert chat_url(b) == "https://api.x.com/v1/chat/completions", b
         assert judge_url(b) == "https://api.x.com/api/alpha/decisions", b
     assert chat_url("https://x.com/api/v1") == "https://x.com/api/v1/chat/completions"
-    # base 自带 /api 前缀的，前缀算它 API 根的一部分，保留
+    # base 自带 /api 前缀的：用户自己填的路径按 API 根拼，保留那个前缀
     assert judge_url("https://x.com/api/v1", "/v1/systemone") == "https://x.com/api/v1/systemone"
     assert judge_url("https://x.com", "v1/systemone") == "https://x.com/v1/systemone"  # 少个斜杠也认
+    # 但默认路径（自带 /api）不能叠成 /api/api
+    assert judge_url("https://x.com/api/v1") == "https://x.com/api/alpha/decisions"
+    assert judge_url("https://x.com/api") == "https://x.com/api/alpha/decisions"
+    assert judge_url("https://x.com") == "https://x.com/api/alpha/decisions"
     assert chat_url("") == "/v1/chat/completions"  # 空 base 由调用方拦住，这里只保证不炸
     print("core/relay.py 自测通过")

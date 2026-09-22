@@ -23,38 +23,35 @@ _ENV = "OPENROUTER_API_KEY"
 _DEEPSEEK_ENV = "DEEPSEEK_API_KEY"
 _PROVIDERS = ("openrouter", "deepseek", "custom")  # custom = 第三方中转，地址和模型名自填
 
-def relationship() -> str:
-    """每次都重新读文件，改设置不用重启进程。"""
+def _read() -> dict:
+    """每次都重新读文件，改设置不用重启进程。读不到 / 坏了 / 根本不是个对象（手改成了数组、数字之类）
+    一律当空配置——configured() 在启动路径上，这里崩了整个界面都出不来。"""
     try:
         with open(_CONFIG, encoding="utf-8") as f:
-            return json.load(f).get("relationship") or _DEFAULT_RELATIONSHIP
+            d = json.load(f)
     except (OSError, ValueError):
-        return _DEFAULT_RELATIONSHIP
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def relationship() -> str:
+    return _read().get("relationship") or _DEFAULT_RELATIONSHIP
 
 def context() -> int:
     """参考上下文条数：起草和判断各看最近多少条消息。3~30，缺失/脏数据一律退默认值。"""
     try:
-        with open(_CONFIG, encoding="utf-8") as f:
-            n = int(json.load(f).get("context", _DEFAULT_CONTEXT))
-    except (OSError, ValueError, TypeError):
+        n = int(_read().get("context", _DEFAULT_CONTEXT))
+    except (TypeError, ValueError):
         return _DEFAULT_CONTEXT
     return max(3, min(30, n))
 
 def style() -> str:
     """用户自己描述的说话风格（可选，自由文本），只喂给起草模型。默认空 = 只照着最近的消息模仿。"""
-    try:
-        with open(_CONFIG, encoding="utf-8") as f:
-            return str(json.load(f).get("style") or "")
-    except (OSError, ValueError):
-        return ""
+    return str(_read().get("style") or "")
 
 def draft_provider() -> str:
     """起草走哪家：openrouter（默认）、deepseek 直连、custom 第三方中转。判断/排序默认仍走 OpenRouter。"""
-    try:
-        with open(_CONFIG, encoding="utf-8") as f:
-            v = json.load(f).get("draft_provider")
-    except (OSError, ValueError):
-        return _PROVIDERS[0]
+    v = _read().get("draft_provider")
     return v if v in _PROVIDERS else _PROVIDERS[0]
 
 def relay() -> dict:
@@ -64,11 +61,7 @@ def relay() -> dict:
     judge: 判断/排序也走中转（默认关）——中转转不转那个专用口得实测，没验过就开着会直接报错
     judge_path: 那个口的路径，各家叫法不同（默认 OpenRouter 的 /api/alpha/decisions）
     thinking_style: 思考开关带哪个字段（thinking / reasoning / none），选错了思考关不掉"""
-    try:
-        with open(_CONFIG, encoding="utf-8") as f:
-            d = json.load(f)
-    except (OSError, ValueError):
-        d = {}
+    d = _read()
     style = str(d.get("relay_thinking_style") or DEFAULT_THINKING_STYLE).strip()
     return {"base_url": str(d.get("relay_base_url") or "").strip(),
             "thinking_style": style if style in THINKING_STYLES else DEFAULT_THINKING_STYLE,
@@ -79,37 +72,33 @@ def relay() -> dict:
 
 
 def configured() -> bool:
-    """回复服务配好了没——判断那步跑得起来就算配好。判断走中转时 OpenRouter key 就不是必需的，
+    """回复服务配好了没：**起草那步和判断那步各自要的东西都齐了**才算配好。
+    判断走中转时 OpenRouter key 不是必需的——但起草要是还在用 OpenRouter，它照样必需，
+    所以这里两边都得看（只看判断会放行一个「保存成功、之后每条消息都失败」的配置）。
     界面上「先设置，再开始」和开跑前的拦截都按这个判。"""
     r = relay()
-    if r["judge"]:
-        return bool(r["base_url"]) and has_relay_key()
-    return has_key()
+    provider = draft_provider()
+    if provider == "custom":
+        draft_ok = bool(r["base_url"]) and has_relay_key()
+    elif provider == "deepseek":
+        draft_ok = has_deepseek_key()
+    else:
+        draft_ok = has_key()
+    judge_ok = (bool(r["base_url"]) and has_relay_key()) if r["judge"] else has_key()
+    return draft_ok and judge_ok
 
 
 def reply_target() -> bool:
     """群聊指定回复对象：开了才在界面上选回复给谁、才把对象喂给模型。默认关。"""
-    try:
-        with open(_CONFIG, encoding="utf-8") as f:
-            return bool(json.load(f).get("reply_target", False))
-    except (OSError, ValueError):
-        return False
+    return bool(_read().get("reply_target", False))
 
 def thinking() -> bool:
     """起草时是否开思考模式：慢且贵，默认关。两个来源（OpenRouter/DeepSeek）都吃这个开关。"""
-    try:
-        with open(_CONFIG, encoding="utf-8") as f:
-            return bool(json.load(f).get("thinking", False))
-    except (OSError, ValueError):
-        return False
+    return bool(_read().get("thinking", False))
 
 def check_update() -> bool:
     """启动时要不要去 GitHub 查一次最新版本号：默认开，只出这一次网，设置里能关。"""
-    try:
-        with open(_CONFIG, encoding="utf-8") as f:
-            return bool(json.load(f).get("check_update", True))
-    except (OSError, ValueError):
-        return True
+    return bool(_read().get("check_update", True))
 
 def _get_key(env_name: str) -> str:
     """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。"""
