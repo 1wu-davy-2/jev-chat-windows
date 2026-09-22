@@ -80,10 +80,17 @@ def on_toggle_capture(on):
 
 def analyze_bg(msgs, title, revision, reply_to=None):
     """后台线程只跑网络调用，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。"""
+    provider = settings.draft_provider()
+    relay = settings.relay()
     try:
         results.put(("ok", analyze(msgs, settings.relationship(), context=settings.context(),
-                                   provider=settings.draft_provider(), reply_to=reply_to,
-                                   style=settings.style(), thinking=settings.thinking()),
+                                   provider=provider, reply_to=reply_to,
+                                   # 中转的模型名跟着设置走；另外两家留 None 用各自默认
+                                   model=relay["draft_model"] if provider == "custom" else None,
+                                   style=settings.style(), thinking=settings.thinking(),
+                                   base_url=relay["base_url"], judge_relay=relay["judge"],
+                                   judge_model=relay["jev_model"], judge_path=relay["judge_path"],
+                                   thinking_style=relay["thinking_style"]),
                      title, revision))
     except Exception as e:
         results.put(("err", f"分析失败: {e}", title, revision))
@@ -96,12 +103,30 @@ def check_update_bg():
         update_result.put(r)
 
 
+def config_problem():
+    """开跑之前该拦下的配置问题（返回给用户看的一句话）；配好了返回 None。
+    判断那步走哪儿决定要不要 OpenRouter key：判断走中转、中转又配好了，就不需要。"""
+    provider = settings.draft_provider()
+    relay = settings.relay()
+    if provider == "custom":
+        if not relay["base_url"]:
+            return "选了第三方中转但没填中转地址，去设置里补上"
+        if not settings.has_relay_key():
+            return "选了第三方中转但没填中转密钥，去设置里补上"
+    elif provider == "deepseek" and not settings.has_deepseek_key():
+        return "选了 DeepSeek 直连但没填 DeepSeek 密钥，去设置里补上"
+    if relay["judge"]:
+        if not relay["base_url"] or not settings.has_relay_key():
+            return "判断走中转但中转没配好，去设置里补上"
+    elif not settings.has_key():
+        return "请先在设置中配置回复服务"
+    return None
+
+
 def start_analyze(title, msgs):
-    if not settings.has_key():
-        ov.set_status("请先在设置中配置回复服务", "warning")
-        return
-    if settings.draft_provider() == "deepseek" and not settings.has_deepseek_key():
-        ov.set_status("选了 DeepSeek 直连但没填 DeepSeek 密钥，去设置里补上", "warning")
+    problem = config_problem()
+    if problem:
+        ov.set_status(problem, "warning")
         return
     state["busy"] = True
     ov.set_busy(True)
@@ -238,7 +263,7 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     else:
         capture_on.set()
         child = spawn_worker()
-    if not settings.has_key():
+    if not settings.configured():
         ov.set_status("请先在设置中配置回复服务", "warning")
         ov.after(0, ov.open_settings)
     if settings.check_update() and update.parse_version(VERSION):  # 开发版没有版本号，不查也不烦源码用户

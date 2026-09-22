@@ -11,7 +11,7 @@ hiddenimports = [
     # 父进程这边 engine 也是运行时才走到，一并钉死，别指望静态分析都能扫出来
     "app.worker", "app.capture", "app.ocr", "app.fill", "app.overlay", "app.settings",
     "app.version", "app.update",
-    "core.engine", "core.draft", "core.jev_client", "core.questions",
+    "core.engine", "core.draft", "core.jev_client", "core.questions", "core.relay",
 ]
 datas, binaries = [], []
 for pkg in (

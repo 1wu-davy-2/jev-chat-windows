@@ -41,6 +41,29 @@ DeepSeek 官方 API（`api.deepseek.com`）国内直连，起草基本就是一�
 
 Jev 判断那一步仍然走 OpenRouter，它比起草轻得多，慢一点无所谓。两个 key 都只进注册表，不落文件。
 
+**还可以用第三方中转**
+
+设置页「起草模型来源」里还有一项 **第三方中转**：填中转商给的地址、密钥、以及中转那边的模型名
+（默认 `deepseek-flash`），起草就走它。地址写法不挑，`https://api.xxx.com`、
+`https://api.xxx.com/v1`、连 `/chat/completions` 一起粘进去都认。
+
+中转想连**判断**也一起接管，得看它有没有自己的判断接口——判断走的不是标准的
+`/v1/chat/completions`，OpenRouter 官方是 `/api/alpha/decisions`，各家中转叫法不同
+（PackyCode 的 typesafe 通道是 `/v1/systemone`）。路径不对会回 404 或者
+「only supports ... protocol」，报错里会写它认哪个口，照着填进「判断接口路径」。
+`probe/probe_relay.py` 会挨个路径自动试：
+
+```powershell
+$env:RELAY_BASE_URL="https://api.xxx.com"; $env:RELAY_API_KEY="sk-..."
+$env:PYTHONPATH="."; python probe/probe_relay.py
+```
+
+还有一个坑：中转的模型可能**默认开着思考模式**，三句话的候选用不上，还慢还贵。
+关它的字段各家也不一样（DeepSeek 官方是 `thinking.type=disabled`，OpenRouter 是
+`reasoning.enabled=false`），传错派系**不会报错、只会被无视**——表现为思考照开、
+`max_tokens` 全被推理吃掉，起草回来是空的。设置里「思考开关的传法」就是选这个的，
+选错了的症状是状态栏报「起草结果解析不出候选」。
+
 **日常怎么用**
 
 - 微信开着、别最小化（用别的窗口盖住没事），把要聊的会话点开
@@ -100,14 +123,16 @@ Jev 判断那一步仍然走 OpenRouter，它比起草轻得多，慢一点无�
 - **不碰钱。** 转账、红包、收款相关的界面元素一律不碰，起草的 system prompt 里也禁了这几个话题。
 - **只有对方的新消息到来（或你在群里换了回复对象）才调一次模型。** 静默期零调用——十分钟没人说话
   就是十分钟零 token。
-- **API key 只进环境变量。** `OPENROUTER_API_KEY` 和（选了 DeepSeek 直连才要的）`DEEPSEEK_API_KEY`
-  都写进注册表 `HKCU\Environment`（跟 `setx` 同一个地方），任何文件里都不出现 key，也绝不进日志
-  （报错文本一律脱敏）。
+- **API key 只进环境变量。** `OPENROUTER_API_KEY`、`DEEPSEEK_API_KEY`（选了直连才要）、
+  `RELAY_API_KEY`（选了中转才要）都写进注册表 `HKCU\Environment`（跟 `setx` 同一个地方），
+  任何文件里都不出现 key，也绝不进日志（报错文本一律脱敏）。
 - **启动时查一次版本号（可关）。** 只向 GitHub Releases API 发一个 GET，带的只有 UA 和当前版本号，
   不夹带任何聊天内容；设置里「启动时检查更新」关掉就完全不发这个请求，源码直接跑（没有版本号）也
   不会发。
 
 什么会出网：`core/` 那两次调用（起草 + 判断/排序），加上启动时（可关）一次到 GitHub 查版本号。
+选了第三方中转的话，这两次调用是发到你填的那个中转地址，不是 OpenRouter / DeepSeek 官方——
+发出去的内容一字不差还是下面那些，但收件方换成了中转商，这一点自己掂量。
 `core/` 送出去的是**最近 N 条对话文本**（N = 设置里的「参考上下文」，默认 10；群聊带发言人名）、
 **关系设置**、**你自己最近 12 条 60 字以内的短消息**（当口吻样本，链接和长段不送）、**你填的说话
 风格**，群聊指定了回复对象的话再加一个对象名。除此之外没有别的。OCR 全程离线。
@@ -134,9 +159,12 @@ WGC 截微信窗口（GPU 合成窗口也能截，被遮挡也能截）
 | --- | --- | --- | --- |
 | 起草 3 条候选 | OpenRouter（默认） | `deepseek/deepseek-v4.1-flash` | `OPENROUTER_API_KEY` |
 | 起草 3 条候选 | DeepSeek 直连（更快，可选） | `deepseek-flash`（DeepSeek-V4.1-Flash） | `DEEPSEEK_API_KEY` |
+| 起草 3 条候选 | 第三方中转（可选） | 自填，默认 `deepseek-flash` | `RELAY_API_KEY` |
 | 判断 + 排序 | OpenRouter（`/api/alpha/decisions`） | `typesafe/jev-1.13` | `OPENROUTER_API_KEY` |
+| 判断 + 排序 | 第三方中转（可选，得中转支持那个口） | 自填，默认 `jev-latest` | `RELAY_API_KEY` |
 
-起草走哪家在设置里选；判断和排序永远走 OpenRouter，所以 OpenRouter key 必填。起草是**盲起草**——不把
+起草走哪家在设置里选；判断和排序默认走 OpenRouter，所以 OpenRouter key 默认必填——把「判断也走中转」
+打开并且中转配好了，才可以不填。起草是**盲起草**——不把
 Jev 的判断喂给它，让它自己读对话；7 道判断题加一道「哪条候选最合适」一次问完，概率就是卡片上的百分比。
 温度 1.2，`max_tokens` 400；思考模式默认关，开了会带上思考开关、`max_tokens` 提到 4000（DeepSeek 把
 思考过程也算进去，400 会把答案截断）。模型只给出 1~2 条时会带着它的回答追问一次补齐，还不够就按实际
@@ -215,8 +243,15 @@ pyinstaller --noconfirm --clean jev.spec
 | 参考上下文 | 起草和判断各看最近多少条消息，3~30 | `config.json` → `context`（默认 10） |
 | 群聊指定回复对象 | 开了群聊里才有「回复对象」那一行，候选针对 TA 写 | `config.json` → `reply_target`（默认关） |
 | OpenRouter API 密钥 | 判断和排序必用；起草默认也用它。已配置时留空 = 保留 | 注册表 `HKCU\Environment` → `OPENROUTER_API_KEY` |
-| 起草模型来源 | OpenRouter 还是 DeepSeek 直连 | `config.json` → `draft_provider`（`openrouter` / `deepseek`） |
+| 起草模型来源 | OpenRouter、DeepSeek 直连，还是第三方中转 | `config.json` → `draft_provider`（`openrouter` / `deepseek` / `custom`） |
 | DeepSeek API 密钥 | 只在选了直连时出现，也只有起草用它 | 注册表 `HKCU\Environment` → `DEEPSEEK_API_KEY` |
+| 中转地址 | 只在选了中转时出现。带不带 `/v1`、带不带 `/chat/completions` 都认 | `config.json` → `relay_base_url` |
+| 中转密钥 | 只在选了中转时出现，起草（和选了「判断也走中转」时的判断）用它 | 注册表 `HKCU\Environment` → `RELAY_API_KEY` |
+| 中转上的起草模型名 | 中转商那边的模型名，不一定跟官方同名。留空用 `deepseek-flash` | `config.json` → `relay_draft_model` |
+| 判断也走中转 | 默认关。中转得有自己的判断接口，判断才能走它 | `config.json` → `relay_judge`（默认关） |
+| 中转上的判断模型名 | 判断走中转时用它，留空用 `jev-latest` | `config.json` → `relay_jev_model` |
+| 判断接口路径 | 各家中转叫法不同。留空用 `/api/alpha/decisions` | `config.json` → `relay_judge_path` |
+| 思考开关的传法 | `thinking`（DeepSeek 式，多数中转）/ `reasoning`（OpenRouter 式）/ 不传 | `config.json` → `relay_thinking_style` |
 | 起草时开启思考模式 | 开了模型先想再写，慢好几倍、贵一些；两种来源都生效 | `config.json` → `thinking`（默认关） |
 | 启动时检查更新 | 开了才在启动时查一次 GitHub 最新版本号，有新版本就在标题栏下面提示 | `config.json` → `check_update`（默认开） |
 
@@ -260,7 +295,8 @@ core/                   Jev 判断内核，平台无关，跟安卓原版同一�
   engine.py             唯一入口 analyze(messages, relationship) → 候选 + 排序 + 判断
   jev_client.py         Jev 判断 API 客户端（stdlib、脱敏、429/529 退避）
   questions.py          7 道判断题 + build_state() + build_rank_question()
-  draft.py              起草 3 条候选（OpenRouter / DeepSeek 直连）
+  draft.py              起草 3 条候选（OpenRouter / DeepSeek 直连 / 第三方中转）
+  relay.py              第三方中转地址归一化（各家写法不统一）+ 默认模型名
 tools/
   demo.py               端到端冒烟：拿一段写死的对话跑完整链（需 key + 联网）
   preview_ui.py         用合成数据预览界面，不采集不联网不碰微信；可 --screenshot 出图
@@ -276,6 +312,7 @@ probe/                  一次性探针，结论已写进本文，留着是为�
   probe_laya.py         Laya（开源本地决策模型）能不能替 Jev：英文题跑 multilingual / typed-decisions → 都接近随机
   probe_laya_cn.py      同上，中文题问 multilingual → 更差
   probe_laya_en.py      把对话人工译成英文再喂 typed-decisions → 好一点，但生气那段仍判成闲聊
+  probe_relay.py        第三方中转能不能替掉官方：起草口 / alpha decisions 口 / jev 当普通 chat 模型
 jev.spec                PyInstaller 打包定义（onedir），build.bat 和 CI 共用这一份
 build.bat               本地一键打包（双击就行）
 .github/workflows/release.yml  推 v* tag → windows-latest 上打包 → zip 挂到 Release

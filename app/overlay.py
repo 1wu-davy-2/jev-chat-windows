@@ -18,6 +18,7 @@ from qfluentwidgets import (
 
 from app import settings
 from app.version import VERSION
+from core.relay import DEFAULT_DRAFT_MODEL, DEFAULT_JEV_MODEL, DEFAULT_JUDGE_PATH
 
 _LOG_LINES = 300
 _MUTED = "#68776f"
@@ -43,6 +44,8 @@ _RELATIONSHIPS = [
     ("恋人", "romantic partners"), ("朋友", "friends"), ("同事", "colleagues"),
     ("家人", "family"), ("自定义", None),
 ]
+_PROVIDER_ORDER = ("openrouter", "deepseek", "custom")  # providerBox 的索引 → 设置里的值
+_THINK_STYLES = ("thinking", "reasoning", "none")       # relayThinkBox 的索引 → core/relay.py 的键
 
 
 def _choice(answers, name):
@@ -250,8 +253,8 @@ class Overlay:
         self.win.resize(min(440, screen.width() - 32), min(820, screen.height() - 48))
         self.win.move(screen.right() - self.win.width() - 20, screen.top() + 24)
         self._relayout(self.win.width(), self.win.height())  # resizeEvent 补不到构造时这一次
-        self.set_status("等待新消息" if settings.has_key() else "需要配置回复服务",
-                        "idle" if settings.has_key() else "warning")
+        self.set_status("等待新消息" if settings.configured() else "需要配置回复服务",
+                        "idle" if settings.configured() else "warning")
         self.win.show()
 
     def _scroll_page(self):
@@ -288,7 +291,7 @@ class Overlay:
         for label in self._hintLabels:
             label.setVisible(not compact)
         self.referenceNote.setVisible(bool(self.cands) and not compact)
-        self._sync_ds_fields()
+        self._sync_provider_fields()
         margins = (12, 8, 12, 12) if compact else (20, 8, 20, 12)
         for layout in self._pageLayouts:
             layout.setContentsMargins(*margins)
@@ -390,9 +393,9 @@ class Overlay:
         empty_box.addWidget(self.emptyHint)
         self.setupButton = PrimaryPushButton("前往设置")
         self.setupButton.clicked.connect(self.open_settings)
-        self.setupButton.setVisible(not settings.has_key())
+        self.setupButton.setVisible(not settings.configured())
         empty_box.addWidget(self.setupButton, 0, Qt.AlignHCenter)
-        if not settings.has_key():
+        if not settings.configured():
             self.emptyTitle.setText("先设置，再开始")
             self.emptyHint.setText("配置回复服务和关系背景，\n让建议更贴近你们的对话。")
         body.addWidget(self.empty)
@@ -504,13 +507,15 @@ class Overlay:
         key_label.setBuddy(self.keyEdit)
         self.keyEdit.returnPressed.connect(self._save)
         box.addWidget(self.keyEdit)
-        box.addWidget(self._hint("Jev 判断和排序走 OpenRouter，必填。起草也可以走它。"))
+        box.addWidget(self._hint("Jev 判断和排序默认走 OpenRouter，起草也可以走它。"
+                                 "下面选了「判断也走中转」并且中转配好了，这个才可以不填。"))
         provider_label = _label("起草模型来源", 13)
         box.addWidget(provider_label)
         self.providerBox = ComboBox()
         self.providerBox.setMinimumWidth(0)  # 选项文字很长，别让它撑开设置页
         self.providerBox.addItems(["OpenRouter（DeepSeek V4.1 Flash，用上面同一个 key）",
-                                   "DeepSeek 直连（更快，需要 DeepSeek key）"])
+                                   "DeepSeek 直连（更快，需要 DeepSeek key）",
+                                   "第三方中转（自填地址和模型名，需要中转 key）"])
         self.providerBox.setAccessibleName("起草模型来源")
         provider_label.setBuddy(self.providerBox)
         box.addWidget(self.providerBox)
@@ -530,7 +535,76 @@ class Overlay:
         box.addWidget(self.dsHint)
         # 只有选了直连才显示这一组；dsHint 额外还要看紧凑模式，单独存，不进 _hintLabels
         self._dsWidgets = (ds_label, self.dsKeyState, self.dsKeyEdit)
-        self.providerBox.currentIndexChanged.connect(lambda index: self._sync_ds_fields())
+        # 第三方中转那一组：同样只在选了中转时显示。这里所有标签都不能走 self._hint()——
+        # _apply_compact 会把 _hintLabels 里的东西无脑 setVisible(True)，把这一组又显出来。
+        relay_label = _label("中转地址", 13)
+        relay_head = QHBoxLayout()
+        relay_head.addWidget(relay_label, 1)
+        self.relayKeyState = _label("", 12, _GREEN)
+        self.relayKeyState.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        relay_head.addWidget(self.relayKeyState)
+        box.addLayout(relay_head)
+        self.relayEdit = LineEdit()
+        self.relayEdit.setPlaceholderText("例如：https://api.example.com/v1")
+        self.relayEdit.setAccessibleName("第三方中转地址")
+        relay_label.setBuddy(self.relayEdit)
+        box.addWidget(self.relayEdit)
+        self.relayKeyEdit = PasswordLineEdit()
+        self.relayKeyEdit.setPlaceholderText("中转站的 API key")
+        self.relayKeyEdit.setAccessibleName("第三方中转密钥")
+        self.relayKeyEdit.returnPressed.connect(self._save)
+        box.addWidget(self.relayKeyEdit)
+        draft_model_label = _label("中转上的起草模型名", 13)
+        box.addWidget(draft_model_label)
+        self.relayDraftEdit = LineEdit()
+        self.relayDraftEdit.setPlaceholderText(f"留空用 {DEFAULT_DRAFT_MODEL}")
+        self.relayDraftEdit.setAccessibleName("中转上的起草模型名")
+        draft_model_label.setBuddy(self.relayDraftEdit)
+        box.addWidget(self.relayDraftEdit)
+        judge_label = _label("判断也走中转", 13)
+        judge_row = QHBoxLayout()
+        judge_row.addWidget(judge_label, 1)
+        self.relayJudgeSwitch = SwitchButton()
+        self.relayJudgeSwitch.setOnText("开")
+        self.relayJudgeSwitch.setOffText("关")
+        self.relayJudgeSwitch.setAccessibleName("判断也走中转")
+        judge_row.addWidget(self.relayJudgeSwitch)
+        box.addLayout(judge_row)
+        jev_model_label = _label("中转上的判断模型名", 13)
+        box.addWidget(jev_model_label)
+        self.relayJevEdit = LineEdit()
+        self.relayJevEdit.setPlaceholderText(f"留空用 {DEFAULT_JEV_MODEL}")
+        self.relayJevEdit.setAccessibleName("中转上的判断模型名")
+        jev_model_label.setBuddy(self.relayJevEdit)
+        box.addWidget(self.relayJevEdit)
+        path_label = _label("判断接口路径", 13)
+        box.addWidget(path_label)
+        self.relayPathEdit = LineEdit()
+        self.relayPathEdit.setPlaceholderText(f"留空用 {DEFAULT_JUDGE_PATH}")
+        self.relayPathEdit.setAccessibleName("判断接口路径")
+        path_label.setBuddy(self.relayPathEdit)
+        box.addWidget(self.relayPathEdit)
+        think_label = _label("思考开关的传法", 13)
+        box.addWidget(think_label)
+        self.relayThinkBox = ComboBox()
+        self.relayThinkBox.setMinimumWidth(0)
+        self.relayThinkBox.addItems(["DeepSeek 式 thinking（多数中转）",
+                                     "OpenRouter 式 reasoning", "不传"])
+        self.relayThinkBox.setAccessibleName("思考开关的传法")
+        think_label.setBuddy(self.relayThinkBox)
+        box.addWidget(self.relayThinkBox)
+        self.relayHint = _label(
+            "判断那一步各家中转的接口路径不一样：OpenRouter 是 /api/alpha/decisions，"
+            "有的中转是 /v1/systemone。路径不对会回 404 或者「only supports ... protocol」，"
+            "报错里会写它认哪个口，照着填。probe/probe_relay.py 可以自动试。\n"
+            "思考开关选错了不会报错，但思考关不掉——token 全被 reasoning 吃掉，"
+            "表现为「起草结果解析不出候选」。", 12, _MUTED)
+        box.addWidget(self.relayHint)
+        self._relayWidgets = (relay_label, self.relayKeyState, self.relayEdit, self.relayKeyEdit,
+                              draft_model_label, self.relayDraftEdit, judge_label,
+                              self.relayJudgeSwitch, jev_model_label, self.relayJevEdit,
+                              path_label, self.relayPathEdit, think_label, self.relayThinkBox)
+        self.providerBox.currentIndexChanged.connect(lambda index: self._sync_provider_fields())
         think_row = QHBoxLayout()
         think_row.addWidget(_label("起草时开启思考模式", 13), 1)
         self.thinkingSwitch = SwitchButton()
@@ -565,15 +639,19 @@ class Overlay:
         self._hintLabels.append(label)
         return label
 
-    def _sync_ds_fields(self):
-        """DeepSeek 那组字段：选了直连才显示；说明文字紧凑模式下再多加一条限制。
+    def _sync_provider_fields(self):
+        """回复服务那两组字段：DeepSeek 直连的 key、第三方中转那一组，按 providerBox 的选择显隐；
+        说明文字紧凑模式下再多加一条限制。
         顺带把 providerBox 按钮上的文字按紧凑模式省略——它是 QPushButton，
         minimumSizeHint 跟 sizeHint 一样是按整段文字算的，不会自动换行/省略，
         选项文字很长（"OpenRouter（DeepSeek V4.1 Flash，用上面同一个 key）"）时会把设置页撑宽。"""
-        deepseek = self.providerBox.currentIndex() == 1
+        index = self.providerBox.currentIndex()
         for w in self._dsWidgets:
-            w.setVisible(deepseek)
-        self.dsHint.setVisible(deepseek and not self._compact)
+            w.setVisible(index == 1)
+        self.dsHint.setVisible(index == 1 and not self._compact)
+        for w in self._relayWidgets:
+            w.setVisible(index == 2)
+        self.relayHint.setVisible(index == 2 and not self._compact)
         full = self.providerBox.currentText()
         if self._compact:
             full = self.providerBox.fontMetrics().elidedText(full, Qt.ElideRight, 200)
@@ -592,29 +670,56 @@ class Overlay:
         self.keyEdit.clear()
         self.keyEdit.setPlaceholderText("已配置，留空保留" if settings.has_key() else "输入你的 API 密钥")
         self.keyState.setText("已配置" if settings.has_key() else "未配置")
-        deepseek = settings.draft_provider() == "deepseek"
-        self.providerBox.setCurrentIndex(1 if deepseek else 0)
+        provider = settings.draft_provider()
+        self.providerBox.setCurrentIndex(max(0, _PROVIDER_ORDER.index(provider))
+                                         if provider in _PROVIDER_ORDER else 0)
         self.dsKeyEdit.clear()
         self.dsKeyEdit.setPlaceholderText(
             "已配置，留空保留" if settings.has_deepseek_key() else "输入你的 DeepSeek 密钥")
         self.dsKeyState.setText("已配置" if settings.has_deepseek_key() else "未配置")
+        relay = settings.relay()
+        self.relayEdit.setText(relay["base_url"])
+        self.relayDraftEdit.setText(relay["draft_model"])
+        self.relayJevEdit.setText(relay["jev_model"])
+        self.relayPathEdit.setText(relay["judge_path"])
+        self.relayThinkBox.setCurrentIndex(_THINK_STYLES.index(relay["thinking_style"])
+                                           if relay["thinking_style"] in _THINK_STYLES else 0)
+        self.relayJudgeSwitch.setChecked(relay["judge"])
+        self.relayKeyEdit.clear()
+        self.relayKeyEdit.setPlaceholderText(
+            "已配置，留空保留" if settings.has_relay_key() else "输入中转站的 API key")
+        self.relayKeyState.setText("已配置" if settings.has_relay_key() else "未配置")
         self.thinkingSwitch.setChecked(settings.thinking())
         self.updateSwitch.setChecked(settings.check_update())
-        self._sync_ds_fields()  # setCurrentIndex 没变就不发信号，这里补一次
+        self._sync_provider_fields()  # setCurrentIndex 没变就不发信号，这里补一次
         self.settingsFeedback.hide()
 
     def _save(self):
         relationship = _RELATIONSHIPS[self.relationshipBox.currentIndex()][1]
         relationship = relationship or self.relEdit.text().strip()
         key = self.keyEdit.text().strip()
-        provider = "deepseek" if self.providerBox.currentIndex() == 1 else "openrouter"
+        provider = _PROVIDER_ORDER[max(0, self.providerBox.currentIndex())]
         deepseek_key = self.dsKeyEdit.text().strip()
+        relay_key = self.relayKeyEdit.text().strip()
+        relay_base = self.relayEdit.text().strip()
+        judge_relay = self.relayJudgeSwitch.isChecked()
         if not relationship:
             self._settings_feedback("请填写关系背景，或选择一个已有选项。", error=True)
             self.relEdit.setFocus()
             return
-        if not key and not settings.has_key():
-            self._settings_feedback("请先填写 OpenRouter API 密钥。", error=True)
+        if provider == "custom":
+            if not relay_base:
+                self._settings_feedback("选了第三方中转就得填中转地址。", error=True)
+                self.relayEdit.setFocus()
+                return
+            if not relay_key and not settings.has_relay_key():
+                self._settings_feedback("选了第三方中转就得填中转密钥。", error=True)
+                self.relayKeyEdit.setFocus()
+                return
+        # 判断走中转且中转配好了，OpenRouter key 就不是必需的
+        if not key and not settings.has_key() and not (judge_relay and relay_base
+                                                       and (relay_key or settings.has_relay_key())):
+            self._settings_feedback("请先填写 OpenRouter API 密钥（判断和排序默认走它）。", error=True)
             self.keyEdit.setFocus()
             return
         if provider == "deepseek" and not deepseek_key and not settings.has_deepseek_key():
@@ -627,7 +732,13 @@ class Overlay:
                           reply_target_on=self.targetSwitch.isChecked(),
                           style_text=self.styleEdit.text().strip(),
                           thinking_on=self.thinkingSwitch.isChecked(),
-                          check_update_on=self.updateSwitch.isChecked())
+                          check_update_on=self.updateSwitch.isChecked(),
+                          relay_key_text=relay_key or None, relay_base_url=relay_base,
+                          relay_draft_model=self.relayDraftEdit.text().strip(),
+                          relay_jev_model=self.relayJevEdit.text().strip(),
+                          judge_relay_on=judge_relay,
+                          relay_judge_path=self.relayPathEdit.text().strip(),
+                          relay_thinking_style=_THINK_STYLES[max(0, self.relayThinkBox.currentIndex())])
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return
@@ -651,7 +762,7 @@ class Overlay:
             self._load_settings()
         self.pages.setCurrentWidget(self.settingsPage)
         self.settingsButton.setEnabled(False)
-        (self.relationshipBox if settings.has_key() else self.keyEdit).setFocus()
+        (self.relationshipBox if settings.configured() else self.keyEdit).setFocus()
 
     def _back_home(self):
         self.keyEdit.clear()
@@ -700,7 +811,7 @@ class Overlay:
 
     def _capture_text(self, on, reason=""):
         """开关状态对应的状态行和空态文案。已有的候选不受影响，暂停了照样能填入/复制。"""
-        configured = settings.has_key()
+        configured = settings.configured()
         if not on:
             self.set_status(reason or "采集已暂停，微信内容不再读取", "warning")
         elif configured:
@@ -736,7 +847,7 @@ class Overlay:
 
     def _empty_text(self):
         """空态卡片的默认文案，配好没配好两套说法。"""
-        configured = settings.has_key()
+        configured = settings.configured()
         self.emptyTitle.setText("等待对方的新消息" if configured else "先设置，再开始")
         self.emptyHint.setText("保持微信聊天窗口打开。\n收到新消息后，回复建议会出现在这里。"
                                if configured else "配置回复服务和关系背景，\n让建议更贴近你们的对话。")
@@ -761,7 +872,7 @@ class Overlay:
         if kind == "error" and not self.cands:
             self.emptyTitle.setText("暂时没有可用的回复")
             self.emptyHint.setText("请按上方提示处理。收到新的对方消息后会再次尝试。")
-            self.setupButton.setVisible(not settings.has_key())
+            self.setupButton.setVisible(not settings.configured())
 
     def _toggle_history(self):
         self.feed.setVisible(self.feed.isHidden())

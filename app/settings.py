@@ -11,6 +11,9 @@ import json
 import os
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
 
+from core.relay import (DEFAULT_DRAFT_MODEL, DEFAULT_JEV_MODEL, DEFAULT_JUDGE_PATH,
+                        DEFAULT_THINKING_STYLE, THINKING_STYLES, KEY_ENV as _RELAY_ENV)
+
 _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CONFIG = os.path.join(_ROOT, "config.json")
@@ -18,7 +21,7 @@ _DEFAULT_RELATIONSHIP = "romantic partners"
 _DEFAULT_CONTEXT = 10
 _ENV = "OPENROUTER_API_KEY"
 _DEEPSEEK_ENV = "DEEPSEEK_API_KEY"
-_PROVIDERS = ("openrouter", "deepseek")
+_PROVIDERS = ("openrouter", "deepseek", "custom")  # custom = 第三方中转，地址和模型名自填
 
 def relationship() -> str:
     """每次都重新读文件，改设置不用重启进程。"""
@@ -46,13 +49,43 @@ def style() -> str:
         return ""
 
 def draft_provider() -> str:
-    """起草走哪家：openrouter（默认）或 deepseek 直连。判断/排序永远走 OpenRouter。"""
+    """起草走哪家：openrouter（默认）、deepseek 直连、custom 第三方中转。判断/排序默认仍走 OpenRouter。"""
     try:
         with open(_CONFIG, encoding="utf-8") as f:
             v = json.load(f).get("draft_provider")
     except (OSError, ValueError):
         return _PROVIDERS[0]
     return v if v in _PROVIDERS else _PROVIDERS[0]
+
+def relay() -> dict:
+    """第三方中转的一组设置。缺项/脏数据一律退默认值。
+    base_url: 中转商给的地址（写法不统一，core/relay.py 负责归一到口）
+    draft_model / jev_model: 中转上的模型名，各家跟官方不一定同名
+    judge: 判断/排序也走中转（默认关）——中转转不转那个专用口得实测，没验过就开着会直接报错
+    judge_path: 那个口的路径，各家叫法不同（默认 OpenRouter 的 /api/alpha/decisions）
+    thinking_style: 思考开关带哪个字段（thinking / reasoning / none），选错了思考关不掉"""
+    try:
+        with open(_CONFIG, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    style = str(d.get("relay_thinking_style") or DEFAULT_THINKING_STYLE).strip()
+    return {"base_url": str(d.get("relay_base_url") or "").strip(),
+            "thinking_style": style if style in THINKING_STYLES else DEFAULT_THINKING_STYLE,
+            "draft_model": str(d.get("relay_draft_model") or DEFAULT_DRAFT_MODEL).strip(),
+            "jev_model": str(d.get("relay_jev_model") or DEFAULT_JEV_MODEL).strip(),
+            "judge_path": str(d.get("relay_judge_path") or DEFAULT_JUDGE_PATH).strip(),
+            "judge": bool(d.get("relay_judge", False))}
+
+
+def configured() -> bool:
+    """回复服务配好了没——判断那步跑得起来就算配好。判断走中转时 OpenRouter key 就不是必需的，
+    界面上「先设置，再开始」和开跑前的拦截都按这个判。"""
+    r = relay()
+    if r["judge"]:
+        return bool(r["base_url"]) and has_relay_key()
+    return has_key()
+
 
 def reply_target() -> bool:
     """群聊指定回复对象：开了才在界面上选回复给谁、才把对象喂给模型。默认关。"""
@@ -118,22 +151,46 @@ def deepseek_key() -> str:
 def has_deepseek_key() -> bool:
     return bool(deepseek_key())
 
+def relay_key() -> str:
+    return _get_key(_RELAY_ENV)
+
+def has_relay_key() -> bool:
+    return bool(relay_key())
+
 def save(key_text: str | None, relationship_text: str, context_n: int | None = None,
          deepseek_key_text: str | None = None, provider_text: str | None = None,
          reply_target_on: bool | None = None, style_text: str | None = None,
-         thinking_on: bool | None = None, check_update_on: bool | None = None) -> None:
-    """每个参数为空/None = 保留当前值。两个 key 都只写进程环境 + HKCU\\Environment，不写任何文件。"""
+         thinking_on: bool | None = None, check_update_on: bool | None = None,
+         relay_key_text: str | None = None, relay_base_url: str | None = None,
+         relay_draft_model: str | None = None, relay_jev_model: str | None = None,
+         judge_relay_on: bool | None = None, relay_judge_path: str | None = None,
+         relay_thinking_style: str | None = None) -> None:
+    """每个参数为空/None = 保留当前值。三个 key 都只写进程环境 + HKCU\\Environment，不写任何文件。"""
     if key_text:
         _set_key(_ENV, key_text)
     if deepseek_key_text:
         _set_key(_DEEPSEEK_ENV, deepseek_key_text)
+    if relay_key_text:
+        _set_key(_RELAY_ENV, relay_key_text)
     n = context() if context_n is None else max(3, min(30, int(context_n)))
     provider = provider_text if provider_text in _PROVIDERS else draft_provider()  # None 或脏值 = 保留原来的
     target = reply_target() if reply_target_on is None else bool(reply_target_on)
     style_v = style() if style_text is None else str(style_text).strip()  # 空串 = 清掉
     think = thinking() if thinking_on is None else bool(thinking_on)
     check = check_update() if check_update_on is None else bool(check_update_on)
+    r = relay()  # 中转那几项同样：None = 保留，空串 = 清掉（模型名清掉就退回默认名）
+    relay_v = {"base_url": r["base_url"] if relay_base_url is None else str(relay_base_url).strip(),
+               "draft_model": r["draft_model"] if relay_draft_model is None else str(relay_draft_model).strip(),
+               "jev_model": r["jev_model"] if relay_jev_model is None else str(relay_jev_model).strip(),
+               "judge_path": r["judge_path"] if relay_judge_path is None else str(relay_judge_path).strip(),
+               "thinking_style": r["thinking_style"] if relay_thinking_style is None
+               else (str(relay_thinking_style).strip() if relay_thinking_style in THINKING_STYLES
+                     else r["thinking_style"]),
+               "judge": r["judge"] if judge_relay_on is None else bool(judge_relay_on)}
     with open(_CONFIG, "w", encoding="utf-8") as f:
         json.dump({"relationship": relationship_text, "context": n, "draft_provider": provider,
                    "reply_target": target, "style": style_v, "thinking": think,
-                   "check_update": check}, f, ensure_ascii=False)
+                   "check_update": check, "relay_base_url": relay_v["base_url"],
+                   "relay_draft_model": relay_v["draft_model"], "relay_jev_model": relay_v["jev_model"],
+                   "relay_judge_path": relay_v["judge_path"], "relay_judge": relay_v["judge"],
+                   "relay_thinking_style": relay_v["thinking_style"]}, f, ensure_ascii=False)

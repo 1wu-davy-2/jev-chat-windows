@@ -24,7 +24,7 @@ def redact_secrets(text: str) -> str:
     """Strip every live key from any string before print or disk write."""
     if not isinstance(text, str):
         text = str(text)
-    for env in ("OPENROUTER_API_KEY", "DEEPSEEK_API_KEY"):
+    for env in ("OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "RELAY_API_KEY"):
         key = os.environ.get(env) or ""
         if key:
             text = text.replace(key, "[REDACTED]")
@@ -49,15 +49,19 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
     return redact_secrets(raw)[:800]
 
 
-def ask(state: dict, questions: dict, timeout: float = 20) -> dict:
+def ask(state: dict, questions: dict, timeout: float = 20, url: str | None = None,
+        model: str | None = None, env: str = "OPENROUTER_API_KEY") -> dict:
     """POST state+questions to Jev. Returns the parsed JSON body.
 
+    url/model/env 留空就走 OpenRouter 官方（默认）；判断改走第三方中转时由 engine 传
+    core/relay.py 拼出来的 decisions 口 + 中转的模型名和 key 环境变量。
     Retries HTTP 429 and 529 up to 3 times with exponential backoff.
     Never prints or writes the API key.
     """
-    key = _api_key()
+    url, model = url or API_URL, model or MODEL
+    key = _api_key(env)
     payload = json.dumps(
-        {"model": MODEL, "state": state, "questions": questions},
+        {"model": model, "state": state, "questions": questions},
         ensure_ascii=False,
     ).encode("utf-8")
 
@@ -65,7 +69,7 @@ def ask(state: dict, questions: dict, timeout: float = 20) -> dict:
     last_body = ""
     for attempt in range(MAX_RETRIES + 1):
         req = urllib.request.Request(
-            API_URL,
+            url,
             data=payload,
             method="POST",
             headers={
@@ -85,7 +89,7 @@ def ask(state: dict, questions: dict, timeout: float = 20) -> dict:
                 time.sleep(2**attempt)
                 continue
             readable = {
-                401: "Jev HTTP 401: API key rejected. Check OPENROUTER_API_KEY.",
+                401: f"Jev HTTP 401: API key rejected. Check {env}. {last_body}",
                 422: f"Jev HTTP 422: request body rejected. {last_body}",
                 429: f"Jev HTTP 429: rate limited after {MAX_RETRIES} retries. {last_body}",
                 529: f"Jev HTTP 529: provider overloaded after {MAX_RETRIES} retries. {last_body}",

@@ -15,7 +15,7 @@ from unittest.mock import patch
 from app import settings
 
 
-_STATES = ("ready", "waiting", "loading", "error", "setup", "settings", "paused")
+_STATES = ("ready", "waiting", "loading", "error", "setup", "settings", "settings-relay", "paused")
 
 _CHAT = "白金搬砖小分队"  # 演示里「微信当前开着的」会话：用群聊，回复对象那一行才看得见
 # (会话, 谁, 内容, 群里的发言人, 时间)：两个会话，下拉框里都能看到
@@ -69,11 +69,19 @@ def main() -> int:
 
     demo_settings = {"has_key": args.state != "setup", "relationship": "friends", "context": 10,
                      "has_deepseek_key": False, "draft_provider": "openrouter", "reply_target": True,
-                     "style": "话少，基本不用标点，急了才发感叹号", "thinking": False, "check_update": True}
+                     "style": "话少，基本不用标点，急了才发感叹号", "thinking": False, "check_update": True,
+                     "has_relay_key": True, "relay_base_url": "https://api.example.com/v1",
+                     "relay_draft_model": "deepseek-flash", "relay_jev_model": "jev-latest",
+                     "relay_judge_path": "/v1/systemone", "relay_thinking_style": "thinking", "judge_relay": False}
+    if args.state == "settings-relay":  # 让设置页停在中转那一组上，离线看这组字段长什么样
+        demo_settings["draft_provider"] = "custom"
 
     def save_demo_settings(key, relationship_text, context_n=None,
                            deepseek_key_text=None, draft_provider=None, reply_target_on=None,
-                           style_text=None, thinking_on=None, check_update_on=None):
+                           style_text=None, thinking_on=None, check_update_on=None,
+                           relay_key_text=None, relay_base_url=None, relay_draft_model=None,
+                           relay_jev_model=None, judge_relay_on=None, relay_judge_path=None,
+                           relay_thinking_style=None):
         if key:
             demo_settings["has_key"] = True
         demo_settings["relationship"] = relationship_text
@@ -91,11 +99,29 @@ def main() -> int:
             demo_settings["thinking"] = bool(thinking_on)
         if check_update_on is not None:
             demo_settings["check_update"] = bool(check_update_on)
+        if relay_key_text:
+            demo_settings["has_relay_key"] = True
+        for text, name in ((relay_base_url, "relay_base_url"), (relay_draft_model, "relay_draft_model"),
+                           (relay_jev_model, "relay_jev_model"), (relay_judge_path, "relay_judge_path"),
+                           (relay_thinking_style, "relay_thinking_style")):
+            if text is not None:
+                demo_settings[name] = text
+        if judge_relay_on is not None:
+            demo_settings["judge_relay"] = bool(judge_relay_on)
 
     # 在创建 Overlay 前替换设置接口，整个事件循环期间都保持隔离。
     with patch.multiple(
         settings,
         has_key=lambda: demo_settings["has_key"],
+        configured=lambda: demo_settings["has_key"] or (
+            demo_settings["judge_relay"] and demo_settings["has_relay_key"]),
+        has_relay_key=lambda: demo_settings["has_relay_key"],
+        relay=lambda: {"base_url": demo_settings["relay_base_url"],
+                       "draft_model": demo_settings["relay_draft_model"],
+                       "jev_model": demo_settings["relay_jev_model"],
+                       "judge_path": demo_settings["relay_judge_path"],
+                       "thinking_style": demo_settings["relay_thinking_style"],
+                       "judge": demo_settings["judge_relay"]},
         relationship=lambda: demo_settings["relationship"],
         context=lambda: demo_settings["context"],
         deepseek_key=lambda: "",
@@ -139,7 +165,7 @@ def main() -> int:
             elif args.state == "error":
                 ov.set_busy(True)
                 ov.set_status("演示模式：分析失败，请检查网络和密钥，等待下一条消息后重试。", kind="error")
-            elif args.state == "settings":
+            elif args.state in ("settings", "settings-relay"):
                 ov.open_settings()
             elif args.state == "paused":
                 ov.set_capture(False)
