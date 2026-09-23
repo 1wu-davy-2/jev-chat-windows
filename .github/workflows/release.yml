@@ -40,6 +40,7 @@ jobs:
           if (-not (Test-Path $exe)) { throw "exe 没生成：$exe" }
           $ver = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { $env:GITHUB_SHA.Substring(0, 7) }
           $zip = "jev-chat-windows-$ver.zip"
+          Copy-Item -Path LICENSE, NOTICE -Destination 'dist\jev-chat-windows'
           Compress-Archive -Path 'dist\jev-chat-windows' -DestinationPath $zip
           Add-Content -Path $env:GITHUB_OUTPUT -Value "zip=$zip"
           "{0}  {1:N1} MB" -f $zip, ((Get-Item $zip).Length / 1MB)

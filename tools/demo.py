@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 """端到端冒烟：截图里那段真实对话跑一遍完整链，打印判断 + 排好序的候选。
 
-    set OPENROUTER_API_KEY=...   (Windows)
-    export OPENROUTER_API_KEY=...(mac/Linux)
+链路是三段式：Jev 判断（7 道题） → 带着判断起草 3 条 → Jev 排序，两次 Jev 调用。
+
+全程只要两把 key：判断一把 JEV_API_KEY（OpenRouter 或 TypeSafe 的），起草一把 LLM_API_KEY。
+
+    set JEV_API_KEY=...   &  set LLM_API_KEY=...    (Windows)
+    export JEV_API_KEY=... && export LLM_API_KEY=...(mac/Linux)
     python tools/demo.py
 
-起草想走 DeepSeek 直连就把下面 PROVIDER 改成 "deepseek"，并设好 DEEPSEEK_API_KEY。
+默认：判断走 OpenRouter，起草走 DeepSeek 官网直连。换别家改下面两个常量
+（可选的来源见 core/providers.py 的两张表）。
 """
 from __future__ import annotations
 
@@ -16,6 +21,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 
 from core.engine import analyze
 from core.jev_client import JevError
+from core.questions import guidance_text
 
 MESSAGES = [
     ("her", "你今天是不是又忘了我跟你说过什么？"),
@@ -25,7 +31,8 @@ MESSAGES = [
     ("her", "你最好是。"),
 ]
 RELATIONSHIP = "romantic partners"
-PROVIDER = "openrouter"  # 或 "deepseek"（起草直连，需要 DEEPSEEK_API_KEY）
+PROVIDER = "deepseek"        # 起草来源，见 core.providers.DRAFT_PROVIDERS
+JEV_PROVIDER = "openrouter"  # 判断来源：openrouter 或 typesafe
 
 
 def fmt(name: str, ans: dict) -> str:
@@ -44,7 +51,7 @@ def main() -> int:
     for w, t in MESSAGES:
         print(f"  {w}: {t}")
     try:
-        r = analyze(MESSAGES, RELATIONSHIP, provider=PROVIDER)
+        r = analyze(MESSAGES, RELATIONSHIP, provider=PROVIDER, jev_provider=JEV_PROVIDER)
     except JevError as e:
         print(f"\n失败: {e}")
         return 1
@@ -54,6 +61,10 @@ def main() -> int:
                  "should_reply_now", "best_action", "she_needs", "tension_resolved"):
         if name in r["answers"]:
             print("  " + fmt(name, r["answers"][name]))
+
+    block = guidance_text(r["answers"])  # 起草时喂进去的那张小抄
+    if block:
+        print("\n" + block)
 
     print("\n候选（Jev 排序，★ = 推荐）:")
     scores = r.get("scores")

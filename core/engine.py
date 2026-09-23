@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""整条链的唯一入口：对话 → 起草 3 条 → Jev 一次判断+排序 → 结构化结果。
+"""整条链的唯一入口：对话 → Jev 判断 → 带着判断起草 3 条 → Jev 排序 → 结构化结果。
 
 平台无关。SSE 消费者、悬浮窗、命令行 demo 都只调 analyze()。
 """
@@ -8,59 +8,81 @@ from __future__ import annotations
 try:
     from .draft import draft_candidates
     from .jev_client import JevError, ask
-    from .questions import JUDGE_QUESTIONS, build_rank_question, build_state
-    from .relay import DEFAULT_JEV_MODEL, KEY_ENV as RELAY_KEY_ENV, judge_url
+    from .questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 except ImportError:
     from draft import draft_candidates
     from jev_client import JevError, ask
-    from questions import JUDGE_QUESTIONS, build_rank_question, build_state
-    from relay import DEFAULT_JEV_MODEL, KEY_ENV as RELAY_KEY_ENV, judge_url
+    from questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 
 _REPLY_IDX = {"reply_a": 0, "reply_b": 1, "reply_c": 2}
 
 
+def _add_usage(total: dict, one: dict | None) -> None:
+    """两次 Jev 调用的 usage 相加（tokens、cost）；非数字的字段后来的盖掉前面的。"""
+    for k, v in (one or {}).items():
+        total[k] = total.get(k, 0) + v if isinstance(v, (int, float)) else v
+
+
 def analyze(messages: list, relationship: str, model: str | None = None,
-            timeout: float = 30, context: int = 10, provider: str = "openrouter",
-            reply_to: str | None = None, style: str = "", thinking: bool = False,
-            base_url: str = "", judge_relay: bool = False, judge_model: str | None = None,
-            judge_path: str = "", thinking_style: str = "") -> dict:
+            timeout: float = 30, context: int = 10, provider: str = "deepseek",
+            base_url: str | None = None, reply_to: str | None = None, style: str = "",
+            thinking: bool = False, jev_provider: str = "openrouter",
+            jev_model: str | None = None, jev_base_url: str = "",
+            jev_path: str = "", thinking_style: str = "") -> dict:
     """messages: [(from, text)] from ∈ {her, me}，最新一条在最后；
     群聊里可以带第三项 name（说这句话的人），单聊不带。
     context: 起草和判断各看最近多少条消息（用户设置里的「参考上下文」）。
-    provider: 起草走哪家（openrouter / deepseek 直连 / custom 第三方中转）。
+    provider: 起草走哪家（core.providers.DRAFT_PROVIDERS），base_url 只有自定义来源要传。
+    jev_provider / jev_model: 判断和排序走哪家、哪个模型（core.providers.JEV_PROVIDERS）。
+    jev_base_url / jev_path: 判断走自定义来源时的地址和接口路径（core/relay.py 拼）。
     reply_to: 群聊里指定回复给谁；None = 正常回复。
     style: 用户自己描述的说话风格，只影响起草。
     thinking: 起草时是否开思考模式，只影响起草，默认关。
-    model=None 用该来源的默认模型。
-    base_url: 第三方中转地址，provider == "custom" 时必填。
-    judge_relay: 判断/排序也走中转（默认关，仍走 OpenRouter）——中转发不发那个专用口得实测，
-    没验过就开着会直接报错，所以默认关。judge_model=None 用 relay 的默认 jev 模型名；
-    judge_path 是中转上那个口的路径（留空用 OpenRouter 的 /api/alpha/decisions，
-    PackyCode 那种要填 /v1/systemone）。
-    thinking_style: 中转认哪种思考开关（thinking / reasoning / none，见 core/relay.py）。
+    thinking_style: 自定义起草来源的思考开关派系（core/relay.py 的 THINKING_STYLES）。
+    model / jev_model = None 用该来源的默认模型。
 
     返回 {candidates, best_index, best_reply, scores, answers, usage, reply_to}。
     scores 是每条候选的胜出概率（0~1），取自 best_reply.probabilities，取不到记 0.0。
     只有对方最新说话时才有意义调它——是不是该触发由调用方判断（看 latest_from）。
+
+    三段式（issue #4）：先让 Jev 答 7 道判断题，把判断当小抄喂给起草，最后 Jev 只排序。
+    判断那次挂了就退回老路：盲起草 + 判断和排序一次问完，行为跟以前一样。usage 是两次之和。
     """
-    if judge_relay and not base_url.strip():
-        # 不拦的话 judge_url 会拼出个 "/api/alpha/decisions"，urllib 再抛一句看不懂的 unknown url type
-        raise JevError("判断走中转但没填中转地址")
-    candidates = draft_candidates(messages, relationship, provider=provider,
-                                  model=model, timeout=timeout, keep=context, reply_to=reply_to,
-                                  style=style, thinking=thinking, base_url=base_url,
+    state = build_state(messages, relationship, keep=context, reply_to=reply_to)
+    usage: dict = {}
+    answers: dict = {}
+    judged = False
+    try:
+        first = ask(state, dict(JUDGE_QUESTIONS), timeout=timeout,
+                    provider=jev_provider, model=jev_model,
+                    base_url=jev_base_url, path=jev_path)
+        answers = first.get("answers") or {}
+        _add_usage(usage, first.get("usage"))
+        judged = True
+    except JevError:
+        pass  # 退回盲起草 + 老的一次合问；错误不打日志（里面可能带请求内容）
+
+    candidates = draft_candidates(messages, relationship, provider=provider, model=model,
+                                  base_url=base_url, timeout=timeout, keep=context,
+                                  reply_to=reply_to, style=style, thinking=thinking,
+                                  guidance=guidance_text(answers) if judged else None,
                                   thinking_style=thinking_style)
 
-    questions = dict(JUDGE_QUESTIONS)
+    questions = {} if judged else dict(JUDGE_QUESTIONS)
     if len(candidates) >= 2:  # 起草只给了 1 条就没什么可排的，判断题照问
         questions.update(build_rank_question(candidates))
-    result = ask(build_state(messages, relationship, keep=context, reply_to=reply_to),
-                 questions, timeout=timeout,
-                 url=judge_url(base_url, judge_path) if judge_relay else None,
-                 model=(judge_model or DEFAULT_JEV_MODEL) if judge_relay else None,
-                 env=RELAY_KEY_ENV if judge_relay else "OPENROUTER_API_KEY")
+    if questions:
+        try:
+            second = ask(state, questions, timeout=timeout,
+                         provider=jev_provider, model=jev_model,
+                         base_url=jev_base_url, path=jev_path)
+        except JevError:
+            if not judged:  # 老路只有这一次调用，挂了就是挂了
+                raise
+            second = {}  # 判断还在，只是没排上序：下面按第一条推荐
+        answers = {**answers, **(second.get("answers") or {})}
+        _add_usage(usage, second.get("usage"))
 
-    answers = result.get("answers") or {}
     best_key = (answers.get("best_reply") or {}).get("choice")
     best_index = _REPLY_IDX.get(best_key, 0)  # 解析不出就退第一条
     if best_index >= len(candidates):
@@ -80,6 +102,6 @@ def analyze(messages: list, relationship: str, model: str | None = None,
         "best_reply": candidates[best_index],
         "scores": scores,
         "answers": answers,
-        "usage": result.get("usage") or {},
+        "usage": usage,
         "reply_to": reply_to,
     }

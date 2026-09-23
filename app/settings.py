@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""设置持久化。key 硬约束（docs/KICKOFF.md #6）：只进环境变量，绝不落文件；relationship 不是密钥，落 config.json。
+"""设置持久化。key 硬约束（docs/KICKOFF.md #6）：只进环境变量，绝不落文件；其余设置落 config.json。
 
 key 的持久化走 Windows 用户环境变量（注册表 HKCU\\Environment，跟 setx 写的是同一个地方）。
+全程只有两把：判断 JEV_API_KEY、起草 LLM_API_KEY，跟选哪家来源无关。
 读的时候先看进程环境，没有就直接读注册表——IDE 启动时把环境快照拿走了，之后再 Run 继承的还是旧环境，
 只靠 os.environ 会「保存了下次打开还是没有」。"""
 from __future__ import annotations
@@ -11,96 +12,101 @@ import json
 import os
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
 
-from core.relay import (DEFAULT_DRAFT_MODEL, DEFAULT_JEV_MODEL, DEFAULT_JUDGE_PATH,
-                        DEFAULT_THINKING_STYLE, THINKING_STYLES, KEY_ENV as _RELAY_ENV)
+from core.providers import (CUSTOM, DRAFT_PROVIDERS, JEV_CUSTOM, JEV_ENV, JEV_PROVIDERS, LEGACY,
+                            LLM_ENV)
+from core.relay import DEFAULT_THINKING_STYLE, THINKING_STYLES
 
 _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CONFIG = os.path.join(_ROOT, "config.json")
 _DEFAULT_RELATIONSHIP = "romantic partners"
 _DEFAULT_CONTEXT = 10
-_ENV = "OPENROUTER_API_KEY"
-_DEEPSEEK_ENV = "DEEPSEEK_API_KEY"
-_PROVIDERS = ("openrouter", "deepseek", "custom")  # custom = 第三方中转，地址和模型名自填
+_DEFAULT_JEV = "openrouter"
+_DEFAULT_DRAFT = "deepseek"
 
-def _read() -> dict:
-    """每次都重新读文件，改设置不用重启进程。读不到 / 坏了 / 根本不是个对象（手改成了数组、数字之类）
-    一律当空配置——configured() 在启动路径上，这里崩了整个界面都出不来。"""
+
+def _read(name: str, default=None):
+    """读 config.json 里的一个字段；每次都重新读文件，改设置不用重启进程。"""
     try:
         with open(_CONFIG, encoding="utf-8") as f:
-            d = json.load(f)
+            value = json.load(f).get(name)
     except (OSError, ValueError):
-        return {}
-    return d if isinstance(d, dict) else {}
-
+        return default
+    return default if value is None else value
 
 def relationship() -> str:
-    return _read().get("relationship") or _DEFAULT_RELATIONSHIP
+    return str(_read("relationship") or _DEFAULT_RELATIONSHIP)
 
 def context() -> int:
     """参考上下文条数：起草和判断各看最近多少条消息。3~30，缺失/脏数据一律退默认值。"""
     try:
-        n = int(_read().get("context", _DEFAULT_CONTEXT))
+        n = int(_read("context", _DEFAULT_CONTEXT))
     except (TypeError, ValueError):
         return _DEFAULT_CONTEXT
     return max(3, min(30, n))
 
 def style() -> str:
     """用户自己描述的说话风格（可选，自由文本），只喂给起草模型。默认空 = 只照着最近的消息模仿。"""
-    return str(_read().get("style") or "")
+    return str(_read("style") or "")
+
+def jev_provider() -> str:
+    """判断模型走哪家：openrouter（默认）或 typesafe 直连。"""
+    v = _read("jev_provider")
+    return v if v in JEV_PROVIDERS else _DEFAULT_JEV
+
+def jev_model() -> str:
+    """判断模型 id；空 = 用该来源的默认模型（自定义来源没有默认，那就得自己填）。"""
+    return str(_read("jev_model") or "") or JEV_PROVIDERS[jev_provider()].default
+
+def jev_base_url() -> str:
+    """自定义判断来源的地址；官方两家用表里写死的，这里返回空。"""
+    return str(_read("jev_base_url") or "") if jev_provider() in JEV_CUSTOM else ""
+
+def jev_path() -> str:
+    """自定义判断来源的接口路径；留空用 core/relay.py 的默认（OpenRouter 那个）。
+    各家叫法不同（PackyCode 的 typesafe 通道是 /v1/systemone），接口回的报错就是线索。"""
+    return str(_read("jev_path") or "") if jev_provider() in JEV_CUSTOM else ""
 
 def draft_provider() -> str:
-    """起草走哪家：openrouter（默认）、deepseek 直连、custom 第三方中转。判断/排序默认仍走 OpenRouter。"""
-    v = _read().get("draft_provider")
-    return v if v in _PROVIDERS else _PROVIDERS[0]
+    """起草走哪家（见 core/providers.DRAFT_PROVIDERS）。老配置里的 openrouter/deepseek 照样认。"""
+    v = _read("draft_provider")
+    return v if v in DRAFT_PROVIDERS else _DEFAULT_DRAFT
 
-def relay() -> dict:
-    """第三方中转的一组设置。缺项/脏数据一律退默认值。
-    base_url: 中转商给的地址（写法不统一，core/relay.py 负责归一到口）
-    draft_model / jev_model: 中转上的模型名，各家跟官方不一定同名
-    judge: 判断/排序也走中转（默认关）——中转转不转那个专用口得实测，没验过就开着会直接报错
-    judge_path: 那个口的路径，各家叫法不同（默认 OpenRouter 的 /api/alpha/decisions）
-    thinking_style: 思考开关带哪个字段（thinking / reasoning / none），选错了思考关不掉"""
-    d = _read()
-    style = str(d.get("relay_thinking_style") or DEFAULT_THINKING_STYLE).strip()
-    return {"base_url": str(d.get("relay_base_url") or "").strip(),
-            "thinking_style": style if style in THINKING_STYLES else DEFAULT_THINKING_STYLE,
-            "draft_model": str(d.get("relay_draft_model") or DEFAULT_DRAFT_MODEL).strip(),
-            "jev_model": str(d.get("relay_jev_model") or DEFAULT_JEV_MODEL).strip(),
-            "judge_path": str(d.get("relay_judge_path") or DEFAULT_JUDGE_PATH).strip(),
-            "judge": bool(d.get("relay_judge", False))}
+def draft_provider_name() -> str:
+    return DRAFT_PROVIDERS[draft_provider()].name
 
+def draft_model() -> str:
+    """起草模型 id；空 = 用该来源的默认模型（有的来源没有默认，那就得自己选）。"""
+    return str(_read("draft_model") or "") or DRAFT_PROVIDERS[draft_provider()].default
 
-def configured() -> bool:
-    """回复服务配好了没：**起草那步和判断那步各自要的东西都齐了**才算配好。
-    判断走中转时 OpenRouter key 不是必需的——但起草要是还在用 OpenRouter，它照样必需，
-    所以这里两边都得看（只看判断会放行一个「保存成功、之后每条消息都失败」的配置）。
-    界面上「先设置，再开始」和开跑前的拦截都按这个判。"""
-    r = relay()
-    provider = draft_provider()
-    if provider == "custom":
-        draft_ok = bool(r["base_url"]) and has_relay_key()
-    elif provider == "deepseek":
-        draft_ok = has_deepseek_key()
-    else:
-        draft_ok = has_key()
-    judge_ok = (bool(r["base_url"]) and has_relay_key()) if r["judge"] else has_key()
-    return draft_ok and judge_ok
+def draft_base_url() -> str:
+    """自定义来源的 Base URL；其余来源用表里的，这里返回空。"""
+    return str(_read("draft_base_url") or "") if draft_provider() in CUSTOM else ""
 
+def draft_thinking_style() -> str:
+    """自定义起草来源的思考开关带哪个字段（core/relay.py 的 THINKING_STYLES）。
+    表里那 11 家预设认哪派是写死的，用不上这个；只有自定义来源没人知道它认哪派，
+    才由这里现挑。默认 thinking（DeepSeek 那套，中转多数认它）。"""
+    v = str(_read("draft_thinking_style") or "").strip()
+    return v if v in THINKING_STYLES else DEFAULT_THINKING_STYLE
 
 def reply_target() -> bool:
     """群聊指定回复对象：开了才在界面上选回复给谁、才把对象喂给模型。默认关。"""
-    return bool(_read().get("reply_target", False))
+    return bool(_read("reply_target", False))
 
 def thinking() -> bool:
-    """起草时是否开思考模式：慢且贵，默认关。两个来源（OpenRouter/DeepSeek）都吃这个开关。"""
-    return bool(_read().get("thinking", False))
+    """起草时是否开思考模式：慢且贵，默认关。只有 DeepSeek / OpenRouter / Anthropic / Gemini 吃它。"""
+    return bool(_read("thinking", False))
 
 def check_update() -> bool:
     """启动时要不要去 GitHub 查一次最新版本号：默认开，只出这一次网，设置里能关。"""
-    return bool(_read().get("check_update", True))
+    return bool(_read("check_update", True))
 
-def _get_key(env_name: str) -> str:
+def debug_view() -> bool:
+    """调试视图：另开一个窗口实时画识别框。默认关，开了子进程才往队列里送帧。"""
+    return bool(_read("debug_view", False))
+
+def _read_env(env_name: str) -> str:
     """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。"""
     v = os.environ.get(env_name, "").strip()
     if not v:
@@ -115,6 +121,10 @@ def _get_key(env_name: str) -> str:
             os.environ[env_name] = v
     return v
 
+def _get_key(env_name: str) -> str:
+    """两把 key 之一。新名字空着就退回老版本按来源存的变量（下次保存会抄进新名字）。"""
+    return _read_env(env_name) or _read_env(LEGACY[env_name])
+
 def _set_key(env_name: str, value: str) -> None:
     """只写进程环境 + HKCU\\Environment，不写任何文件。"""
     os.environ[env_name] = value
@@ -128,58 +138,61 @@ def _set_key(env_name: str, value: str) -> None:
     except Exception:
         pass  # 非 Windows（本机 Mac 开发）走不到，忽略
 
-def key() -> str:
-    return _get_key(_ENV)
+def jev_key() -> str:
+    """判断那把 key，两家来源共用。"""
+    return _get_key(JEV_ENV)
 
-def has_key() -> bool:
-    return bool(key())
+def has_jev_key() -> bool:
+    return bool(jev_key())
 
-def deepseek_key() -> str:
-    return _get_key(_DEEPSEEK_ENV)
+def llm_key() -> str:
+    """起草那把 key，所有语言模型来源共用。"""
+    return _get_key(LLM_ENV)
 
-def has_deepseek_key() -> bool:
-    return bool(deepseek_key())
+def has_llm_key() -> bool:
+    return bool(llm_key())
 
-def relay_key() -> str:
-    return _get_key(_RELAY_ENV)
+has_key = has_jev_key  # 旧名字：界面上「配没配好」问的就是判断模型这把 key
 
-def has_relay_key() -> bool:
-    return bool(relay_key())
-
-def save(key_text: str | None, relationship_text: str, context_n: int | None = None,
-         deepseek_key_text: str | None = None, provider_text: str | None = None,
+def save(relationship_text: str | None = None, context_n: int | None = None, *,
+         jev_provider_text: str | None = None, jev_key_text: str | None = None,
+         jev_model_text: str | None = None, jev_base_url_text: str | None = None,
+         jev_path_text: str | None = None, draft_provider_text: str | None = None,
+         llm_key_text: str | None = None, draft_model_text: str | None = None,
+         draft_base_url_text: str | None = None, draft_thinking_style_text: str | None = None,
          reply_target_on: bool | None = None, style_text: str | None = None,
          thinking_on: bool | None = None, check_update_on: bool | None = None,
-         relay_key_text: str | None = None, relay_base_url: str | None = None,
-         relay_draft_model: str | None = None, relay_jev_model: str | None = None,
-         judge_relay_on: bool | None = None, relay_judge_path: str | None = None,
-         relay_thinking_style: str | None = None) -> None:
-    """每个参数为空/None = 保留当前值。三个 key 都只写进程环境 + HKCU\\Environment，不写任何文件。"""
-    if key_text:
-        _set_key(_ENV, key_text)
-    if deepseek_key_text:
-        _set_key(_DEEPSEEK_ENV, deepseek_key_text)
-    if relay_key_text:
-        _set_key(_RELAY_ENV, relay_key_text)
+         debug_view_on: bool | None = None) -> None:
+    """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
+    jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
+    draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
+    # 没重填就把老变量里的值抄进新名字，迁移一次性做完（_get_key 已经退回读过老的了）
+    for env, typed in ((JEV_ENV, jev_key_text), (LLM_ENV, llm_key_text)):
+        value = typed or ("" if _read_env(env) else _get_key(env))
+        if value:
+            _set_key(env, value)
     n = context() if context_n is None else max(3, min(30, int(context_n)))
-    provider = provider_text if provider_text in _PROVIDERS else draft_provider()  # None 或脏值 = 保留原来的
-    target = reply_target() if reply_target_on is None else bool(reply_target_on)
-    style_v = style() if style_text is None else str(style_text).strip()  # 空串 = 清掉
-    think = thinking() if thinking_on is None else bool(thinking_on)
-    check = check_update() if check_update_on is None else bool(check_update_on)
-    r = relay()  # 中转那几项同样：None = 保留，空串 = 清掉（模型名清掉就退回默认名）
-    relay_v = {"base_url": r["base_url"] if relay_base_url is None else str(relay_base_url).strip(),
-               "draft_model": r["draft_model"] if relay_draft_model is None else str(relay_draft_model).strip(),
-               "jev_model": r["jev_model"] if relay_jev_model is None else str(relay_jev_model).strip(),
-               "judge_path": r["judge_path"] if relay_judge_path is None else str(relay_judge_path).strip(),
-               "thinking_style": r["thinking_style"] if relay_thinking_style is None
-               else (str(relay_thinking_style).strip() if relay_thinking_style in THINKING_STYLES
-                     else r["thinking_style"]),
-               "judge": r["judge"] if judge_relay_on is None else bool(judge_relay_on)}
+    # 空串 = 清掉，None = 原样留着（读原始字段，别读补过默认值的那个）
+    keep = lambda new, name: str(_read(name) or "") if new is None else str(new).strip()
+    flag = lambda new, now: now() if new is None else bool(new)
+    # 整个 dict 必须在 open(..., "w") **之前**拼好：open 一上来就把文件截断，
+    # 之后再 _read() 读到的是空文件，None 那几项就不是「保留」而是被清空了。
+    style_v = keep(draft_thinking_style_text, "draft_thinking_style")
+    data = {
+        # 关系为空 = 只改别的开关（调试视图那种单项保存），别把它写没了
+        "relationship": relationship_text or relationship(), "context": n,
+        "style": keep(style_text, "style"),
+        "jev_provider": jev, "jev_model": keep(jev_model_text, "jev_model"),
+        "jev_base_url": keep(jev_base_url_text, "jev_base_url"),
+        "jev_path": keep(jev_path_text, "jev_path"),
+        "draft_provider": draft, "draft_model": keep(draft_model_text, "draft_model"),
+        "draft_base_url": keep(draft_base_url_text, "draft_base_url"),
+        # 脏值一律退回默认，别把认不出的派系名当键名塞进请求体
+        "draft_thinking_style": style_v if style_v in THINKING_STYLES else DEFAULT_THINKING_STYLE,
+        "reply_target": flag(reply_target_on, reply_target),
+        "thinking": flag(thinking_on, thinking),
+        "check_update": flag(check_update_on, check_update),
+        "debug_view": flag(debug_view_on, debug_view),
+    }
     with open(_CONFIG, "w", encoding="utf-8") as f:
-        json.dump({"relationship": relationship_text, "context": n, "draft_provider": provider,
-                   "reply_target": target, "style": style_v, "thinking": think,
-                   "check_update": check, "relay_base_url": relay_v["base_url"],
-                   "relay_draft_model": relay_v["draft_model"], "relay_jev_model": relay_v["jev_model"],
-                   "relay_judge_path": relay_v["judge_path"], "relay_judge": relay_v["judge"],
-                   "relay_thinking_style": relay_v["thinking_style"]}, f, ensure_ascii=False)
+        json.dump(data, f, ensure_ascii=False)

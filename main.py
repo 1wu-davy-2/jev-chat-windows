@@ -4,7 +4,7 @@
 上下文、结果、聊天记录都按会话名（子进程 OCR 头部标题得来）分开存，切会话不串味。
 
     pip install rapidocr-onnxruntime numpy windows-capture PySide6-Fluent-Widgets
-OpenRouter key 在独立设置页填写，不用改代码。IDE 里直接 Run。
+两个模型（判断 Jev / 起草语言模型）的来源和 key 在独立设置页填写，不用改代码。IDE 里直接 Run。
 """
 import ctypes
 import multiprocessing
@@ -19,6 +19,7 @@ from app.fill import fill
 from app.overlay import Overlay
 from app.version import VERSION
 from core.engine import analyze
+from core.providers import CUSTOM, JEV_CUSTOM
 
 # {会话名: {history, result, rev, target, senders}}：每个会话各自的上下文、上次结果和版本号，互不串味
 # history 里是 [(who, text, name)]，engine 只认 her/me，name 是群里的发言人（单聊/自己说的是 None）；
@@ -57,9 +58,33 @@ def fill_reply(text):
 
 def spawn_worker():
     """开一个采集子进程，它跟着 capture_on 走：置位=采集，清掉=暂停。"""
-    p = multiprocessing.Process(target=worker.run, args=(q, state["hwnd"], capture_on), daemon=True)
+    p = multiprocessing.Process(target=worker.run,
+                                args=(q, state["hwnd"], capture_on, debug_on), daemon=True)
     p.start()
     return p
+
+
+def set_debug(on):
+    """调试视图开关：开 → 开窗 + 置位（子进程这才开始送帧，一帧 2~3MB）；关 → 清掉 + 收窗。"""
+    global dbg
+    if not on:
+        debug_on.clear()
+        if dbg is not None:
+            dbg.hide()
+        return
+    if dbg is None:
+        from app.debugwin import DebugWindow
+
+        dbg = DebugWindow(on_close=on_debug_closed)
+    dbg.show()
+    debug_on.set()
+
+
+def on_debug_closed():
+    """用户直接关了调试窗 = 把开关也关了，否则设置页显示开着但没窗。"""
+    debug_on.clear()
+    ov.set_debug_switch(False)
+    settings.save(debug_view_on=False)
 
 
 def on_toggle_capture(on):
@@ -83,16 +108,17 @@ def analyze_bg(msgs, title, revision, reply_to=None):
     读设置也放在 try 里：在外面抛的话这里什么都不往队列里丢，state["busy"] 就永远卡在 True，
     界面一直停在「正在根据新消息整理回复…」，还看不到任何错误。"""
     try:
-        provider = settings.draft_provider()
-        relay = settings.relay()
         results.put(("ok", analyze(msgs, settings.relationship(), context=settings.context(),
-                                   provider=provider, reply_to=reply_to,
-                                   # 中转的模型名跟着设置走；另外两家留 None 用各自默认
-                                   model=relay["draft_model"] if provider == "custom" else None,
-                                   style=settings.style(), thinking=settings.thinking(),
-                                   base_url=relay["base_url"], judge_relay=relay["judge"],
-                                   judge_model=relay["jev_model"], judge_path=relay["judge_path"],
-                                   thinking_style=relay["thinking_style"]),
+                                   model=settings.draft_model() or None,
+                                   provider=settings.draft_provider(),
+                                   base_url=settings.draft_base_url() or None,
+                                   reply_to=reply_to, style=settings.style(),
+                                   thinking=settings.thinking(),
+                                   thinking_style=settings.draft_thinking_style(),
+                                   jev_provider=settings.jev_provider(),
+                                   jev_model=settings.jev_model() or None,
+                                   jev_base_url=settings.jev_base_url(),
+                                   jev_path=settings.jev_path()),
                      title, revision))
     except Exception as e:
         results.put(("err", f"分析失败: {e}", title, revision))
@@ -107,25 +133,23 @@ def check_update_bg():
 
 def config_problem():
     """开跑之前该拦下的配置问题（返回给用户看的一句话）；配好了返回 None。
-    起草和判断两步各自要什么分头看：判断走中转时 OpenRouter key 不是必需的，但起草还在用
-    OpenRouter 的话它仍然必需——只看判断会放行一个「保存成功、之后每条消息都失败」的配置。"""
-    provider = settings.draft_provider()
-    relay = settings.relay()
-    if provider == "custom":
-        if not relay["base_url"]:
-            return "选了第三方中转但没填中转地址，去设置里补上"
-        if not settings.has_relay_key():
-            return "选了第三方中转但没填中转密钥，去设置里补上"
-    elif provider == "deepseek":
-        if not settings.has_deepseek_key():
-            return "选了 DeepSeek 直连但没填 DeepSeek 密钥，去设置里补上"
-    elif not settings.has_key():
-        return "请先在设置中配置回复服务"
-    if relay["judge"]:
-        if not relay["base_url"] or not settings.has_relay_key():
-            return "判断走中转但中转没配好，去设置里补上"
-    elif not settings.has_key():
-        return "请先在设置中配置回复服务"
+    起草和判断两步各自要什么分头看：判断走自定义口时官方那两家的 key 不是必需的，但起草还在用
+    OpenRouter 的话 LLM 那把仍然必需——只看判断会放行一个「保存得下去、之后每条消息都失败」的配置。
+    地址/模型名同理：自定义来源没有写死的默认，缺了就是每次调用都当场抛。"""
+    if not settings.has_jev_key():
+        return "请先在设置中配置判断模型的密钥"
+    if settings.jev_provider() in JEV_CUSTOM:
+        if not settings.jev_base_url():
+            return "判断走自定义来源但没填地址，去设置里补上"
+        if not settings.jev_model():
+            return "判断走自定义来源但没填模型名，去设置里补上"
+    if not settings.has_llm_key():
+        return f"起草来源 {settings.draft_provider_name()} 没填密钥，去设置里补上"
+    if settings.draft_provider() in CUSTOM:
+        if not settings.draft_base_url():
+            return "起草选了自定义来源但没填 Base URL，去设置里补上"
+        if not settings.draft_model():
+            return "起草选了自定义来源但没填模型名，去设置里补上"
     return None
 
 
@@ -170,6 +194,10 @@ def drain():
         if kind == "chat":  # 微信切了会话，界面跟过去（用户正浏览别的会话时也跟，微信是准的）
             state["chat"] = msg[1]
             ov.set_chat(msg[1])
+            continue
+        if kind == "debug":  # 调试视图的一帧；窗口不在就直接丢掉
+            if dbg is not None:
+                dbg.show_packet(msg[1])
             continue
         if kind == "status":  # 单帧识别失败/报错，提示一下就好，别把正在跑的分析和已知坐标清掉
             ov.set_status(msg[1], "warning")
@@ -258,10 +286,11 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     ctypes.windll.user32.SetProcessDPIAware()
     q = multiprocessing.Queue()
     capture_on = multiprocessing.Event()  # 父子进程共用的开关，置位=采集
+    debug_on = multiprocessing.Event()  # 同上，置位=子进程往队列里送整帧给调试窗
     ov = Overlay(on_fill=fill_reply, on_toggle_capture=on_toggle_capture,
-                 on_target_change=on_target_change,
+                 on_target_change=on_target_change, on_toggle_debug=set_debug,
                  result_of=lambda t: chats.get(t, {}).get("result"))
-    child = None
+    child = dbg = None
     try:
         state["hwnd"] = find_wechat_hwnd()
     except RuntimeError:
@@ -269,8 +298,11 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     else:
         capture_on.set()
         child = spawn_worker()
-    if not settings.configured():
-        ov.set_status("请先在设置中配置回复服务", "warning")
+    if settings.debug_view():  # 上次开着就直接开回来
+        set_debug(True)
+    problem = config_problem()
+    if problem:
+        ov.set_status(problem, "warning")
         ov.after(0, ov.open_settings)
     if settings.check_update() and update.parse_version(VERSION):  # 开发版没有版本号，不查也不烦源码用户
         threading.Thread(target=check_update_bg, daemon=True).start()
