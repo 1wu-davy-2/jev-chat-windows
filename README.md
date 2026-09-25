@@ -2,12 +2,6 @@
 
 本仓库只维护当前这一套识别。有能力的人可以 Fork 后自行适配别的聊天窗口，作者不提供这项适配，也不对 Fork 出去的改动负责。
 
-## 公众号
-
-反馈和合作走公众号「恸码奇点」。扫左边的码，或者搜一搜这个名字。
-
-<p align="center"><img src="docs/wechat-mp.png" width="640" alt="公众号：恸码奇点"></p>
-
 聊天窗口旁挂的回复辅助：本地 OCR 读屏上的对话 → Jev 判断意图/情绪 → 给出 3 条候选回复 →
 一键填入输入框。**发送永远手动，程序不替你按发送。**
 
@@ -355,7 +349,6 @@ NOTICE                  出处、第三方组件许可证与商用约束
 docs/KICKOFF.md         最初的需求和硬约束说明
 docs/icon.ico           程序图标，tools/make_icon.py 生成
 docs/ui_*.png           README 里那三张截图，tools/preview_ui.py --screenshot 出的
-docs/wechat-mp.png      公众号「恸码奇点」长条横幅，README 标题下和设置页底部共用
 config.json             你自己的设置，不进仓库（在 .gitignore 里）
 ```
 
@@ -392,7 +385,7 @@ config.json             你自己的设置，不进仓库（在 .gitignore 里�
   429 等错误保留服务端返回的原因
 - 修：Win10 1909 上采集不再切换不受支持的光标/边框选项；候选被过滤光时明确报错；长会话名和回复对象名
   在窄窗口按宽度省略，选项里仍保留完整名称
-- 源码安装说明明确 Python 3.10–3.12；README 和设置页加入公众号「恸码奇点」入口
+- 源码安装说明明确 Python 3.10–3.12
 
 **v0.1.9**
 - 设置页「模型」卡片：判断 · Jev（OpenRouter / TypeSafe 直连）+ 起草 · 语言模型（12 家预设 + 自定义

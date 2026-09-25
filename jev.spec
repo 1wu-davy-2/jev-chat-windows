@@ -15,7 +15,6 @@ hiddenimports = [
     "core.llm",
 ]
 datas, binaries = [], []
-datas += [("docs/wechat-mp.png", "docs")]  # 设置页底部的公众号长条横幅
 for pkg in (
     "rapidocr_onnxruntime",  # .onnx 模型 + config.yaml 是包数据，不收就是启动即炸
     "onnxruntime",           # capi 下面那堆 DLL
