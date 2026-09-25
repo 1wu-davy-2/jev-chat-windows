@@ -10,13 +10,12 @@
 3. **截图不落盘**：捕获得到的位图始终是内存里的对象（numpy/PIL），全程不写磁盘、不进日志、不上传。
 4. **绝不自动发送**，不点发送按钮；填入输入框后停手。
 5. **不碰钱**：转账、红包、收款相关界面元素一律不碰。
-6. OpenRouter key 只从环境变量 `OPENROUTER_API_KEY` 读，任何文件不出现 key。
+6. 全局只有两把 key：Jev 一把（`JEV_API_KEY`）、语言模型一把（`LLM_API_KEY`），只从环境变量 / 注册表读，任何文件不出现 key。
 7. Python 读写文件一律 `encoding='utf-8'`。
 
 ## 为什么走 OCR（已实测的结论，别重测）
 
-- 微信 Windows 4.x（进程 `Weixin.exe`，窗口类 `Qt51514QWindowIcon`）界面自绘在一块
-  GPU 合成画布上（`MMUIRenderSubWindowHW`）。UIA 树只有 2 个节点、**没有控件树**——实测证伪。
+- 目标窗口界面自绘在一块 GPU 合成画布上（`MMUIRenderSubWindowHW`）。UIA 树只有 2 个节点、**没有控件树**——实测证伪。
 - 所以唯一干净的非侵入采集路 = 截自己的微信窗口 + 本地 OCR。离线、零 token。
 
 ## 已经建好，直接用（`core/`，平台无关）
@@ -35,7 +34,7 @@
 ## 待建（新会话干这些）
 
 1. **`capture.py` — 窗口级截图到内存，不落盘**
-   - 目标窗口：`Weixin.exe` / 类 `Qt51514QWindowIcon` / 标题「微信」。
+   - 目标窗口按进程名和主窗口标题挑，不按面积。
    - 微信是 GPU 合成窗口，`PrintWindow` 容易黑屏 → **优先用 Windows Graphics Capture**
      （pip `windows-capture`，帧直接是 numpy，可捕获被遮挡/GPU 窗口）。
      兜底：`PrintWindow` 带 `PW_RENDERFULLCONTENT=2`；再兜底：区域抓屏（需窗口可见）。

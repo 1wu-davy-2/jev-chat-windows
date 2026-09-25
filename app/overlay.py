@@ -1,44 +1,33 @@
 # -*- coding: utf-8 -*-
-"""浅色置顶回复助手：回复建议和独立设置页。发送始终由用户在微信确认。"""
+"""浅色置顶回复助手：回复建议和独立设置页。发送始终由用户确认。"""
+import os
+import sys
+import threading
 from datetime import datetime
 from math import isfinite
+from types import SimpleNamespace
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QSizeGrip, QSizePolicy, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QSizeGrip, QSizePolicy,
+    QStackedWidget, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
-    BodyLabel, CardWidget, CheckBox, ComboBox, FluentIcon as FIF, HyperlinkButton,
-    IndeterminateProgressBar, LineEdit, PasswordLineEdit, PlainTextEdit,
+    BodyLabel, CardWidget, CheckBox, ComboBox, EditableComboBox, FluentIcon as FIF,
+    HyperlinkButton, IndeterminateProgressBar, LineEdit, PasswordLineEdit, PlainTextEdit,
     PrimaryPushButton, PushButton, ScrollArea, SpinBox, SwitchButton, Theme, TransparentToolButton,
     setCustomStyleSheet, setFont, setTheme, setThemeColor,
 )
 
 from app import settings
 from app.version import VERSION
+from core import jev_client, llm, providers
+from core.questions import CHOICE_LABELS
 
 _LOG_LINES = 300
 _MUTED = "#68776f"
 _GREEN = "#18794e"
-_CHOICES = {
-    "true_intent": {
-        "confirm_you_care": "希望确认你在意", "vent_anger": "表达不满或受伤",
-        "request_action": "希望你采取行动", "seek_explanation": "希望了解原因",
-        "casual_chat": "轻松交流", "close_topic": "平和结束话题",
-    },
-    "best_action": {
-        "check_history": "先核对聊天记录", "apologize": "为已知问题道歉",
-        "give_commitment": "给出具体承诺", "explain": "说明事实与原因",
-        "acknowledge": "回应并表达理解", "say_less": "简短回应或留白",
-        "make_plan": "商量具体安排",
-    },
-    "she_needs": {
-        "apology": "真诚道歉", "action": "具体行动或安排", "explanation": "清楚的解释",
-        "care": "关注与在意", "nothing": "可能无需补充回应",
-    },
-}
 _RELATIONSHIPS = [
     ("恋人", "romantic partners"), ("朋友", "friends"), ("同事", "colleagues"),
     ("家人", "family"), ("自定义", None),
@@ -46,7 +35,75 @@ _RELATIONSHIPS = [
 
 
 def _choice(answers, name):
-    return _CHOICES[name].get((answers.get(name) or {}).get("choice"), "暂未判断")
+    return CHOICE_LABELS[name].get((answers.get(name) or {}).get("choice"), "暂未判断")
+
+
+def _mp_banner_path() -> str:
+    """打包后在 _MEIPASS/docs，源码跑在仓库 docs/。"""
+    root = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(root, "docs", "wechat-mp.png")
+
+
+class _MpBanner(QLabel):
+    """公众号长条横幅，宽度跟着设置页走，高度按原图比例。"""
+
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self._src = QPixmap(path)
+        self._shown = 0
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        if self._src.isNull() or w <= 0 or self._src.width() <= 0:
+            return 0
+        return max(1, round(w * self._src.height() / self._src.width()))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        w = self.width()
+        if w <= 0 or w == self._shown or self._src.isNull():
+            return
+        h = self.heightForWidth(w)
+        self._shown = w
+        self.setPixmap(self._src.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        if self.height() != h:
+            self.setFixedHeight(h)
+
+
+class _FitCombo(ComboBox):
+    """长名字不撑开窄布局。按钮上按当前宽度省略；条目仍是全文，findText 靠它。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._full = ""
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def setText(self, text):
+        self._full = text or ""
+        QPushButton.setText(self, self._elide(self._full))
+        if self._full and self.text() != self._full:
+            self.setToolTip(self._full)
+
+    def minimumSizeHint(self):
+        hint = QPushButton.minimumSizeHint(self)
+        return QSize(48, hint.height())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        shown = self._elide(self._full)
+        if shown != self.text():
+            QPushButton.setText(self, shown)
+        if self._full and shown != self._full:
+            self.setToolTip(self._full)
+
+    def _elide(self, text):
+        # 右侧箭头大约 28px。还没排上版时先按一个窄宽度省略，避免最小宽度被整句名字撑开。
+        avail = self.width() - 36 if self.width() > 64 else 120
+        return self.fontMetrics().elidedText(text, Qt.ElideRight, max(24, avail))
 
 
 def _label(text="", size=14, color=None, bold=False, parent=None):
@@ -86,6 +143,12 @@ class _Surface(CardWidget):
 
     def _pressedBackgroundColor(self):
         return self._normalBackgroundColor()
+
+
+class _Fetched(QObject):
+    """取模型列表的后台线程 → 主线程：哪一组（SimpleNamespace）、取回来的模型 id、失败原因（成功是空串）。
+    Qt 不让跨线程碰控件，信号是跨线程唯一干净的路。"""
+    done = Signal(object, list, str)
 
 
 class _TitleBar(QWidget):
@@ -140,8 +203,8 @@ class _ReplyCard(_Surface):
         box.addWidget(self.text)
         bottom = QHBoxLayout()
         bottom.addStretch(1)
-        self.fillButton = (PrimaryPushButton if recommended else PushButton)("填入微信", self)
-        self.fillButton.setAccessibleName(f"填入{'推荐回复' if recommended else f'备选 {number}'}到微信")
+        self.fillButton = (PrimaryPushButton if recommended else PushButton)("填入", self)
+        self.fillButton.setAccessibleName(f"填入{'推荐回复' if recommended else f'备选 {number}'}")
         self.fillButton.clicked.connect(lambda: owner._fill(index))
         bottom.addWidget(self.fillButton)
         box.addLayout(bottom)
@@ -157,15 +220,18 @@ class _ReplyCard(_Surface):
 
 
 class Overlay:
-    def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None):
+    def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
+                 on_toggle_debug=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
-        on_target_change(会话名, 人名) → 用户在群里挑了回复对象。"""
+        on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
+        on_toggle_debug(开不开) → 开关调试视图那个独立窗口。"""
         self.app = QApplication.instance() or QApplication([])
         setTheme(Theme.LIGHT)
         setThemeColor(_GREEN, save=False)
         self.on_fill = on_fill
         self.on_toggle_capture = on_toggle_capture
         self.on_target_change = on_target_change
+        self.on_toggle_debug = on_toggle_debug
         self.result_of = result_of
         self.cands = []
         self.cards = []
@@ -182,7 +248,7 @@ class Overlay:
         self._shown = ""  # 界面上正在看的会话（浏览时和上面不一样）
         self.win = _MainWindow(self._relayout)
         self.win.setObjectName("assistantWindow")
-        self.win.setWindowTitle("Jev · 微信回复助手")
+        self.win.setWindowTitle("JevChat-Windows")
         self.win.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.win.setStyleSheet(
             "QWidget#assistantWindow { background: #f5f7f6; border: 1px solid #dce3de; border-radius: 14px; }"
@@ -200,14 +266,14 @@ class Overlay:
         name.setFixedWidth(40)
         name.setAttribute(Qt.WA_TransparentForMouseEvents)
         title.addWidget(name)
-        self.subtitle = _label("微信回复助手", 12, _MUTED)
+        self.subtitle = _label("JevChat-Windows", 12, _MUTED)
         self.subtitle.setAttribute(Qt.WA_TransparentForMouseEvents)
         title.addWidget(self.subtitle, 1)
         self.captureSwitch = SwitchButton(header)
         self.captureSwitch.setOnText("采集中")
         self.captureSwitch.setOffText("已暂停")
-        self.captureSwitch.setToolTip("开启或暂停微信采集")
-        self.captureSwitch.setAccessibleName("开启或暂停微信采集")
+        self.captureSwitch.setToolTip("开启或暂停采集")
+        self.captureSwitch.setAccessibleName("开启或暂停采集")
         self.captureSwitch.setChecked(True)
         self.captureSwitch.checkedChanged.connect(self._capture_toggled)
         title.addWidget(self.captureSwitch)
@@ -250,7 +316,7 @@ class Overlay:
         self.win.resize(min(440, screen.width() - 32), min(820, screen.height() - 48))
         self.win.move(screen.right() - self.win.width() - 20, screen.top() + 24)
         self._relayout(self.win.width(), self.win.height())  # resizeEvent 补不到构造时这一次
-        self.set_status("等待新消息" if settings.has_key() else "需要配置回复服务",
+        self.set_status("等待新消息" if settings.has_key() else "需要配置模型",
                         "idle" if settings.has_key() else "warning")
         self.win.show()
 
@@ -288,7 +354,7 @@ class Overlay:
         for label in self._hintLabels:
             label.setVisible(not compact)
         self.referenceNote.setVisible(bool(self.cands) and not compact)
-        self._sync_ds_fields()
+        self._sync_model_fields()
         margins = (12, 8, 12, 12) if compact else (20, 8, 20, 12)
         for layout in self._pageLayouts:
             layout.setContentsMargins(*margins)
@@ -308,11 +374,10 @@ class Overlay:
         prefix = _label("当前会话", 12, _MUTED)
         prefix.setFixedWidth(56)
         chat_row.addWidget(prefix)
-        self.chatBox = ComboBox()
-        self.chatBox.setMinimumWidth(0)  # 别让会话名的长度撑开整行，宽度交给 stretch
+        self.chatBox = _FitCombo()
         self.chatBox.setPlaceholderText("尚未识别到会话")
         self.chatBox.setAccessibleName("当前会话")
-        self.chatBox.setToolTip("微信切到哪个会话这里就跟到哪个；也可以自己选一个，只看它的记录和建议")
+        self.chatBox.setToolTip("聊天窗口切到哪个会话这里就跟到哪个；也可以自己选一个，只看它的记录和建议")
         self.chatBox.currentIndexChanged.connect(self._on_chat_selected)
         chat_row.addWidget(self.chatBox, 1)
         self.chatFollow = _label("", 11, _MUTED)
@@ -327,15 +392,14 @@ class Overlay:
         target_prefix = _label("回复对象", 12, _MUTED)
         target_prefix.setFixedWidth(56)
         target_row.addWidget(target_prefix)
-        self.targetBox = ComboBox()
-        self.targetBox.setMinimumWidth(0)  # 人名长度不定，别让它撑开整行
+        self.targetBox = _FitCombo()
         self.targetBox.setAccessibleName("回复对象")
         self.targetBox.setToolTip("三条候选都按这个人来写；不选就跟着最近说话的那位")
         self.targetBox.currentIndexChanged.connect(self._on_target_selected)
         target_row.addWidget(self.targetBox, 1)
         self.atCheck = CheckBox("填入时带 @")
         self.atCheck.setChecked(True)
-        self.atCheck.setToolTip("填入时在开头加「@名字 」。只是普通文字，微信不会认成真正的 @")
+        self.atCheck.setToolTip("填入时在开头加「@名字 」。只是普通文字，不会变成真正的 @")
         target_row.addWidget(self.atCheck)
         self.targetRow.hide()
         body.addWidget(self.targetRow)
@@ -385,7 +449,7 @@ class Overlay:
         self.emptyTitle = _label("等待对方的新消息", 17, "#304c3c", True)
         self.emptyTitle.setAlignment(Qt.AlignCenter)
         empty_box.addWidget(self.emptyTitle)
-        self.emptyHint = _label("保持微信聊天窗口打开。\n收到新消息后，回复建议会出现在这里。", 13, _MUTED)
+        self.emptyHint = _label("保持聊天窗口打开。\n收到新消息后，回复建议会出现在这里。", 13, _MUTED)
         self.emptyHint.setAlignment(Qt.AlignCenter)
         empty_box.addWidget(self.emptyHint)
         self.setupButton = PrimaryPushButton("前往设置")
@@ -394,7 +458,7 @@ class Overlay:
         empty_box.addWidget(self.setupButton, 0, Qt.AlignHCenter)
         if not settings.has_key():
             self.emptyTitle.setText("先设置，再开始")
-            self.emptyHint.setText("配置回复服务和关系背景，\n让建议更贴近你们的对话。")
+            self.emptyHint.setText("配置模型和关系背景，\n让建议更贴近你们的对话。")
         body.addWidget(self.empty)
         self.replyBox = QVBoxLayout()
         self.replyBox.setSpacing(10)
@@ -423,7 +487,7 @@ class Overlay:
         heading.addWidget(_tool(FIF.RETURN, "返回回复建议", self._back_home))
         heading.addWidget(_label("设置", 23, "#24382d", True), 1)
         body.addLayout(heading)
-        body.addWidget(_label("调整关系背景，连接你的回复服务。", 13, _MUTED))
+        body.addWidget(_label("调整关系背景，配置判断和起草用的两个模型。", 13, _MUTED))
         preference = _Surface()
         box = QVBoxLayout(preference)
         box.setContentsMargins(16, 16, 16, 18)
@@ -485,52 +549,37 @@ class Overlay:
         box.addWidget(self._hint(
             "只向 GitHub 查最新版本号，不发送任何数据。国内访问 GitHub 慢的话关掉也行。"
         ))
+        debug_row = QHBoxLayout()
+        debug_row.addWidget(_label("调试视图", 13), 1)
+        self.debugSwitch = SwitchButton()
+        self.debugSwitch.setOnText("开")
+        self.debugSwitch.setOffText("关")
+        self.debugSwitch.setAccessibleName("调试视图")
+        self.debugSwitch.checkedChanged.connect(self._debug_toggled)  # 这个开关立刻生效，不等「保存设置」
+        debug_row.addWidget(self.debugSwitch)
+        box.addLayout(debug_row)
+        box.addWidget(self._hint(
+            "另开一个窗口实时显示截到的画面和识别框：绿 = 我、蓝 = 对方、灰 = 过滤掉的灰字、"
+            "红 = 当成图片丢掉、黄 = 小字丢掉。只在内存里画，不存图。"
+        ))
         body.addWidget(preference)
 
-        connection = _Surface()
-        box = QVBoxLayout(connection)
+        models = _Surface()
+        box = QVBoxLayout(models)
         box.setContentsMargins(16, 16, 16, 18)
         box.setSpacing(12)
-        heading = QHBoxLayout()
-        heading.addWidget(_label("回复服务", 16, "#304c3c", True), 1)
-        self.keyState = _label("", 12, _GREEN)
-        self.keyState.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        heading.addWidget(self.keyState)
-        box.addLayout(heading)
-        key_label = _label("OpenRouter API 密钥", 13)
-        box.addWidget(key_label)
-        self.keyEdit = PasswordLineEdit()
-        self.keyEdit.setAccessibleName("OpenRouter API 密钥")
-        key_label.setBuddy(self.keyEdit)
-        self.keyEdit.returnPressed.connect(self._save)
-        box.addWidget(self.keyEdit)
-        box.addWidget(self._hint("Jev 判断和排序走 OpenRouter，必填。起草也可以走它。"))
-        provider_label = _label("起草模型来源", 13)
-        box.addWidget(provider_label)
-        self.providerBox = ComboBox()
-        self.providerBox.setMinimumWidth(0)  # 选项文字很长，别让它撑开设置页
-        self.providerBox.addItems(["OpenRouter（DeepSeek V4.1 Flash，用上面同一个 key）",
-                                   "DeepSeek 直连（更快，需要 DeepSeek key）"])
-        self.providerBox.setAccessibleName("起草模型来源")
-        provider_label.setBuddy(self.providerBox)
-        box.addWidget(self.providerBox)
-        ds_heading = QHBoxLayout()
-        ds_label = _label("DeepSeek API 密钥", 13)
-        ds_heading.addWidget(ds_label, 1)
-        self.dsKeyState = _label("", 12, _GREEN)
-        self.dsKeyState.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        ds_heading.addWidget(self.dsKeyState)
-        box.addLayout(ds_heading)
-        self.dsKeyEdit = PasswordLineEdit()
-        self.dsKeyEdit.setAccessibleName("DeepSeek API 密钥")
-        ds_label.setBuddy(self.dsKeyEdit)
-        self.dsKeyEdit.returnPressed.connect(self._save)
-        box.addWidget(self.dsKeyEdit)
-        self.dsHint = _label("platform.deepseek.com 申请。已配置时留空保留当前密钥。", 12, _MUTED)
-        box.addWidget(self.dsHint)
-        # 只有选了直连才显示这一组；dsHint 额外还要看紧凑模式，单独存，不进 _hintLabels
-        self._dsWidgets = (ds_label, self.dsKeyState, self.dsKeyEdit)
-        self.providerBox.currentIndexChanged.connect(lambda index: self._sync_ds_fields())
+        box.addWidget(_label("模型", 16, "#304c3c", True))
+        self._fetched = _Fetched()
+        self._fetched.done.connect(self._models_fetched)
+        self.jev = self._model_group(box, "判断 · Jev", "jev", providers.JEV_PROVIDERS)
+        box.addWidget(self._hint(
+            "判断意图、紧张度，并给三条候选排序。两家给的是同一个 Jev，必填。"
+        ))
+        self.draft = self._model_group(box, "起草 · 语言模型", "draft", providers.DRAFT_PROVIDERS)
+        box.addWidget(self._hint(
+            "写那三条候选。OpenAI / Anthropic / Gemini 三种接口都走各自官方 SDK。"
+            "默认 DeepSeek 官网直连，国内最快。"
+        ))
         think_row = QHBoxLayout()
         think_row.addWidget(_label("起草时开启思考模式", 13), 1)
         self.thinkingSwitch = SwitchButton()
@@ -540,9 +589,10 @@ class Overlay:
         think_row.addWidget(self.thinkingSwitch)
         box.addLayout(think_row)
         box.addWidget(self._hint(
-            "关：秒回，够用。开：模型先想再写，更斟酌但慢好几倍、贵一些。两种来源都生效。"
+            "关：秒回，够用。开：模型先想再写，更斟酌但慢好几倍、贵一些。"
+            "只有 " + " / ".join(providers.THINKING) + " 认这个开关。"
         ))
-        body.addWidget(connection)
+        body.addWidget(models)
         self.settingsFeedback = _label("", 13, _GREEN)
         self.settingsFeedback.hide()
         body.addWidget(self.settingsFeedback)
@@ -556,6 +606,9 @@ class Overlay:
         actions.addWidget(self.saveButton)
         body.addLayout(actions)
         body.addWidget(self._hint("保存后用于下一次生成的回复。"))
+        banner = _mp_banner_path()
+        if os.path.exists(banner):
+            body.addWidget(_MpBanner(banner))
         body.addStretch(1)
         self._load_settings()
 
@@ -565,19 +618,151 @@ class Overlay:
         self._hintLabels.append(label)
         return label
 
-    def _sync_ds_fields(self):
-        """DeepSeek 那组字段：选了直连才显示；说明文字紧凑模式下再多加一条限制。
-        顺带把 providerBox 按钮上的文字按紧凑模式省略——它是 QPushButton，
-        minimumSizeHint 跟 sizeHint 一样是按整段文字算的，不会自动换行/省略，
-        选项文字很长（"OpenRouter（DeepSeek V4.1 Flash，用上面同一个 key）"）时会把设置页撑宽。"""
-        deepseek = self.providerBox.currentIndex() == 1
-        for w in self._dsWidgets:
-            w.setVisible(deepseek)
-        self.dsHint.setVisible(deepseek and not self._compact)
-        full = self.providerBox.currentText()
-        if self._compact:
-            full = self.providerBox.fontMetrics().elidedText(full, Qt.ElideRight, 200)
-        self.providerBox.setText(full)
+    def _model_group(self, box, title, kind, table):
+        """一组「来源 / 密钥 / 模型」控件，判断和起草各一份。table 是 core/providers.py 里那张表。"""
+        group = SimpleNamespace(kind=kind, table=table, ids=list(table),
+                                keyTitle="判断" if kind == "jev" else "起草",
+                                stored_key=lambda k=kind: (settings.jev_key() if k == "jev"
+                                                           else settings.llm_key()))
+        heading = QHBoxLayout()
+        heading.addWidget(_label(title, 14, "#304c3c", True), 1)
+        group.keyState = _label("", 12, _GREEN)
+        group.keyState.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        heading.addWidget(group.keyState)
+        box.addLayout(heading)
+        source_label = _label("来源", 13)
+        box.addWidget(source_label)
+        group.providerBox = ComboBox()
+        group.providerBox.setMinimumWidth(0)  # 选项文字长短不一，别让它撑开设置页
+        group.providerBox.addItems([table[i].name for i in group.ids])
+        group.providerBox.setAccessibleName(f"{title} 来源")
+        source_label.setBuddy(group.providerBox)
+        box.addWidget(group.providerBox)
+        if kind == "draft":  # 只有两个「自定义」来源要自己填地址，别的来源这一行藏着
+            self.baseLabel = _label("Base URL", 13)
+            box.addWidget(self.baseLabel)
+            self.baseEdit = LineEdit()
+            self.baseEdit.setPlaceholderText("https://你的服务/v1")
+            self.baseEdit.setAccessibleName("自定义来源 Base URL")
+            self.baseLabel.setBuddy(self.baseEdit)
+            box.addWidget(self.baseEdit)
+        key_label = _label("密钥", 13)
+        box.addWidget(key_label)
+        group.keyEdit = PasswordLineEdit()
+        group.keyEdit.setAccessibleName(f"{title} API 密钥")
+        key_label.setBuddy(group.keyEdit)
+        group.keyEdit.returnPressed.connect(self._save)
+        box.addWidget(group.keyEdit)
+        box.addWidget(self._hint(
+            "OpenRouter 的 key 或 TypeSafe 的 key，看上面选的来源。" if kind == "jev"
+            else "上面选哪家就填哪家的 key；换来源重填一次，只存这一把。"))
+        model_label = _label("模型", 13)
+        box.addWidget(model_label)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        group.modelBox = EditableComboBox()  # 能选也能手打，接口新出的模型不用等我改代码
+        group.modelBox.setMinimumWidth(0)
+        group.modelBox.setAccessibleName(f"{title} 模型")
+        model_label.setBuddy(group.modelBox)
+        row.addWidget(group.modelBox, 1)
+        group.fetchButton = PushButton("获取模型")
+        group.fetchButton.setAccessibleName(f"获取{title}的可用模型列表")
+        group.fetchButton.clicked.connect(lambda: self._fetch_models(group))
+        row.addWidget(group.fetchButton)
+        box.addLayout(row)
+        group.status = _label("", 12, _MUTED)
+        box.addWidget(group.status)
+        group.providerBox.currentIndexChanged.connect(lambda _: self._provider_changed(group))
+        return group
+
+    @staticmethod
+    def _provider_of(group):
+        return group.ids[max(0, group.providerBox.currentIndex())]
+
+    def _provider_changed(self, group):
+        """换来源：模型框回到这家该有的值（存的就是这家才用存的，否则用它的默认），状态清掉。"""
+        provider = self._provider_of(group)
+        saved = settings.jev_provider() if group.kind == "jev" else settings.draft_provider()
+        stored = settings.jev_model() if group.kind == "jev" else settings.draft_model()
+        group.modelBox.clear()
+        group.modelBox.setText(stored if provider == saved else group.table[provider].default)
+        group.status.setText("")
+        self._sync_model_fields()
+
+    def _sync_model_fields(self):
+        """两组共用：密钥已配置/未配置、占位文案、自定义 Base URL 行的显隐，
+        外加紧凑模式下把来源按钮上的文字省略——ComboBox 是 QPushButton，
+        minimumSizeHint 按整段文字算，不会自动换行/省略，长名字会把设置页撑宽。"""
+        for group in (self.jev, self.draft):
+            provider = self._provider_of(group)
+            name = group.table[provider].name
+            configured = bool(group.stored_key())
+            group.keyState.setText("已配置" if configured else "未配置")
+            group.keyEdit.setPlaceholderText(
+                "已配置，留空保留" if configured else f"输入 {name} API 密钥")
+            if self._compact:
+                name = group.providerBox.fontMetrics().elidedText(name, Qt.ElideRight, 180)
+            group.providerBox.setText(name)
+        custom = self._provider_of(self.draft) in providers.CUSTOM
+        self.baseLabel.setVisible(custom)
+        self.baseEdit.setVisible(custom)
+
+    def _fetch_models(self, group):
+        """「获取模型」：拿填的 key（没填就拿存的）去问接口，网络调用丢后台线程。"""
+        provider = self._provider_of(group)
+        custom = group.kind == "draft" and provider in providers.CUSTOM
+        base = self.baseEdit.text().strip() if custom else None
+        key = group.keyEdit.text().strip() or group.stored_key()
+        if not key:
+            group.status.setText("先填密钥")
+            return
+        if custom and not base:
+            group.status.setText("先填 Base URL")
+            return
+        group.status.setText("获取中…")
+        group.fetchButton.setEnabled(False)
+        threading.Thread(target=lambda: self._list_models(group, provider, key, base),
+                         daemon=True).start()
+
+    def _list_models(self, group, provider, key, base):
+        """后台线程：判断走 jev_client，起草按协议走 llm；失败把原因一起送回主线程。"""
+        try:
+            if group.kind == "jev":
+                models = jev_client.list_models(provider, key)
+            else:
+                spec = providers.DRAFT_PROVIDERS[provider]
+                models = llm.list_models(spec.protocol, base or spec.base, key, headers=spec.headers)
+                if spec.keep:  # 目录里混了别的协议时，只留这条路打得通的
+                    models = [m for m in models if spec.keep(m)]
+            reason = "" if models else "这个来源没返回任何模型"
+        except Exception as exc:  # 线程里漏异常会静默吞掉，按钮就永远停在禁用态
+            models, reason = [], str(exc)[:120]
+        self._fetched.done.emit(group, models, reason)
+
+    def _models_fetched(self, group, models, reason):
+        """回到主线程：填进下拉框，原来选中的还在列表里就留着。"""
+        group.fetchButton.setEnabled(True)
+        if not models:
+            group.status.setText(reason or "获取失败，检查密钥、网络或 Base URL")
+            return
+        current = group.modelBox.text().strip()
+        group.modelBox.clear()
+        group.modelBox.addItems(models)
+        if current in models:
+            group.modelBox.setCurrentIndex(models.index(current))
+        else:
+            group.modelBox.setText(current)  # 手打的没在列表里也不清掉
+        group.status.setText(f"共 {len(models)} 个")
+
+    def _set_group(self, group, provider, model):
+        """把存下来的来源和模型放回一组控件里；填充不算用户操作，别触发换来源的重置。"""
+        group.providerBox.blockSignals(True)
+        group.providerBox.setCurrentIndex(group.ids.index(provider))
+        group.providerBox.blockSignals(False)
+        group.keyEdit.clear()
+        group.modelBox.clear()
+        group.modelBox.setText(model)
+        group.status.setText("")
 
     def _load_settings(self):
         relationship = settings.relationship()
@@ -589,41 +774,48 @@ class Overlay:
         self.styleEdit.setText(settings.style())
         self.contextBox.setValue(settings.context())
         self.targetSwitch.setChecked(settings.reply_target())
-        self.keyEdit.clear()
-        self.keyEdit.setPlaceholderText("已配置，留空保留" if settings.has_key() else "输入你的 API 密钥")
-        self.keyState.setText("已配置" if settings.has_key() else "未配置")
-        deepseek = settings.draft_provider() == "deepseek"
-        self.providerBox.setCurrentIndex(1 if deepseek else 0)
-        self.dsKeyEdit.clear()
-        self.dsKeyEdit.setPlaceholderText(
-            "已配置，留空保留" if settings.has_deepseek_key() else "输入你的 DeepSeek 密钥")
-        self.dsKeyState.setText("已配置" if settings.has_deepseek_key() else "未配置")
+        self._set_group(self.jev, settings.jev_provider(), settings.jev_model())
+        self._set_group(self.draft, settings.draft_provider(), settings.draft_model())
+        self.baseEdit.setText(settings.draft_base_url())
         self.thinkingSwitch.setChecked(settings.thinking())
         self.updateSwitch.setChecked(settings.check_update())
-        self._sync_ds_fields()  # setCurrentIndex 没变就不发信号，这里补一次
+        self.set_debug_switch(settings.debug_view())  # 屏蔽信号地拨，别在加载时开关一遍窗口
+        self._sync_model_fields()  # 上面屏蔽了信号，这里补一次
         self.settingsFeedback.hide()
 
     def _save(self):
         relationship = _RELATIONSHIPS[self.relationshipBox.currentIndex()][1]
         relationship = relationship or self.relEdit.text().strip()
-        key = self.keyEdit.text().strip()
-        provider = "deepseek" if self.providerBox.currentIndex() == 1 else "openrouter"
-        deepseek_key = self.dsKeyEdit.text().strip()
+        jev_provider = self._provider_of(self.jev)
+        draft_provider = self._provider_of(self.draft)
+        base = self.baseEdit.text().strip()
         if not relationship:
             self._settings_feedback("请填写关系背景，或选择一个已有选项。", error=True)
             self.relEdit.setFocus()
             return
-        if not key and not settings.has_key():
-            self._settings_feedback("请先填写 OpenRouter API 密钥。", error=True)
-            self.keyEdit.setFocus()
+        if draft_provider in providers.CUSTOM and not base:
+            self._settings_feedback("自定义来源要填 Base URL。", error=True)
+            self.baseEdit.setFocus()
             return
-        if provider == "deepseek" and not deepseek_key and not settings.has_deepseek_key():
-            self._settings_feedback("选了 DeepSeek 直连就得填 DeepSeek API 密钥。", error=True)
-            self.dsKeyEdit.setFocus()
-            return
+        for group, provider in ((self.jev, jev_provider), (self.draft, draft_provider)):
+            name = group.table[provider].name
+            if not group.keyEdit.text().strip() and not group.stored_key():
+                self._settings_feedback(f"请先填写 {group.keyTitle} 的 API 密钥。", error=True)
+                group.keyEdit.setFocus()
+                return
+            if not group.modelBox.text().strip():
+                self._settings_feedback(f"{name} 请先获取并选择一个模型。", error=True)
+                group.modelBox.setFocus()
+                return
         try:
-            settings.save(key or None, relationship, self.contextBox.value(),
-                          deepseek_key or None, provider,
+            settings.save(relationship, self.contextBox.value(),
+                          jev_provider_text=jev_provider,
+                          jev_key_text=self.jev.keyEdit.text().strip() or None,
+                          jev_model_text=self.jev.modelBox.text().strip(),
+                          draft_provider_text=draft_provider,
+                          llm_key_text=self.draft.keyEdit.text().strip() or None,
+                          draft_model_text=self.draft.modelBox.text().strip(),
+                          draft_base_url_text=base,
                           reply_target_on=self.targetSwitch.isChecked(),
                           style_text=self.styleEdit.text().strip(),
                           thinking_on=self.thinkingSwitch.isChecked(),
@@ -639,6 +831,18 @@ class Overlay:
             self._empty_text()
             self.set_status("设置已就绪，等待新消息", "idle")
 
+    def _debug_toggled(self, on):
+        """调试视图独立于「保存设置」：拨一下就开窗/收窗，顺手落盘，重启还在。"""
+        settings.save(debug_view_on=on)
+        if self.on_toggle_debug:
+            self.on_toggle_debug(on)
+
+    def set_debug_switch(self, on):
+        """调试窗被用户直接关掉时把开关拨回去；屏蔽信号，免得又回调一圈。"""
+        self.debugSwitch.blockSignals(True)
+        self.debugSwitch.setChecked(on)
+        self.debugSwitch.blockSignals(False)
+
     def _settings_feedback(self, text, error=False):
         color = "#b44832" if error else _GREEN
         qss = f"BodyLabel {{ color: {color}; background: transparent; }}"
@@ -651,11 +855,11 @@ class Overlay:
             self._load_settings()
         self.pages.setCurrentWidget(self.settingsPage)
         self.settingsButton.setEnabled(False)
-        (self.relationshipBox if settings.has_key() else self.keyEdit).setFocus()
+        (self.relationshipBox if settings.has_key() else self.jev.keyEdit).setFocus()
 
     def _back_home(self):
-        self.keyEdit.clear()
-        self.dsKeyEdit.clear()
+        self.jev.keyEdit.clear()
+        self.draft.keyEdit.clear()
         self.pages.setCurrentWidget(self.home)
         self.settingsButton.setEnabled(True)
 
@@ -667,17 +871,17 @@ class Overlay:
         except Exception as e:
             # 状态栏保持友好文案；真实原因和压缩堆栈进聊天记录，认得出是哪一步炸的
             import traceback
-            self.set_status("未能填入，请确认微信窗口可用后重试，或复制回复。", "error")
+            self.set_status("未能填入，请确认聊天窗口可用后重试，或复制回复。", "error")
             self.log(f"[填入失败] {type(e).__name__}: {e}")
             self.log(f"[填入失败堆栈] {' '.join(traceback.format_exc().split())[:300]}")
             return
-        self.set_status("已尝试填入，请在微信确认内容后发送。", "success")
+        self.set_status("已尝试填入，请确认内容后发送。", "success")
 
     def _copy(self, index):
         if self._busy or not self._current or index >= len(self.cands):
             return
         self.app.clipboard().setText(self.cands[index])
-        self.set_status("回复已复制，可在微信中粘贴并修改。", "success")
+        self.set_status("回复已复制，可粘贴并修改。", "success")
 
     def _capture_toggled(self, on):
         """用户自己拨的开关：界面先改，再通知父进程去开/停采集。"""
@@ -702,16 +906,16 @@ class Overlay:
         """开关状态对应的状态行和空态文案。已有的候选不受影响，暂停了照样能填入/复制。"""
         configured = settings.has_key()
         if not on:
-            self.set_status(reason or "采集已暂停，微信内容不再读取", "warning")
+            self.set_status(reason or "采集已暂停，聊天内容不再读取", "warning")
         elif configured:
             self.set_status("等待新消息", "idle")
         else:
-            self.set_status("请先在设置中配置回复服务", "warning")
+            self.set_status("请先在设置中配置模型", "warning")
         if self._busy or self.cands:  # 正在生成或已有候选时，空态卡片本来就看不见
             return
         if not on:
             self.emptyTitle.setText("采集已暂停")
-            self.emptyHint.setText("微信里的内容暂时不再读取。\n打开标题栏的开关，继续接收新消息。")
+            self.emptyHint.setText("聊天内容暂时不再读取。\n打开标题栏的开关，继续接收新消息。")
             self.setupButton.setVisible(not configured)
         else:
             self._empty_text()
@@ -738,8 +942,8 @@ class Overlay:
         """空态卡片的默认文案，配好没配好两套说法。"""
         configured = settings.has_key()
         self.emptyTitle.setText("等待对方的新消息" if configured else "先设置，再开始")
-        self.emptyHint.setText("保持微信聊天窗口打开。\n收到新消息后，回复建议会出现在这里。"
-                               if configured else "配置回复服务和关系背景，\n让建议更贴近你们的对话。")
+        self.emptyHint.setText("保持聊天窗口打开。\n收到新消息后，回复建议会出现在这里。"
+                               if configured else "配置模型和关系背景，\n让建议更贴近你们的对话。")
         self.setupButton.setVisible(not configured)
 
     def invalidate_replies(self):
@@ -888,7 +1092,7 @@ class Overlay:
         return self.atCheck.isChecked()
 
     def _follow_text(self):
-        self.chatFollow.setText(("跟随微信" if self._shown == self._chat else "浏览中") if self._chat else "")
+        self.chatFollow.setText(("跟随" if self._shown == self._chat else "浏览中") if self._chat else "")
 
     def show_cached(self, result):
         """把某个会话上次的结果放回界面；没有就回到空态。浏览别的会话时只给看不给填——
@@ -905,7 +1109,7 @@ class Overlay:
             self._empty_text()
         if self._shown != self._chat:
             self.invalidate_replies()
-            self.set_status(f"正在浏览「{self._shown}」，只看不填；微信切回它才能用。")
+            self.set_status(f"正在浏览「{self._shown}」，只看不填；切回这个会话才能用。")
 
     def show(self, result):
         """按推荐顺序展示，按钮始终绑定 candidates 的原始索引。"""
