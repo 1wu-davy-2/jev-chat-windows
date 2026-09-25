@@ -17,9 +17,11 @@ import urllib.request
 from typing import NoReturn
 
 try:  # 当模块导入 / 当脚本直接跑 都能用
+    from . import relay
     from .providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
                             OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
 except ImportError:
+    import relay
     from providers import (ENV_VARS, JEV_ENV, JEV_PROVIDERS, LEGACY,
                            OPENROUTER_DECISIONS, OPENROUTER_KEY_URL, TYPESAFE_BASE)
 
@@ -66,9 +68,9 @@ def _fail(exc: Exception, what: str) -> NoReturn:
 
 
 def _api_key(env: str = JEV_ENV) -> str:
-    """两把 key 之一（JEV_API_KEY / LLM_API_KEY）。新名字空着就退回老名字，老用户不用重填。"""
-    key = ((os.environ.get(env) or "").strip()
-           or (os.environ.get(LEGACY.get(env, "")) or "").strip())
+    """两把 key 之一（JEV_API_KEY / LLM_API_KEY）。新名字空着就按顺序退回老名字，老用户不用重填。"""
+    names = (env, *LEGACY.get(env, ()))
+    key = next((v for v in ((os.environ.get(n) or "").strip() for n in names) if v), "")
     if not key:
         raise JevError(
             f"{env} is not set. Export it in the environment; "
@@ -86,17 +88,28 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
 
 
 def ask(state: dict, questions: dict, timeout: float = 20,
-        provider: str = "openrouter", model: str | None = None) -> dict:
+        provider: str = "openrouter", model: str | None = None,
+        base_url: str = "", path: str = "") -> dict:
     """问 Jev 一轮判断，返回 {"answers": {名字: 答案}, "usage": {...}}。
 
-    provider ∈ JEV_PROVIDERS（openrouter / typesafe 直连）；model=None 用该来源的默认模型。
-    两条路返回的 dict 形状一模一样，429/529 都会退避重试。绝不打印或写出 key。
+    provider ∈ JEV_PROVIDERS（openrouter / typesafe 直连 / relay 第三方中转）；
+    model=None 用该来源的默认模型。
+    base_url / path 只有 relay 用：中转地址和它那个判断口的路径（各家叫法不同，见 core/relay.py）。
+    三条路返回的 dict 形状一模一样，429/529 都会退避重试。绝不打印或写出 key。
     """
     spec = JEV_PROVIDERS.get(provider) or JEV_PROVIDERS["openrouter"]
-    key = _api_key(JEV_ENV)  # 两家共用同一把 key，换来源不用重填
+    key = _api_key(JEV_ENV)  # 各家共用同一把 key，换来源不用重填
     model = model or spec.default
     if provider == "typesafe":
         return _ask_typesafe(state, questions, key, model, timeout)
+    if provider == "relay":
+        if not base_url.strip():
+            raise JevError("判断走第三方中转，但没填中转地址")
+        if not base_url.strip().startswith(("http://", "https://")):
+            # 少了 scheme 的话 urllib 抛的是 "unknown url type: ..."，看不懂也脱不了敏
+            raise JevError(f"中转地址要以 http:// 或 https:// 开头：{base_url.strip()!r}")
+        return _ask_openrouter(state, questions, key, model, timeout,
+                               url=relay.judge_url(base_url, path))
     return _ask_openrouter(state, questions, key, model, timeout)
 
 
@@ -131,8 +144,10 @@ def _ask_typesafe(state: dict, questions: dict, key: str, model: str, timeout: f
     }
 
 
-def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout: float) -> dict:
-    """OpenRouter 的 /api/alpha/decisions，手写 urllib。429/529 退避重试 3 次。"""
+def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout: float,
+                    url: str = OPENROUTER_DECISIONS) -> dict:
+    """OpenRouter 的 /api/alpha/decisions，手写 urllib。429/529 退避重试 3 次。
+    中转那条也走这里——同一个 wire 协议，只是地址和模型名换掉（url 参数）。"""
     payload = json.dumps(
         {"model": model, "state": state, "questions": questions},
         ensure_ascii=False,
@@ -142,7 +157,7 @@ def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout:
     last_body = ""
     for attempt in range(MAX_RETRIES + 1):
         req = urllib.request.Request(
-            OPENROUTER_DECISIONS,
+            url,
             data=payload,
             method="POST",
             headers={
@@ -203,8 +218,15 @@ def _check_openrouter_key(key: str, timeout: float) -> None:
             f"取模型列表失败: {redact_secrets(getattr(exc, 'reason', exc))}") from None
 
 
-def list_models(provider: str, key: str, timeout: float = 10) -> list[str]:
-    """某家能用的 Jev 模型 id，去重排序。失败抛 JevError（设置页直接显示这句话）。"""
+def list_models(provider: str, key: str, timeout: float = 10, base_url: str = "") -> list[str]:
+    """某家能用的 Jev 模型 id，去重排序。失败抛 JevError（设置页直接显示这句话）。
+    base_url 只有中转要传——它那边是个 OpenAI 兼容的模型目录，列出来的是中转上能用的全部模型，
+    jev 在不在里头看这家转不转，不在就自己手打名字。"""
+    if provider == "relay":
+        if not base_url.strip():
+            raise JevError("先填中转地址，才能取模型列表")
+        from .llm import list_models as _openai_models  # 延迟 import：llm 模块级就 import 本模块
+        return _openai_models("openai", relay.openai_base(base_url), key, timeout)
     if provider == "typesafe":
         import typesafe_sdk
 
@@ -316,6 +338,23 @@ if __name__ == "__main__":
         assert ask({"chat": {}}, questions) == body
     assert seen["url"] == OPENROUTER_DECISIONS
     assert seen["body"]["model"] == "typesafe/jev-1.13" and seen["body"]["questions"] == questions
+
+    # 中转：同一个 wire 协议，只是地址按 core/relay.py 拼、模型名换成中转上的
+    with patch.object(urllib.request, "urlopen", _fake_urlopen):
+        assert ask({"chat": {}}, questions, provider="relay", model="jev-latest",
+                   base_url="https://api.x.com/v1", path="/v1/systemone") == body
+    assert seen["url"] == "https://api.x.com/v1/systemone"
+    assert seen["body"]["model"] == "jev-latest"
+    with patch.object(urllib.request, "urlopen", _fake_urlopen):
+        ask({"chat": {}}, questions, provider="relay", base_url="https://api.x.com")
+    assert seen["url"] == "https://api.x.com/api/alpha/decisions"  # 路径留空 = OpenRouter 那个默认
+    # 没填地址 / 地址少了 scheme：都得当场说人话，不能等 urllib 抛 unknown url type
+    for bad, want in (("", "没填中转地址"), ("api.x.com", "http:// 或 https://")):
+        try:
+            ask({"chat": {}}, questions, provider="relay", base_url=bad)
+            raise SystemExit("应当抛错")
+        except JevError as e:
+            assert want in str(e), (bad, str(e))
 
     # OpenRouter 路的列表是写死的，但 key 要过 auth/key 探测：mock urlopen 验两头
     def _fake_key_ok(req, timeout=None):

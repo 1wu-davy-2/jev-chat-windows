@@ -13,6 +13,7 @@ import os
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
 
 from core.providers import CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, LEGACY, LLM_ENV
+from core.relay import DEFAULT_JUDGE_PATH, DEFAULT_THINKING_STYLE, THINKING_STYLES
 
 _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -48,29 +49,59 @@ def style() -> str:
     return str(_read("style") or "")
 
 def jev_provider() -> str:
-    """判断模型走哪家：openrouter（默认）或 typesafe 直连。"""
+    """判断模型走哪家：openrouter（默认）、typesafe 直连，或 relay 第三方中转。"""
     v = _read("jev_provider")
-    return v if v in JEV_PROVIDERS else _DEFAULT_JEV
+    if v in JEV_PROVIDERS:
+        return v
+    # 加中转那版没有「判断来源」这一项，只有一个 relay_judge 开关；开着就是走中转
+    return "relay" if v is None and _read("relay_judge") else _DEFAULT_JEV
 
 def jev_model() -> str:
     """判断模型 id；空 = 用该来源的默认模型。"""
+    if jev_provider() == "relay":  # 中转的模型名在旧字段里叫 relay_jev_model
+        return str(_read("jev_model") or _read("relay_jev_model") or "").strip() \
+            or JEV_PROVIDERS["relay"].default
     return str(_read("jev_model") or "") or JEV_PROVIDERS[jev_provider()].default
 
 def draft_provider() -> str:
-    """起草走哪家（见 core/providers.DRAFT_PROVIDERS）。老配置里的 openrouter/deepseek 照样认。"""
+    """起草走哪家（见 core/providers.DRAFT_PROVIDERS）。老配置里的 openrouter/deepseek 照样认；
+    加中转那版的 "custom" 就是指中转，换成现在这个名字。"""
     v = _read("draft_provider")
+    if v == "custom":
+        return "relay"
     return v if v in DRAFT_PROVIDERS else _DEFAULT_DRAFT
 
 def draft_provider_name() -> str:
     return DRAFT_PROVIDERS[draft_provider()].name
 
 def draft_model() -> str:
-    """起草模型 id；空 = 用该来源的默认模型（有的来源没有默认，那就得自己选）。"""
-    return str(_read("draft_model") or "") or DRAFT_PROVIDERS[draft_provider()].default
+    """起草模型 id；空 = 用该来源的默认模型（有的来源没有默认，那就得自己选）。
+    中转的模型名在旧字段里叫 relay_draft_model。"""
+    stored = str(_read("draft_model") or "").strip()
+    if not stored and draft_provider() == "relay":
+        stored = str(_read("relay_draft_model") or "").strip()
+    return stored or DRAFT_PROVIDERS[draft_provider()].default
 
 def draft_base_url() -> str:
-    """自定义来源的 Base URL；其余来源用表里的，这里返回空。"""
-    return str(_read("draft_base_url") or "") if draft_provider() in CUSTOM else ""
+    """自定义来源的 Base URL；其余来源用表里的，这里返回空。
+    中转的地址不走这个字段（它那个是判断也共用的），见 relay_base_url()。"""
+    p = draft_provider()
+    return str(_read("draft_base_url") or "") if p in CUSTOM and p != "relay" else ""
+
+def relay_base_url() -> str:
+    """第三方中转的地址，起草和判断共用同一个。空 = 没配。"""
+    return str(_read("relay_base_url") or "").strip()
+
+def relay_judge_path() -> str:
+    """中转上判断/排序那个口的路径。留空用 OpenRouter 那个默认；
+    PackyCode 的 typesafe 通道那种要填 /v1/systemone（见 core/relay.py）。"""
+    return str(_read("relay_judge_path") or "").strip() or DEFAULT_JUDGE_PATH
+
+def relay_thinking_style() -> str:
+    """中转认哪种思考开关（thinking / reasoning / none）。传错派系不报错、只被无视——
+    思考照开、max_tokens 全被推理吃掉，表现为「起草结果解析不出候选」。"""
+    v = str(_read("relay_thinking_style") or "").strip()
+    return v if v in THINKING_STYLES else DEFAULT_THINKING_STYLE
 
 def reply_target() -> bool:
     """群聊指定回复对象：开了才在界面上选回复给谁、才把对象喂给模型。默认关。"""
@@ -153,7 +184,9 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          llm_key_text: str | None = None, draft_model_text: str | None = None,
          draft_base_url_text: str | None = None, reply_target_on: bool | None = None,
          style_text: str | None = None, thinking_on: bool | None = None,
-         check_update_on: bool | None = None, debug_view_on: bool | None = None) -> None:
+         check_update_on: bool | None = None, debug_view_on: bool | None = None,
+         relay_base_url_text: str | None = None, relay_judge_path_text: str | None = None,
+         relay_thinking_style_text: str | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -179,6 +212,9 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "jev_provider": jev, "jev_model": keep(jev_model_text, "jev_model"),
         "draft_provider": draft, "draft_model": keep(draft_model_text, "draft_model"),
         "draft_base_url": keep(draft_base_url_text, "draft_base_url"),
+        "relay_base_url": keep(relay_base_url_text, "relay_base_url"),
+        "relay_judge_path": keep(relay_judge_path_text, "relay_judge_path"),
+        "relay_thinking_style": keep(relay_thinking_style_text, "relay_thinking_style"),
         "reply_target": flag(reply_target_on, reply_target),
         "thinking": flag(thinking_on, thinking),
         "check_update": flag(check_update_on, check_update),

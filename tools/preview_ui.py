@@ -107,31 +107,44 @@ def main() -> int:
     )
     parser.add_argument("--state", choices=_STATES, default="ready", help="预览界面状态")
     parser.add_argument("--screenshot", metavar="PATH", help="将演示界面保存为 PNG 后退出（合成数据，不含微信内容）")
+    parser.add_argument("--relay", action="store_true",
+                        help="演示第三方中转那组字段（地址 / 判断接口路径 / 思考开关的传法）")
     args = parser.parse_args()
     target = Path(args.screenshot).expanduser() if args.screenshot else None
 
-    # 演示里：判断走 OpenRouter，起草走 DeepSeek 官网；全程就两把 key，都当「已配置」
+    # 演示里：判断走 OpenRouter，起草走 DeepSeek 官网；全程就两把 key，都当「已配置」。
+    # --relay 换成两边都走第三方中转，把那一组字段露出来（地址是编的，不会联网）。
     configured = "" if args.state == "setup" else "demo-key"
     demo_settings = {"relationship": "friends", "context": 10,
                      "jev_key": configured, "llm_key": configured,
-                     "jev_provider": "openrouter", "jev_model": "typesafe/jev-1.13",
-                     "draft_provider": "deepseek", "draft_model": "deepseek-flash",
+                     "jev_provider": "relay" if args.relay else "openrouter",
+                     "jev_model": "jev-latest" if args.relay else "typesafe/jev-1.13",
+                     "draft_provider": "relay" if args.relay else "deepseek",
+                     "draft_model": "deepseek-flash",
                      "draft_base_url": "", "reply_target": True,
                      "style": "话少，基本不用标点，急了才发感叹号", "thinking": False,
-                     "check_update": True, "debug_view": args.state == "debug"}
+                     "check_update": True, "debug_view": args.state == "debug",
+                     "relay_base_url": "https://中转站.example" if args.relay else "",
+                     "relay_judge_path": "/v1/systemone",
+                     "relay_thinking_style": "thinking"}
 
     def save_demo_settings(relationship_text=None, context_n=None, *, jev_provider_text=None,
                            jev_key_text=None, jev_model_text=None, draft_provider_text=None,
                            llm_key_text=None, draft_model_text=None, draft_base_url_text=None,
                            reply_target_on=None, style_text=None, thinking_on=None,
-                           check_update_on=None, debug_view_on=None):
+                           check_update_on=None, debug_view_on=None,
+                           relay_base_url_text=None, relay_judge_path_text=None,
+                           relay_thinking_style_text=None):
         if relationship_text:
             demo_settings["relationship"] = relationship_text
         if context_n is not None:
             demo_settings["context"] = context_n
         for name, value in (("jev_provider", jev_provider_text), ("jev_model", jev_model_text),
                             ("draft_provider", draft_provider_text), ("draft_model", draft_model_text),
-                            ("draft_base_url", draft_base_url_text), ("style", style_text)):
+                            ("draft_base_url", draft_base_url_text), ("style", style_text),
+                            ("relay_base_url", relay_base_url_text),
+                            ("relay_judge_path", relay_judge_path_text),
+                            ("relay_thinking_style", relay_thinking_style_text)):
             if value is not None:
                 demo_settings[name] = value
         for name, key in (("jev_key", jev_key_text), ("llm_key", llm_key_text)):
@@ -142,7 +155,7 @@ def main() -> int:
             if value is not None:
                 demo_settings[name] = bool(value)
 
-    def fake_jev_models(provider, key, timeout=10):
+    def fake_jev_models(provider, key, timeout=10, base_url=""):
         """演示不联网：给一小撮假模型，让「获取模型」按钮在本地也走得通。"""
         return (["typesafe/jev-1.13"] if provider == "openrouter"
                 else ["jev-1.13.0", "jev-latest", "jev-preview"])
@@ -168,6 +181,9 @@ def main() -> int:
         draft_provider=lambda: demo_settings["draft_provider"],
         draft_model=lambda: demo_settings["draft_model"],
         draft_base_url=lambda: demo_settings["draft_base_url"],
+        relay_base_url=lambda: demo_settings["relay_base_url"],
+        relay_judge_path=lambda: demo_settings["relay_judge_path"],
+        relay_thinking_style=lambda: demo_settings["relay_thinking_style"],
         reply_target=lambda: demo_settings["reply_target"],
         style=lambda: demo_settings["style"],
         thinking=lambda: demo_settings["thinking"],
@@ -226,6 +242,12 @@ def main() -> int:
             def save_screenshot():
                 nonlocal exit_code
                 try:
+                    # --relay 要拍的「模型」卡片在设置页下半截，先滚下去，不然截到的还是上半截。
+                    # settingsPage 自己就是那个 ScrollArea（_scroll_page 直接把 scroll 返回了）
+                    if args.relay and args.state == "settings":
+                        bar = ov.settingsPage.verticalScrollBar()
+                        bar.setValue(bar.maximum())
+                        ov.app.processEvents()
                     target.parent.mkdir(parents=True, exist_ok=True)
                     if not shot.grab().save(str(target), "PNG"):
                         raise OSError(f"无法保存截图：{target}")

@@ -12,7 +12,7 @@ hiddenimports = [
     "app.worker", "app.capture", "app.ocr", "app.fill", "app.overlay", "app.settings",
     "app.version", "app.update", "app.debugwin",  # debugwin 是开了调试视图才 import 的
     "core.engine", "core.draft", "core.jev_client", "core.questions", "core.providers",
-    "core.llm",
+    "core.llm", "core.relay",
 ]
 datas, binaries = [], []
 for pkg in (

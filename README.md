@@ -51,6 +51,29 @@ DeepSeek 官方 API（`api.deepseek.com`）国内直连，起草基本就是一�
 判断那一步比起草轻得多，慢一点无所谓，默认走 OpenRouter 即可；嫌慢就把它也换成 TypeSafe 直连。
 两把 key 都只进注册表，不落文件。
 
+**还可以用第三方中转**
+
+两节的来源里都有 **第三方中转**：填中转商给的地址、密钥，起草和判断就都走它（地址两节共用，
+选任意一节的中转都能填）。地址写法不挑，`https://api.xxx.com`、`https://api.xxx.com/v1`、
+连 `/chat/completions` 一起粘进去都认。
+
+判断那一路比较特殊：它走的不是标准的 `/v1/chat/completions`，各家中转叫法不同——OpenRouter 官方是
+`/api/alpha/decisions`，PackyCode 的 typesafe 通道是 `/v1/systemone`。填错会回 404 或
+「only supports ... protocol」，**报错里会写它认哪个口**，照着填进「判断接口路径」。
+`probe/probe_relay.py` 能把这两个口和几条路径挨个试一遍：
+
+```powershell
+$env:RELAY_BASE_URL="https://api.xxx.com"; $env:RELAY_API_KEY="sk-..."
+$env:PYTHONPATH="."; python probe/probe_relay.py
+```
+
+还有一个坑：中转的模型可能**默认开着思考模式**，三句话的候选用不上，还慢还贵。关它的字段各家也不一样
+（DeepSeek 官方是 `thinking.type=disabled`，OpenRouter 是 `reasoning.enabled=false`），传错派系
+**不会报错、只会被无视**——表现为思考照开、`max_tokens` 全被推理吃掉，起草回来是空的。
+设置里「思考开关的传法」就是选这个的，选错了的症状是状态栏报「起草结果解析不出候选」。
+
+加中转那版用的 `RELAY_API_KEY` 仍然读得到：两把新 key 空着就退回它，老配置不用重填。
+
 **日常怎么用**
 
 - 聊天窗口开着、别最小化（用别的窗口盖住没事），把要聊的会话点开
@@ -93,8 +116,10 @@ DeepSeek 官方 API（`api.deepseek.com`）国内直连，起草基本就是一�
 - **调试视图**（可选）：另开一个窗口，实时画出截到的画面和每个识别框——绿 = 我、蓝 = 对方、
   灰 = 过滤掉的灰字、橙 = 当成发言人名、红 = 当成图片丢掉、黄 = 小字丢掉，外加消息区和头部的框、
   OCR 耗时、这一帧读出来的每一行。识别不对时一眼看出是哪一步的锅。只在内存里画，不存图。
-- **两个模型都能换**：判断走 OpenRouter 或 TypeSafe 直连；起草有 12 家预设（默认 DeepSeek 官网），
-  OpenAI / Anthropic / Gemini 三种协议都支持，也能填自己的 Base URL。全程只要两把 key。
+- **两个模型都能换**：判断走 OpenRouter、TypeSafe 直连或第三方中转；起草有 13 家预设（默认 DeepSeek
+  官网），OpenAI / Anthropic / Gemini 三种协议都支持，也能填自己的 Base URL。全程只要两把 key。
+- **第三方中转**：两节的来源都能改成中转商，地址写法不挑；判断那个专用口的路径可配，
+  `probe/probe_relay.py` 能挨个试出这家认哪个口。
 - **思考模式开关**：默认关；开了模型先想再写，更斟酌但慢好几倍、贵一些。
 - **参考上下文条数**：3~30，默认 10，起草和判断都按它取最近 N 条。
 - **说话风格**：一句话描述自己的口吻，补在「照着你最近发的消息模仿」之上。
@@ -121,19 +146,23 @@ DeepSeek 官方 API（`api.deepseek.com`）国内直连，起草基本就是一�
 - **API key 只进环境变量，而且全程只有两个。** `JEV_API_KEY`（判断）和 `LLM_API_KEY`（起草），
   不管来源选哪家都是这两个槽。都写进注册表 `HKCU\Environment`（跟 `setx` 同一个地方），任何文件里
   都不出现 key，也绝不进日志（报错文本一律脱敏）。老版本按来源分开存的 `OPENROUTER_API_KEY` /
-  `DEEPSEEK_API_KEY` 仍然能读到，保存一次就迁到新名字上。
+  `DEEPSEEK_API_KEY` 仍然能读到，保存一次就迁到新名字上；加中转那版的 `RELAY_API_KEY` 同样当作
+  这两把的兜底读。
 - **启动时查一次版本号（可关）。** 只向 GitHub Releases API 发一个 GET，带的只有 UA 和当前版本号，
   不夹带任何聊天内容；设置里「启动时检查更新」关掉就完全不发这个请求，源码直接跑（没有版本号）也
   不会发。
 
-什么会出网：判断（`JEV_API_KEY`）去你选的 OpenRouter 或 TypeSafe 直连；起草（`LLM_API_KEY`）发给你
-在设置里选的那家接口（DeepSeek 官网、OpenRouter、OpenAI、Moonshot、智谱、通义、硅基流动、
-OpenCode Go、Anthropic、Gemini，或者自填的 OpenAI 兼容 / Anthropic 兼容地址），加上启动时（可关）一次到
-GitHub 查版本号。**本项目没有任何自建服务器**，聊天内容只在触发分析的那一刻，发给你自己在设置里
-配置的那个接口，本项目不收集、不落盘、不进日志。发出去的内容固定是：**最近 N 条对话文本**（N =
-设置里的「参考上下文」，默认 10；群聊带发言人名）、**关系设置**、**你自己最近 12 条 60 字以内的短
+什么会出网：判断（`JEV_API_KEY`）去你选的 OpenRouter、TypeSafe 直连或第三方中转；起草（`LLM_API_KEY`）
+发给你在设置里选的那家接口（DeepSeek 官网、OpenRouter、OpenAI、Moonshot、智谱、通义、硅基流动、
+OpenCode Go、Anthropic、Gemini，或者自填的 OpenAI 兼容 / Anthropic 兼容 / 中转地址），加上启动时
+（可关）一次到 GitHub 查版本号。**本项目没有任何自建服务器**，聊天内容只在触发分析的那一刻，发给你
+自己在设置里配置的那个接口，本项目不收集、不落盘、不进日志。发出去的内容固定是：**最近 N 条对话文本**
+（N = 设置里的「参考上下文」，默认 10；群聊带发言人名）、**关系设置**、**你自己最近 12 条 60 字以内的短
 消息**（当口吻样本，链接和长段不送）、**你填的说话风格**，群聊指定了回复对象的话再加一个对象名。
 除此之外没有别的。OCR 全程离线。GitHub 版本查询只带 UA 和当前版本号，不夹带任何聊天内容。
+
+选了第三方中转的话，这两次调用发到你填的那个中转地址，而不是官方——发出去的内容一字不差还是上面那些，
+但**收件方换成了中转商**，聊天内容会经过它，这一点自己掂量。
 
 **会不会因此被封号？** 本项目不 hook、不注入、不读对方的数据库或进程内存、不调用对方的任何
 私有接口或账号体系——只截自己这一个窗口的画面做 OCR，跟读屏软件、录屏软件是同一类操作。
@@ -163,6 +192,7 @@ WGC 截聊天窗口（GPU 合成窗口也能截，被遮挡也能截）
 | --- | --- | --- |
 | OpenRouter（默认） | `openrouter.ai/api/alpha/decisions` | `typesafe/jev-1.13` |
 | TypeSafe 直连 | `api.typesafe.ai`（官方 `typesafe-sdk`） | `jev-latest` |
+| 第三方中转 | 自己填（默认路径 `/api/alpha/decisions`，可改） | `jev-latest` |
 
 **起草 3 条候选（key：`LLM_API_KEY`）**
 
@@ -176,6 +206,7 @@ WGC 截聊天窗口（GPU 合成窗口也能截，被遮挡也能截）
 | 通义千问 | OpenAI | `dashscope.aliyuncs.com/compatible-mode/v1` | 自己选 |
 | 硅基流动 | OpenAI | `api.siliconflow.cn/v1` | 自己选 |
 | OpenCode Go | OpenAI | `opencode.ai/zen/go/v1` | `deepseek-v4.1-flash` |
+| 第三方中转 | OpenAI | 自己填（带不带 `/v1` 都认） | `deepseek-flash` |
 | Anthropic | Anthropic | `api.anthropic.com` | 自己选 |
 | Google Gemini | Gemini | SDK 自带 | 自己选 |
 | 自定义 · OpenAI 兼容 | OpenAI | 自己填 | 自己选 |
@@ -185,8 +216,8 @@ WGC 截聊天窗口（GPU 合成窗口也能截，被遮挡也能截）
 OpenCode Go 的列表只留走 `/chat/completions` 的模型（DeepSeek、GLM、Kimi、MiMo 等）；
 MiniMax、Qwen 走 `/messages`，Grok、GPT 走 `/responses`，选了会失败，所以不放进下拉框。
 三种协议各走自家官方 SDK（`openai` / `anthropic` / `google-genai`），不自己拼 HTTP；
-判断那条 OpenRouter 的路是唯一的例外——`typesafe-sdk` 把路径写死成 `/v1/systemone`，
-打不到 OpenRouter 的 `/api/alpha/decisions`。
+判断那条 OpenRouter 和第三方中转的路是例外——`typesafe-sdk` 把路径写死成 `/v1/systemone`，
+打不到 `/api/alpha/decisions` 那种专用口，这两条是手写 HTTP 的（同一段代码，只换地址和模型名）。
 
 两节各一把 key，都必填。链路是**三段式**（issue #4）：先让 Jev 答 7 道判断题，把
 「对方意图 / 对方需要 / 建议动作 / 紧张度」折成一小段中文小抄喂给起草，三条候选都顺着这个判断写；
@@ -273,14 +304,17 @@ pyinstaller --noconfirm --clean jev.spec
 | 群聊指定回复对象 | 开了群聊里才有「回复对象」那一行，候选针对 TA 写 | `config.json` → `reply_target`（默认关） |
 | 启动时检查更新 | 开了才在启动时查一次 GitHub 最新版本号，有新版本就在标题栏下面提示 | `config.json` → `check_update`（默认开） |
 | 调试视图 | 另开一个窗口实时显示截到的画面和识别框，看识别在哪一步认错。拨一下立刻生效，不用点保存；关掉那个窗口等于关掉开关 | `config.json` → `debug_view`（默认关） |
-| 判断 · 来源 | OpenRouter 还是 TypeSafe 直连 | `config.json` → `jev_provider`（默认 `openrouter`） |
+| 判断 · 来源 | OpenRouter、TypeSafe 直连或第三方中转 | `config.json` → `jev_provider`（默认 `openrouter`） |
 | 判断 · 密钥 | 上面选哪家就填哪家的 key。已配置时留空 = 保留 | 注册表 `HKCU\Environment` → `JEV_API_KEY` |
 | 判断 · 模型 | 可手打，也可点「获取模型」拉列表挑 | `config.json` → `jev_model`（空 = 该来源默认） |
 | 起草 · 来源 | 上面那张表里的任意一家 | `config.json` → `draft_provider`（默认 `deepseek`） |
-| 起草 · Base URL | 只有两个「自定义」来源才出现这一行 | `config.json` → `draft_base_url` |
+| 起草 · Base URL | 只有两个「自定义」来源才出现这一行（中转的地址走下面那组共用字段） | `config.json` → `draft_base_url` |
 | 起草 · 密钥 | 上面选哪家就填哪家的 key。已配置时留空 = 保留 | 注册表 `HKCU\Environment` → `LLM_API_KEY` |
 | 起草 · 模型 | 可手打，也可点「获取模型」拉列表挑 | `config.json` → `draft_model`（空 = 该来源默认） |
 | 起草时开启思考模式 | 开了模型先想再写，慢好几倍、贵一些 | `config.json` → `thinking`（默认关） |
+| 中转地址 | 任一节的来源选了「第三方中转」才出现；起草和判断共用同一个 | `config.json` → `relay_base_url` |
+| 判断接口路径 | 只有判断走中转时出现。留空 = `/api/alpha/decisions`，各家叫法不同，报错里会写它认哪个口 | `config.json` → `relay_judge_path` |
+| 思考开关的传法 | 中转认哪种思考字段（thinking / reasoning / 不传）。传错派系不报错、只被无视 | `config.json` → `relay_thinking_style`（默认 `thinking`） |
 
 主界面上那几个（标题栏的采集开关、「当前会话」和「回复对象」下拉、「填入时带 @」勾选框）只在内存里，
 不落盘，重启回默认。
@@ -323,7 +357,8 @@ core/                   Jev 判断内核，平台无关，跟安卓原版同一�
   engine.py             唯一入口 analyze(messages, relationship) → 候选 + 排序 + 判断
   providers.py          两张来源表（判断 / 起草）：协议、地址、默认模型；纯数据，不认 key
   llm.py                三种协议的薄适配层，一律走官方 SDK：openai / anthropic / google-genai
-  jev_client.py         Jev 判断客户端：OpenRouter（urllib）/ TypeSafe 直连（typesafe-sdk）；脱敏、退避
+  relay.py              第三方中转：把五花八门的地址写法归一到口、思考开关的三种传法；纯函数，不认 key
+  jev_client.py         Jev 判断客户端：OpenRouter / 第三方中转（urllib）/ TypeSafe 直连（typesafe-sdk）；脱敏、退避
   questions.py          7 道判断题 + build_state() + build_rank_question() + 判断小抄 guidance_text() / 中文标签 CHOICE_LABELS
   draft.py              起草 3 条候选：拼提示词、解析、过滤、不足时追问补齐；调用走 llm.py
 tools/
@@ -338,6 +373,7 @@ probe/                  一次性探针，结论已写进本文，留着是为�
   probe_ocr_speed.py    RapidOCR 一帧多久、裁小能快多少（结论：det_limit_type 必须 'max'）
   probe_ocr_live.py     WGC 持续盯窗口 + 变了就 OCR，新文字实时打控制台
   probe_printwindow.py  试 PrintWindow + PW_RENDERFULLCONTENT 能不能绕开 Win10 黄框（未验证）
+  probe_relay.py        第三方中转能不能替官方：起草口、判断口（挨个路径试）、jev 当普通 chat 模型各试一遍
   probe_laya.py         Laya（开源本地决策模型）能不能替 Jev：英文题跑 multilingual / typed-decisions → 都接近随机
   probe_laya_cn.py      同上，中文题问 multilingual → 更差
   probe_laya_en.py      把对话人工译成英文再喂 typed-decisions → 好一点，但生气那段仍判成闲聊
@@ -374,6 +410,17 @@ config.json             你自己的设置，不进仓库（在 .gitignore 里�
 - **没有托盘**：关窗口就是退出（标题栏的「最小化」是收到任务栏，不是后台常驻）。
 
 ## 更新记录
+
+**本仓库（Fork）：合并上游 v0.1.9–v0.1.11 + 第三方中转**
+- 合并上游 v0.1.9–v0.1.11 的 28 个提交（设置页「模型」卡片重做、三段式、识别调试窗口、
+  OpenCode Go 来源、Win10 1909 采集修复、保存密钥卡死修复等，逐条见下面各版本）
+- **去掉上游加的公众号广告**：README 的公众号段落与配图、设置页底部的长条横幅、打包资源与图片
+- 把本仓库原有的**第三方中转**接到上游新的来源表上：中转现在是 `providers.py` 里的一等来源
+  （判断 `JEV_PROVIDERS["relay"]`、起草 `DRAFT_PROVIDERS["relay"]`），起草走 OpenAI SDK、
+  判断复用 OpenRouter 那条 urllib 路（同一个 wire 协议，只换地址和模型名）
+- key 从「中转自己一把 `RELAY_API_KEY`」并进全局那两把（`JEV_API_KEY` / `LLM_API_KEY`），
+  旧变量仍作兜底读；老 `config.json` 里的 `custom` 起草来源、`relay_judge` 开关、
+  `relay_draft_model` / `relay_jev_model` 自动认
 
 **v0.1.10**
 - 先判断再起草（issue #4）：`analyze()` 改成三段式 —— Jev 先答 7 道判断题，判断折成中文小抄喂进

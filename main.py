@@ -103,15 +103,23 @@ def on_toggle_capture(on):
 
 
 def analyze_bg(msgs, title, revision, reply_to=None):
-    """后台线程只跑网络调用，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。"""
+    """后台线程只跑网络调用，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。
+
+    读设置整体挪进 try：在外面抛的话下面一条结果都不入队，busy 永远卡在 True。"""
     try:
+        # 起草和判断都可能是中转，那边地址只有一个（设置里共用），谁选中转就把它传给它
+        provider, jev_provider = settings.draft_provider(), settings.jev_provider()
+        relay_base = settings.relay_base_url()
         results.put(("ok", analyze(msgs, settings.relationship(), context=settings.context(),
                                    model=settings.draft_model() or None,
-                                   provider=settings.draft_provider(),
-                                   base_url=settings.draft_base_url() or None,
+                                   provider=provider,
+                                   base_url=(relay_base if "relay" in (provider, jev_provider)
+                                             else settings.draft_base_url()) or None,
                                    reply_to=reply_to, style=settings.style(),
                                    thinking=settings.thinking(),
-                                   jev_provider=settings.jev_provider(),
+                                   thinking_style=settings.relay_thinking_style(),
+                                   judge_path=settings.relay_judge_path(),
+                                   jev_provider=jev_provider,
                                    jev_model=settings.jev_model() or None),
                      title, revision))
     except Exception as e:

@@ -22,7 +22,7 @@ from qfluentwidgets import (
 
 from app import settings
 from app.version import VERSION
-from core import jev_client, llm, providers
+from core import jev_client, llm, providers, relay
 from core.questions import CHOICE_LABELS
 
 _LOG_LINES = 300
@@ -32,6 +32,8 @@ _RELATIONSHIPS = [
     ("恋人", "romantic partners"), ("朋友", "friends"), ("同事", "colleagues"),
     ("家人", "family"), ("自定义", None),
 ]
+# 「思考开关的传法」下拉框的索引 → core/relay.py 里的键。顺序得跟下面 addItems 一致
+_THINK_STYLE_ORDER = ("thinking", "reasoning", "none")
 
 
 def _choice(answers, name):
@@ -557,6 +559,39 @@ class Overlay:
             "关：秒回，够用。开：模型先想再写，更斟酌但慢好几倍、贵一些。"
             "只有 " + " / ".join(providers.THINKING) + " 认这个开关。"
         ))
+        # 中转那几项：来源选了「第三方中转」才露出来，起草和判断共用同一个地址
+        self.relayLabel = _label("中转地址", 13)
+        box.addWidget(self.relayLabel)
+        self.relayEdit = LineEdit()
+        self.relayEdit.setPlaceholderText("https://你的中转站（带不带 /v1 都认）")
+        self.relayEdit.setAccessibleName("第三方中转地址")
+        self.relayLabel.setBuddy(self.relayEdit)
+        box.addWidget(self.relayEdit)
+        self.judgePathLabel = _label("判断接口路径", 13)
+        box.addWidget(self.judgePathLabel)
+        self.judgePathEdit = LineEdit()
+        self.judgePathEdit.setPlaceholderText(relay.DEFAULT_JUDGE_PATH)
+        self.judgePathEdit.setAccessibleName("中转上的判断接口路径")
+        self.judgePathLabel.setBuddy(self.judgePathEdit)
+        box.addWidget(self.judgePathEdit)
+        style_row = QHBoxLayout()
+        style_row.addWidget(_label("思考开关的传法", 13), 1)
+        self.thinkStyleBox = ComboBox()
+        self.thinkStyleBox.setMinimumWidth(0)
+        self.thinkStyleBox.setAccessibleName("中转认哪种思考开关")
+        self.thinkStyleBox.addItems(["thinking（DeepSeek 那套）", "reasoning（OpenRouter 那套）",
+                                     "不传（中转自己会关）"])
+        style_row.addWidget(self.thinkStyleBox)
+        box.addLayout(style_row)
+        self.relayHint = self._hint(
+            "中转的地址写法不挑：带不带 /v1、连 /chat/completions 一起粘进来都认。"
+            "判断口各家叫法不同（OpenRouter 是 " + relay.DEFAULT_JUDGE_PATH +
+            "，PackyCode 的 typesafe 通道是 /v1/systemone），填错会回 404 或"
+            "「only supports ... protocol」，报错里会写它认哪个口。"
+            "思考开关传错派系不报错、只被无视——思考照开、max_tokens 全被推理吃掉，"
+            "表现为「起草结果解析不出候选」。probe/probe_relay.py 能把这两样挨个试出来。"
+        )
+        box.addWidget(self.relayHint)
         body.addWidget(models)
         self.settingsFeedback = _label("", 13, _GREEN)
         self.settingsFeedback.hide()
@@ -665,21 +700,34 @@ class Overlay:
             if self._compact:
                 name = group.providerBox.fontMetrics().elidedText(name, Qt.ElideRight, 180)
             group.providerBox.setText(name)
-        custom = self._provider_of(self.draft) in providers.CUSTOM
+        # 中转的地址走下面那一组共用字段，起草这行的 Base URL 就不重复露了
+        custom = (self._provider_of(self.draft) in providers.CUSTOM
+                  and self._provider_of(self.draft) != "relay")
         self.baseLabel.setVisible(custom)
         self.baseEdit.setVisible(custom)
+        on_relay = "relay" in (self._provider_of(self.jev), self._provider_of(self.draft))
+        for widget in (self.relayLabel, self.relayEdit, self.judgePathLabel, self.judgePathEdit,
+                       self.thinkStyleBox):
+            widget.setVisible(on_relay)
+        self.relayHint.setVisible(on_relay and not self._compact)
+        # 判断口只有判断也走中转时才用得上，起草走中转时藏起来少一行
+        judge_relay = self._provider_of(self.jev) == "relay"
+        self.judgePathLabel.setVisible(judge_relay)
+        self.judgePathEdit.setVisible(judge_relay)
 
     def _fetch_models(self, group):
         """「获取模型」：拿填的 key（没填就拿存的）去问接口，网络调用丢后台线程。"""
         provider = self._provider_of(group)
-        custom = group.kind == "draft" and provider in providers.CUSTOM
-        base = self.baseEdit.text().strip() if custom else None
+        on_relay = provider == "relay"  # 中转的地址在那个共用字段里，不在起草那行的 Base URL
+        custom = group.kind == "draft" and provider in providers.CUSTOM and not on_relay
+        base = (self.baseEdit.text().strip() if custom
+                else self.relayEdit.text().strip() if on_relay else None)
         key = group.keyEdit.text().strip() or group.stored_key()
         if not key:
             group.status.setText("先填密钥")
             return
-        if custom and not base:
-            group.status.setText("先填 Base URL")
+        if (custom or on_relay) and not base:
+            group.status.setText("先填中转地址" if on_relay else "先填 Base URL")
             return
         group.status.setText("获取中…")
         group.fetchButton.setEnabled(False)
@@ -690,9 +738,11 @@ class Overlay:
         """后台线程：判断走 jev_client，起草按协议走 llm；失败把原因一起送回主线程。"""
         try:
             if group.kind == "jev":
-                models = jev_client.list_models(provider, key)
+                models = jev_client.list_models(provider, key, base_url=base or "")
             else:
                 spec = providers.DRAFT_PROVIDERS[provider]
+                # 中转的地址要归一（带不带 /v1、带没带 /chat/completions 都得认）
+                base = relay.openai_base(base) if provider == "relay" and base else base
                 models = llm.list_models(spec.protocol, base or spec.base, key, headers=spec.headers)
                 if spec.keep:  # 目录里混了别的协议时，只留这条路打得通的
                     models = [m for m in models if spec.keep(m)]
@@ -739,6 +789,10 @@ class Overlay:
         self._set_group(self.jev, settings.jev_provider(), settings.jev_model())
         self._set_group(self.draft, settings.draft_provider(), settings.draft_model())
         self.baseEdit.setText(settings.draft_base_url())
+        self.relayEdit.setText(settings.relay_base_url())
+        self.judgePathEdit.setText(settings.relay_judge_path())
+        self.thinkStyleBox.setCurrentIndex(
+            _THINK_STYLE_ORDER.index(settings.relay_thinking_style()))
         self.thinkingSwitch.setChecked(settings.thinking())
         self.updateSwitch.setChecked(settings.check_update())
         self.set_debug_switch(settings.debug_view())  # 屏蔽信号地拨，别在加载时开关一遍窗口
@@ -755,10 +809,20 @@ class Overlay:
             self._settings_feedback("请填写关系背景，或选择一个已有选项。", error=True)
             self.relEdit.setFocus()
             return
-        if draft_provider in providers.CUSTOM and not base:
+        if draft_provider in providers.CUSTOM and draft_provider != "relay" and not base:
             self._settings_feedback("自定义来源要填 Base URL。", error=True)
             self.baseEdit.setFocus()
             return
+        relay_base = self.relayEdit.text().strip()
+        if "relay" in (jev_provider, draft_provider):
+            if not relay_base:
+                self._settings_feedback("来源选了第三方中转，要填中转地址。", error=True)
+                self.relayEdit.setFocus()
+                return
+            if not relay_base.startswith(("http://", "https://")):
+                self._settings_feedback("中转地址要以 http:// 或 https:// 开头。", error=True)
+                self.relayEdit.setFocus()
+                return
         for group, provider in ((self.jev, jev_provider), (self.draft, draft_provider)):
             name = group.table[provider].name
             if not group.keyEdit.text().strip() and not group.stored_key():
@@ -778,6 +842,10 @@ class Overlay:
                           llm_key_text=self.draft.keyEdit.text().strip() or None,
                           draft_model_text=self.draft.modelBox.text().strip(),
                           draft_base_url_text=base,
+                          relay_base_url_text=relay_base,
+                          relay_judge_path_text=self.judgePathEdit.text().strip(),
+                          relay_thinking_style_text=_THINK_STYLE_ORDER[
+                              max(0, self.thinkStyleBox.currentIndex())],
                           reply_target_on=self.targetSwitch.isChecked(),
                           style_text=self.styleEdit.text().strip(),
                           thinking_on=self.thinkingSwitch.isChecked(),
