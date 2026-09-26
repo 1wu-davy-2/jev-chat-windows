@@ -108,8 +108,13 @@ class _Mascot(QWidget):
 
 
 class PetWindow(QWidget):
-    """桌面宠物窗。clicked / dropped 由 Overlay 接线：前者展开面板，后者记住位置。"""
+    """桌面宠物窗。
+
+    手势分开：悬停 / 单击 → 弹紧凑候选条；双击 / 右键 → 展开完整面板；
+    拖动 → 记住位置。四个信号都由 Overlay 接线，这里只管发。"""
+    hovered = Signal()
     clicked = Signal()
+    expand = Signal()
     dropped = Signal(int, int)
 
     def __init__(self, parent=None):
@@ -223,6 +228,22 @@ class PetWindow(QWidget):
         y = min(max(self.y(), area.top()), area.bottom() - self.height())
         if (x, y) != (self.x(), self.y()):
             self.move(x, y)
+
+    def enterEvent(self, event):
+        """鼠标一搭上宠物就把候选条摆出来——不用先点一下。"""
+        self.hovered.emit()
+        super().enterEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag = None  # 双击的第一下已经被当成单击了，这里别再判一次
+            self.expand.emit()
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        """右键 = 展开完整面板（不弹菜单，少一步操作）。"""
+        self.expand.emit()
+        event.accept()
 
     # ── 拖动 / 点击 ──
     def mousePressEvent(self, event):

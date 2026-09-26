@@ -32,6 +32,8 @@ from core import jev_client, llm, providers, relay
 from core.questions import CHOICE_LABELS
 
 _LOG_LINES = 300
+_BAR_HOLD_MS = 25000  # 候选条自己待多久没人理就收起来（鼠标搭上来会重新计时）
+_BAR_LEAVE_MS = 700   # 鼠标离开候选条后宽限这么久再收，够从宠物挪到条上
 _MUTED = theme.MUTED   # 次要文字色（原来是偏绿的 #68776f，现在统一走 token）
 _ACCENT = theme.SAGE   # 强调色（原来是 #18794e）
 _RELATIONSHIPS = [
@@ -293,6 +295,10 @@ class _CandidateBar(QWidget):
     def __init__(self, owner, parent=None):
         super().__init__(parent)
         self.owner = owner
+        # 不设 flags 的话默认是 Qt.Window：会套一个 Windows 标题栏、还占任务栏一格
+        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
+                            Qt.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setFixedWidth(280 + 2 * SHADOW_PAD)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         outer = QVBoxLayout(self)
@@ -359,6 +365,15 @@ class _CandidateBar(QWidget):
         expand.clicked.connect(owner.show_panel)
         foot_row.addWidget(expand, 0, Qt.AlignRight)
         box.addWidget(self.foot)
+
+    def enterEvent(self, event):
+        """鼠标停在候选条上就别自动收了，不然正看着它自己跑掉。"""
+        self.owner._hold_bar()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.owner._schedule_bar_hide()
+        super().leaveEvent(event)
 
     def _set_pill(self, phase):
         text = self._PILL.get(phase, "")
@@ -494,11 +509,16 @@ class Overlay:
             # 素材读不到（打包漏了 PNG 之类）就退回「只有面板」的老形态，别启动即炸
             self.pet_enabled = False
             self.log("[宠物] 吉祥物素材读不到，已退回只有面板的形态")
-        self.pet.clicked.connect(self.show_panel)
+        # 悬停/单击宠物 → 弹紧凑候选条；双击/右键 → 展开完整面板
+        self.pet.hovered.connect(self._show_bar)
+        self.pet.clicked.connect(self._show_bar)
+        self.pet.expand.connect(self.show_panel)
         self.pet.dropped.connect(lambda x, y: settings.save_pet_pos(x, y))
         pos = settings.pet_pos()
         if pos:
             self.pet.move(*pos)
+        else:
+            self.pet.move_to_default()
         self._barTimer = QTimer(self.win)
         self._barTimer.setSingleShot(True)
         self._barTimer.timeout.connect(self.bar.hide)
@@ -1294,10 +1314,27 @@ class Overlay:
         if phase in ("notify", "thinking", "ready"):
             self._place_bar()
             self.bar.show()
-            if phase == "ready":
-                self._barTimer.start(12000)  # 没人理就自动收回去，宠物上的角标留着
+            self._barTimer.start(_BAR_HOLD_MS)  # 没人理就自己收回去，宠物上的角标留着
         else:
             self.bar.hide()
+
+    def _show_bar(self):
+        """悬停 / 单击宠物：把紧凑候选条摆出来。没有可看的东西就不弹，免得弹个空的。"""
+        if not self.pet_enabled or self._phase not in ("notify", "thinking", "ready"):
+            return
+        self._place_bar()
+        self.bar.show()
+        self._barTimer.start(_BAR_HOLD_MS)
+
+    def _hold_bar(self):
+        """鼠标搭在候选条上就续命，别正看着它自己跑掉。"""
+        if self.bar.isVisible():
+            self._barTimer.start(_BAR_HOLD_MS)
+
+    def _schedule_bar_hide(self):
+        """鼠标离开候选条：宽限一下再收，够用户从宠物挪到条上。"""
+        if self.bar.isVisible():
+            self._barTimer.start(_BAR_LEAVE_MS)
 
     def show_panel(self):
         """展开完整面板：贴到宠物旁边（没开宠物就还用原来那个右上角位置）。"""
