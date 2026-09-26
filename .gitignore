@@ -16,3 +16,21 @@ wechat_probe.png
 build/
 dist/
 *.spec.bak
+
+# 调研用的第三方仓库克隆（各自带 .git，别混进本仓库）
+# 只忽略克隆本身，cankao/ 下的调研报告照常可以提交
+cankao/anshangjian-chat-copilot/
+cankao/goutoujunshi/
+cankao/goutoujunshi-jev/
+cankao/goutoujunshi-jev-chat/
+cankao/wenyan/
+
+# grok-ui：Grok 生成的设计稿原型（React + Tailwind），只当 UI 重构的参考，不是本项目的运行时代码
+# 只忽略构建产物和 Grok 的工作区脚手架；src/ public/ screenshots/ 这些设计本体照常提交
+grok-ui/node_modules/
+grok-ui/.node_modules.lock
+grok-ui/.tanstack/
+grok-ui/.vercel/
+grok-ui/.grok/
+grok-ui/dist/
+grok-ui/.output/
