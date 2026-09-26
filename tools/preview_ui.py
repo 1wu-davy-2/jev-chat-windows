@@ -17,7 +17,7 @@ from app import settings
 
 
 _STATES = ("ready", "waiting", "loading", "error", "setup", "settings", "paused", "debug",
-           "ime", "ime-thinking", "pet", "bar")
+           "ime", "ime-thinking", "pet", "pet-menu", "bar")
 
 # 调试视图预览用的真微信截图（只读进内存，不改不存）；没有就退一张空画面
 _FRAME = Path("/private/tmp/claude-501/-Users-lpitiless-Documents-project-wechatjev"
@@ -127,7 +127,7 @@ def main() -> int:
                      "check_update": True, "debug_view": args.state == "debug",
                      # 只有宠物相关的状态才开宠物形态；其余状态保持「面板直接可见」，
                      # 不然面板从没 show 过，grab 出来是空的
-                     "pet_enabled": args.state in ("pet", "bar"), "pet_pos": None,
+                     "pet_enabled": args.state in ("pet", "pet-menu", "bar"), "pet_pos": None,
                      "relay_base_url": "https://中转站.example" if args.relay else "",
                      "relay_judge_path": "/v1/systemone",
                      "relay_thinking_style": "thinking"}
@@ -199,7 +199,7 @@ def main() -> int:
         save_pet_pos=lambda x, y: demo_settings.update(pet_pos=(x, y)),
         save=save_demo_settings,
     ):
-        from PySide6.QtCore import QTimer
+        from PySide6.QtCore import QPoint, QTimer
         from app.overlay import Overlay
 
         def simulate_fill(text):
@@ -216,6 +216,11 @@ def main() -> int:
         if args.state == "pet":
             # 宠物形态：启动时就只有宠物，不用喂消息，也不用展开面板
             shot = ov.pet
+        elif args.state == "pet-menu":
+            # 宠物右键菜单。不能走 _pet_menu()：exec() 是嵌套事件循环，截图回调永远轮不到。
+            # 这里只把菜单摆出来（popup 不阻塞），grab 的就是菜单自己。
+            shot = ov._build_pet_menu()
+            shot.popup(ov.pet.mapToGlobal(QPoint(ov.pet.width() // 2, ov.pet.height() // 2)))
         elif args.state == "debug":
             from app.debugwin import DebugWindow
 

@@ -93,6 +93,12 @@ main.py（父进程，只管界面和网络）
 | 候选条 | `app/overlay.py:_CandidateBar` | 280px，贴宠物上方（放不下翻下方） |
 | 面板 | `app/overlay.py:_MainWindow` | 就是原来那个悬浮窗，默认收起 |
 
+宠物右键菜单（`Overlay._build_pet_menu()`，三项：暂停采集 / 全屏（主页）/ 设置）里，「暂停采集」
+**不是**直接调 `on_toggle_capture`，而是 `captureSwitch.setChecked(...)` 让信号走一遍
+`checkedChanged → _capture_toggled`——直接调回调的话开关自己还停在旧状态，两边就各说各话了。
+菜单内容拆在 `_build_pet_menu()` 里而不是塞进 `contextMenuEvent`，是为了 `tools/preview_ui.py
+--state pet-menu` 能摆出来截图（`exec()` 是嵌套事件循环，截图回调进不去）。
+
 `phase`（idle/scanning/notify/thinking/ready）是**派生**出来的，不是事件流水账：
 `main.py:phase_now()` 是纯函数，`refresh_phase()` 是唯一写者、唯一调用点是 `tick()` 的出口。
 **别在 `drain()` 中途写 phase**，否则 `tick` 里「busy=False 紧跟 start_analyze 又置 True」那一瞬间

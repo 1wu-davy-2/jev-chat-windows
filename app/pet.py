@@ -114,11 +114,12 @@ class _Mascot(QWidget):
 class PetWindow(QWidget):
     """桌面宠物窗。
 
-    手势分开：悬停 / 单击 → 弹紧凑候选条；双击 / 右键 → 展开完整面板；
-    拖动 → 记住位置。四个信号都由 Overlay 接线，这里只管发。"""
+    手势分开：悬停 / 单击 → 弹紧凑候选条；双击 → 展开完整面板；右键 → 弹菜单；
+    拖动 → 记住位置。五个信号都由 Overlay 接线，这里只管发。"""
     hovered = Signal()
     clicked = Signal()
     expand = Signal()
+    context_menu = Signal(QPoint)  # 右键位置（全局坐标）；菜单内容归 Overlay 管
     dropped = Signal(int, int)
 
     def __init__(self, parent=None):
@@ -249,8 +250,10 @@ class PetWindow(QWidget):
         super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):
-        """右键 = 展开完整面板（不弹菜单，少一步操作）。"""
-        self.expand.emit()
+        """右键 = 弹菜单（暂停采集 / 全屏主页 / 设置）。
+
+        菜单内容不在这里建：这个类不知道采集开没开，也不该知道。位置发出去让 Overlay 摆。"""
+        self.context_menu.emit(event.globalPos())
         event.accept()
 
     # ── 拖动 / 点击 ──

@@ -14,10 +14,10 @@ from PySide6.QtWidgets import (
     QStackedWidget, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
-    BodyLabel, CardWidget, CheckBox, ComboBox, EditableComboBox, FluentIcon as FIF,
+    Action, BodyLabel, CardWidget, CheckBox, ComboBox, EditableComboBox, FluentIcon as FIF,
     HyperlinkButton, IndeterminateProgressBar, LineEdit, PasswordLineEdit, PlainTextEdit,
-    PrimaryPushButton, PushButton, ScrollArea, SpinBox, SwitchButton, Theme, TransparentToolButton,
-    setCustomStyleSheet, setFont, setTheme, setThemeColor,
+    PrimaryPushButton, PushButton, RoundMenu, ScrollArea, SpinBox, SwitchButton, Theme,
+    TransparentToolButton, setCustomStyleSheet, setFont, setTheme, setThemeColor,
 )
 
 from app import settings, theme
@@ -532,10 +532,11 @@ class Overlay:
             # 素材读不到（打包漏了 PNG 之类）就退回「只有面板」的老形态，别启动即炸
             self.pet_enabled = False
             self.log("[宠物] 吉祥物素材读不到，已退回只有面板的形态")
-        # 悬停/单击宠物 → 弹紧凑候选条；双击/右键 → 展开完整面板
+        # 悬停/单击宠物 → 弹紧凑候选条；双击 → 展开完整面板；右键 → 弹菜单
         self.pet.hovered.connect(self._show_bar)
         self.pet.clicked.connect(self._show_bar)
         self.pet.expand.connect(self.show_panel)
+        self.pet.context_menu.connect(self._pet_menu)
         self.pet.dropped.connect(lambda x, y: settings.save_pet_pos(x, y))
         pos = settings.pet_pos()
         if pos:
@@ -1401,6 +1402,37 @@ class Overlay:
     def collapse(self):
         """收起面板。宠物留着——它是常驻入口，也是拖拽的锚点。"""
         self.win.hide()
+
+    def _build_pet_menu(self):
+        """宠物右键菜单的内容：暂停采集 / 全屏（主页）/ 设置。
+
+        三项都只是既有入口的快捷方式，不新增数据流。单独拆成一个方法是为了
+        tools/preview_ui.py 能直接摆出来截图——exec() 是嵌套事件循环，截图回调进不去。"""
+        menu = RoundMenu(parent=self.pet)
+        capturing = self.captureSwitch.isChecked()
+        toggle = Action(FIF.PAUSE if capturing else FIF.PLAY,
+                        "暂停采集" if capturing else "继续采集", menu)
+        # 拨的就是标题栏那个开关：checkedChanged → _capture_toggled → 父进程，
+        # 跟手动点一下完全同一条路。不直接调 on_toggle_capture，否则开关自己还停在旧状态。
+        toggle.triggered.connect(lambda: self.captureSwitch.setChecked(not capturing))
+        menu.addAction(toggle)
+        home = Action(FIF.HOME, "全屏（主页）", menu)
+        home.triggered.connect(self._show_home)
+        menu.addAction(home)
+        prefs = Action(FIF.SETTING, "设置", menu)
+        prefs.triggered.connect(self.open_settings)
+        menu.addAction(prefs)
+        return menu
+
+    def _pet_menu(self, pos):
+        """右键宠物：在鼠标处弹菜单。"""
+        self._build_pet_menu().exec(pos)
+
+    def _show_home(self):
+        """「全屏（主页）」：面板露出来，并回到回复建议那一页（跟在设置页点「返回」一样）。"""
+        self.show_panel()
+        if self.pages.currentWidget() is not self.home:
+            self._back_home()
 
     def _quit(self):
         """真退出：三个窗口一起收掉。「收起」和「退出」是两回事，别混。"""
