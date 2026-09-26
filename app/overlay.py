@@ -211,6 +211,192 @@ class _ReplyCard(_Surface):
         self.fillButton.setMinimumWidth(80 if compact else 100)
 
 
+class _BarRow(QWidget):
+    """候选条里的一行：序号方块 + 正文/百分比 + 复制按钮。整行可点，等于「填入」。"""
+
+    def __init__(self, owner, index, parent=None):
+        super().__init__(parent)
+        self.owner = owner
+        self.index = index
+        self.recommended = False
+        self.setObjectName("barRow")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setCursor(Qt.PointingHandCursor)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(GAP_SM, GAP_SM, GAP_SM, GAP_SM)
+        row.setSpacing(GAP_SM)
+        self.number = QLabel("1")
+        self.number.setAlignment(Qt.AlignCenter)
+        self.number.setFixedSize(24, 24)
+        row.addWidget(self.number, 0, Qt.AlignTop)
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(1)
+        self.text = _label("", FONT_MD, theme.INK, True)
+        self.text.setWordWrap(False)
+        col.addWidget(self.text)
+        self.meta = _label("", FONT_XS, _MUTED)
+        col.addWidget(self.meta)
+        row.addLayout(col, 1)
+        self.copyButton = _tool(FIF.COPY, "复制这条回复", self._copy, self)
+        self.copyButton.setFixedSize(24, 24)
+        row.addWidget(self.copyButton, 0, Qt.AlignTop)
+        self._restyle()
+
+    def _copy(self):
+        self.owner._copy(self.index)
+
+    def set_content(self, text, meta, number, recommended):
+        self.text.setText(text)
+        self.meta.setText(meta)
+        self.number.setText(str(number))
+        self.recommended = recommended
+        self._restyle()
+
+    def _restyle(self):
+        """推荐那条用 sage 底、其余透明；悬停给一层 cream。序号方块跟着一起变。"""
+        bg = theme.SAGE_SOFT if self.recommended else "transparent"
+        hover = theme.SAGE_SOFT if self.recommended else theme.CREAM
+        self.setStyleSheet(
+            f"QWidget#barRow {{ background: {bg}; border-radius: {RADIUS_MD}px; }}"
+            f"QWidget#barRow:hover {{ background: {hover}; }}"
+        )
+        num_bg = theme.SAGE if self.recommended else theme.CREAM
+        num_fg = theme.PAPER if self.recommended else theme.INK
+        self.number.setStyleSheet(
+            f"QLabel {{ background: {num_bg}; color: {num_fg}; "
+            f"border-radius: {RADIUS_SM}px; font-weight: 600; }}"
+        )
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.owner._fill(self.index)
+        super().mouseReleaseEvent(event)
+
+
+class _CandidateBar(QWidget):
+    """宠物旁边的紧凑候选条（280px），对应设计稿的 CandidateIme。
+
+    平时不出现，有新消息才弹出来；点某一行 = 填入那条，右下角可展开成完整面板。
+    和面板共用同一份 cands，不新增数据流。
+
+    结构上分两层：外层留出 SHADOW_PAD 给投影，内层 frame 才画底色和圆角——
+    顶层窗口开了透明之后 QSS 背景不会被绘制（跟 _MainWindow 是同一个坑），
+    所以背景画在 frame 上、阴影也挂在 frame 上。"""
+    _PILL = {"scanning": "OCR", "notify": "提醒", "thinking": "判断", "ready": "候选"}
+    _BUSY = {"scanning": "正在截取聊天窗口并 OCR…",
+             "notify": "读到新消息，开始判断",
+             "thinking": "Jev 判断中，正在起草三条回复"}
+    _ROWS = 3
+
+    def __init__(self, owner, parent=None):
+        super().__init__(parent)
+        self.owner = owner
+        self.setFixedWidth(280 + 2 * SHADOW_PAD)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(SHADOW_PAD, SHADOW_PAD, SHADOW_PAD, SHADOW_PAD)
+        outer.setSpacing(0)
+        self.frame = QWidget()
+        self.frame.setObjectName("candidateBar")
+        self.frame.setAttribute(Qt.WA_StyledBackground, True)
+        self.frame.setStyleSheet(
+            f"QWidget#candidateBar {{ background: {theme.PAPER}; "
+            f"border-radius: {RADIUS_XL}px; }}"
+        )
+        theme.apply_shadow(self.frame, pop=True)
+        outer.addWidget(self.frame)
+        box = QVBoxLayout(self.frame)
+        box.setContentsMargins(GAP_SM, GAP_SM, GAP_SM, GAP_SM)
+        box.setSpacing(GAP_XS)
+
+        self.head = QWidget()
+        self.head.setObjectName("barHead")
+        self.head.setAttribute(Qt.WA_StyledBackground, True)
+        self.head.setStyleSheet(
+            f"QWidget#barHead {{ background: {theme.CREAM}; border-radius: {RADIUS_MD}px; }}"
+        )
+        head_row = QHBoxLayout(self.head)
+        head_row.setContentsMargins(10, GAP_SM, 10, GAP_SM)
+        head_row.setSpacing(GAP_SM)
+        head_col = QVBoxLayout()
+        head_col.setContentsMargins(0, 0, 0, 0)
+        head_col.setSpacing(1)
+        head_col.addWidget(_label("对方刚说", FONT_XS, _MUTED))
+        self.heard = _label("…", FONT_MD, theme.INK, True)
+        self.heard.setWordWrap(False)
+        head_col.addWidget(self.heard)
+        head_row.addLayout(head_col, 1)
+        self.pill = QLabel("")
+        self.pill.setAlignment(Qt.AlignCenter)
+        head_row.addWidget(self.pill, 0, Qt.AlignTop)
+        box.addWidget(self.head)
+
+        self.hint = _label("", FONT_MD, _MUTED)
+        self.hint.hide()
+        box.addWidget(self.hint)
+
+        self.rows = [_BarRow(owner, i, self.frame) for i in range(self._ROWS)]
+        for r in self.rows:
+            r.hide()
+            box.addWidget(r)
+
+        self.suggest = _label("", FONT_XS, _MUTED)
+        self.suggest.hide()
+        box.addWidget(self.suggest)
+
+        self.foot = QWidget()
+        foot_row = QHBoxLayout(self.foot)
+        foot_row.setContentsMargins(GAP_XS, GAP_XS, GAP_XS, 0)
+        foot_row.addWidget(_label("按 Ctrl+1/2/3 填入", FONT_XS, _MUTED), 1)
+        expand = QPushButton("展开面板")
+        expand.setFlat(True)
+        expand.setCursor(Qt.PointingHandCursor)
+        expand.setStyleSheet(
+            f"QPushButton {{ color: {theme.SAGE}; background: transparent; border: none; }}"
+        )
+        expand.clicked.connect(owner.show_panel)
+        foot_row.addWidget(expand, 0, Qt.AlignRight)
+        box.addWidget(self.foot)
+
+    def _set_pill(self, phase):
+        text = self._PILL.get(phase, "")
+        self.pill.setText(text)
+        self.pill.setVisible(bool(text))
+        if text:
+            self.pill.setStyleSheet(
+                f"QLabel {{ background: {theme.INK}; color: {theme.PAPER}; "
+                f"border-radius: {RADIUS_SM}px; padding: 1px 6px; }}"
+            )
+
+    def set_items(self, items, suggest, phase, heard=""):
+        """items: [(序号, 正文, 百分比或 None, 是否推荐)]。
+
+        候选行、忙碌文案、建议行三者按 phase 互斥（跟设计稿的 CandidateIme 一个口径）：
+        只有 ready 才摆候选，其余阶段只显示一句进度说明。这样即便上层忘了清候选，
+        也不会出现「一边说正在判断、一边把旧候选摆在那儿」的错乱。"""
+        self.heard.setText(heard or "…")
+        self._set_pill(phase)
+        ready = phase == "ready" and bool(items)
+        busy = self._BUSY.get(phase)
+        self.hint.setText(busy or "")
+        self.hint.setVisible(bool(busy) and not ready)
+        self.suggest.setText(suggest or "")
+        self.suggest.setVisible(ready and bool(suggest))
+        self.foot.setVisible(ready)
+        for i, row in enumerate(self.rows):
+            if ready and i < len(items):
+                number, text, score, recommended = items[i]
+                meta = ("推荐回复" if recommended else f"备选 {i}")
+                if score is not None:
+                    meta += f" · {round(score * 100)}%"
+                row.set_content(text, meta, number, recommended)
+                row.show()
+            else:
+                row.hide()
+        self.adjustSize()
+
+
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
                  on_toggle_debug=None):
@@ -238,6 +424,9 @@ class Overlay:
         self.targets = {}  # {会话名: ([发言人], 当前回复对象)}
         self._chat = ""  # 微信当前开着的会话
         self._shown = ""  # 界面上正在看的会话（浏览时和上面不一样）
+        self._ordered = []  # [(candidates 里的原始索引, 百分比, 是否推荐)]，按推荐顺序排好
+        self._answers = {}  # 上一次判断的 7 道题答案，候选条和面板共用
+        self._phase = "idle"  # 流水线状态，由 main.py 派生后经 set_phase() 推进来
         self.win = _MainWindow(self._relayout)
         self.win.setObjectName("assistantWindow")
         self.win.setWindowTitle("JevChat-Windows")
@@ -296,6 +485,7 @@ class Overlay:
         outer.addWidget(self.pages, 1)
         self._build_home()
         self._build_settings()
+        self.bar = _CandidateBar(self)
         footer = QHBoxLayout()
         footer.setContentsMargins(GAP_LG, GAP_SM, GAP_SM, GAP_SM)
         footer.addWidget(_label(f"仅填入输入框 · 发送由你确认 · v{VERSION}", FONT_XS, _MUTED), 1)
@@ -486,8 +676,8 @@ class Overlay:
         body.addWidget(_label("调整关系背景，配置判断和起草用的两个模型。", FONT_MD, _MUTED))
         preference = _Surface()
         box = QVBoxLayout(preference)
-        box.setContentsMargins(16, 16, 16, 18)
-        box.setSpacing(12)
+        box.setContentsMargins(GAP_LG, GAP_LG, GAP_LG, GAP_LG)
+        box.setSpacing(GAP_MD)
         box.addWidget(_label("回复偏好", FONT_MD, theme.INK, True))
         relation_label = _label("你们的关系", FONT_MD)
         box.addWidget(relation_label)
@@ -562,8 +752,8 @@ class Overlay:
 
         models = _Surface()
         box = QVBoxLayout(models)
-        box.setContentsMargins(16, 16, 16, 18)
-        box.setSpacing(12)
+        box.setContentsMargins(GAP_LG, GAP_LG, GAP_LG, GAP_LG)
+        box.setSpacing(GAP_MD)
         box.addWidget(_label("模型", FONT_MD, theme.INK, True))
         self._fetched = _Fetched()
         self._fetched.done.connect(self._models_fetched)
@@ -685,7 +875,7 @@ class Overlay:
         model_label = _label("模型", FONT_MD)
         box.addWidget(model_label)
         row = QHBoxLayout()
-        row.setSpacing(8)
+        row.setSpacing(GAP_SM)
         group.modelBox = EditableComboBox()  # 能选也能手打，接口新出的模型不用等我改代码
         group.modelBox.setMinimumWidth(0)
         group.modelBox.setAccessibleName(f"{title} 模型")
@@ -996,6 +1186,7 @@ class Overlay:
                 self._empty_text()
         for card in self.cards:
             card.set_available(self._current and not busy)
+        self._sync_bar()
 
     def _empty_text(self):
         """空态卡片的默认文案，配好没配好两套说法。"""
@@ -1011,6 +1202,40 @@ class Overlay:
             self.updated.setText("上次建议")
         for card in self.cards:
             card.set_available(False)
+        # 候选条跟着清空：新消息一来，旧候选就不该再摆在宠物旁边了
+        self._ordered = []
+        self._sync_bar()
+
+    def has_reply(self):
+        """现在有没有可填的候选。main.py 拿它派生 phase，别去读 _current。"""
+        return self._current
+
+    def _suggest_text(self):
+        """候选条底部那行「建议：xxx · 紧张度 N/9」，口径跟面板的洞察卡一致。"""
+        action = _choice(self._answers, "best_action")
+        score = (self._answers.get("danger_level") or {}).get("score")
+        valid = isinstance(score, (int, float)) and isfinite(score) and 0 <= score <= 9
+        return f"建议：{action} · 紧张度 {score:.0f}/9" if valid else f"建议：{action}"
+
+    def _sync_bar(self):
+        """把紧凑候选条刷成和面板一致。两边共用 self.cands / self._ordered，不新增数据流。"""
+        items = [(position + 1, self.cands[index], score, recommended)
+                 for position, (index, score, recommended) in enumerate(self._ordered)]
+        heard = self.hers.get(self._shown) or self.hers.get(self._chat) or ""
+        self.bar.set_items(items, self._suggest_text() if items else "", self._phase, heard)
+
+    def set_phase(self, phase):
+        """main.py 派生出来的流水线状态。同态重复调用是空操作，否则每 50ms 重放一次会闪。"""
+        if phase == self._phase:
+            return
+        self._phase = phase
+        self._sync_bar()
+
+    def show_panel(self):
+        """展开完整面板。第 3 步接上宠物之后，这里还要顺手把宠物收起来。"""
+        self.win.show()
+        self.win.raise_()
+        self.win.activateWindow()
 
     def set_status(self, text, kind="idle"):
         colors = {"idle": _MUTED, "busy": _ACCENT, "success": _ACCENT,
@@ -1192,6 +1417,8 @@ class Overlay:
         reply_to = result.get("reply_to")
         self.insightTitle.setText(f"对话参考 · 回复给 {reply_to}" if reply_to else "对话参考")
         answers = result.get("answers") or {}
+        self._answers = answers
+        self._ordered = [(index, scores[index], index == best) for index in order]
         self.summary.setText("建议：" + _choice(answers, "best_action"))
         self.intent.setText("可能意图 · " + _choice(answers, "true_intent") +
                             "\n可能需要 · " + _choice(answers, "she_needs"))
@@ -1211,6 +1438,7 @@ class Overlay:
             self.set_status("建议已更新，选一句适合你的回复", "success")
         else:
             self.set_status("未生成可用回复，请等待下一条新消息。", "error")
+        self._sync_bar()
 
     def _clear_cards(self):
         for card in self.cards:

@@ -16,7 +16,8 @@ from unittest.mock import patch
 from app import settings
 
 
-_STATES = ("ready", "waiting", "loading", "error", "setup", "settings", "paused", "debug")
+_STATES = ("ready", "waiting", "loading", "error", "setup", "settings", "paused", "debug",
+           "ime", "ime-thinking")
 
 # 调试视图预览用的真微信截图（只读进内存，不改不存）；没有就退一张空画面
 _FRAME = Path("/private/tmp/claude-501/-Users-lpitiless-Documents-project-wechatjev"
@@ -236,6 +237,11 @@ def main() -> int:
                 ov.open_settings()
             elif args.state == "paused":
                 ov.set_capture(False)
+            elif args.state in ("ime", "ime-thinking"):
+                # 宠物旁的紧凑候选条。得先 show()，没显示过的窗口 grab 出来是空的
+                ov.set_phase("ready" if args.state == "ime" else "thinking")
+                ov.bar.show()
+                shot = ov.bar
 
         exit_code = 0
         if target is not None:
