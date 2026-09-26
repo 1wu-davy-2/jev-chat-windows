@@ -60,13 +60,18 @@ def mascot_pixmap(phase: str, height: int = PET_H) -> QPixmap:
 
 
 def _gray(pix: QPixmap) -> QPixmap:
-    """去色版本，采集暂停时用。Qt 没有现成的「去饱和」效果，转一次灰度最省事。"""
+    """去色版本，采集暂停时用。Qt 没有现成的「去饱和」效果，转一次灰度最省事。
+
+    注意 Grayscale8 和 RGB32 都**没有 alpha 通道**，直接转会把透明背景变成不透明的黑，
+    表现是暂停时宠物周围糊一圈黑框。所以转完要把原图的 alpha 贴回去。"""
     if pix.isNull():
         return pix
-    img = pix.toImage().convertToFormat(QImage.Format_Grayscale8)
-    out = QPixmap.fromImage(img.convertToFormat(QImage.Format_RGB32))
-    out.setDevicePixelRatio(pix.devicePixelRatio())
-    return out
+    img = pix.toImage().convertToFormat(QImage.Format_ARGB32)
+    out = img.convertToFormat(QImage.Format_Grayscale8).convertToFormat(QImage.Format_ARGB32)
+    out.setAlphaChannel(img.convertToFormat(QImage.Format_Alpha8))
+    result = QPixmap.fromImage(out)
+    result.setDevicePixelRatio(pix.devicePixelRatio())
+    return result
 
 
 class _Mascot(QWidget):
