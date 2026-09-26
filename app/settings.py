@@ -119,6 +119,21 @@ def debug_view() -> bool:
     """调试视图：另开一个窗口实时画识别框。默认关，开了子进程才往队列里送帧。"""
     return bool(_read("debug_view", False))
 
+def pet_enabled() -> bool:
+    """宠物优先形态：平时桌面上只有宠物，有消息才在它旁边弹候选条，点宠物展开完整面板。默认开。"""
+    return bool(_read("pet_enabled", True))
+
+def pet_pos():
+    """宠物上次停在屏幕哪儿，返回 (x, y)；没存过或数据脏就返回 None，由界面放默认角落。
+    这里不判断「还在不在屏幕里」——那要问 Qt，交给界面层。"""
+    v = _read("pet_pos")
+    if isinstance(v, (list, tuple)) and len(v) == 2:
+        try:
+            return int(v[0]), int(v[1])
+        except (TypeError, ValueError):
+            return None
+    return None
+
 def _read_env(env_name: str) -> str:
     """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。"""
     v = os.environ.get(env_name, "").strip()
@@ -186,7 +201,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          style_text: str | None = None, thinking_on: bool | None = None,
          check_update_on: bool | None = None, debug_view_on: bool | None = None,
          relay_base_url_text: str | None = None, relay_judge_path_text: str | None = None,
-         relay_thinking_style_text: str | None = None) -> None:
+         relay_thinking_style_text: str | None = None,
+         pet_enabled_on: bool | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -219,6 +235,28 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "thinking": flag(thinking_on, thinking),
         "check_update": flag(check_update_on, check_update),
         "debug_view": flag(debug_view_on, debug_view),
+        "pet_enabled": flag(pet_enabled_on, pet_enabled),
     }
+    with open(_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def _load_all() -> dict:
+    """整个 config.json 读成 dict；文件不在或坏了就当空的。"""
+    try:
+        with open(_CONFIG, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_pet_pos(x: int, y: int) -> None:
+    """只更新宠物位置，别的字段原样带过去。
+
+    不走 save()：save() 每次都把两把 key 重写一遍注册表、再广播一次 WM_SETTINGCHANGE，
+    拖一次宠物就来这么一下没必要。这里读全量、改一个键、写全量，不会弄丢别的设置。"""
+    data = _load_all()
+    data["pet_pos"] = [int(x), int(y)]
     with open(_CONFIG, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)

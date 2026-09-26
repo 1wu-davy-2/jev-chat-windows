@@ -11,6 +11,7 @@ hiddenimports = [
     # 父进程这边 engine 也是运行时才走到，一并钉死，别指望静态分析都能扫出来
     "app.worker", "app.capture", "app.ocr", "app.fill", "app.overlay", "app.settings",
     "app.version", "app.update", "app.debugwin",  # debugwin 是开了调试视图才 import 的
+    "app.theme", "app.pet",  # theme 是纯数据；pet 是桌面宠物窗
     "core.engine", "core.draft", "core.jev_client", "core.questions", "core.providers",
     "core.llm", "core.relay",
 ]
@@ -31,6 +32,11 @@ for pkg in (
     datas += d
     binaries += b
     hiddenimports += h
+
+# 吉祥物素材：桌面宠物窗要用。onedir 下落在 _internal/app/assets，
+# app/pet.py 按 sys._MEIPASS 找（别照抄 settings._ROOT 那种「exe 旁边」的写法）
+datas += [(f"app/assets/{name}", "app/assets") for name in
+          ("mascot-idle.png", "mascot-think.png", "mascot-alert.png")]
 
 excludes = [
     # 确认没人用：rapidocr 只 import 了 cv2 / PIL / yaml / pyclipper / shapely（PIL 千万别排，读图要它）

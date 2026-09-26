@@ -10,6 +10,7 @@ import ctypes
 import multiprocessing
 import queue
 import threading
+import time
 import traceback
 from collections import deque
 
@@ -25,7 +26,11 @@ from core.engine import analyze
 # 只是缓冲区，实际喂模型几条由设置里的「参考上下文」决定
 # senders：这个群里发过言的人，去重、最近的排最前；target：用户挑的回复对象（None = 跟着最近那个走）
 chats = {}
-state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": ""}
+# phase 是派生出来的流水线状态（宠物换姿势、候选条显隐都看它），notify_until 是「刚来新消息」
+# 那一下的截止时刻——用时间戳而不是布尔量，省得还要找地方把它清掉
+state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "",
+         "phase": "idle", "notify_until": 0.0}
+_NOTIFY_HOLD = 0.9  # 新消息到了先闪这么久「提醒」，再进判断
 results = queue.Queue()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
 
@@ -220,6 +225,7 @@ def drain():
                 chat["senders"].insert(0, name)
         ov.set_targets(title, chat["senders"], target_of(title))  # 显不显示这一行由悬浮窗按开关决定
         if new[-1][0] == "her":  # 只有对方最新说话才值得分析
+            state["notify_until"] = time.monotonic() + _NOTIFY_HOLD  # 宠物先换个姿势提醒一下
             msgs = list(chat["history"])
             if state["busy"]:
                 state["rerun"] = (title, msgs)
@@ -230,6 +236,33 @@ def drain():
             state["rerun"] = None
             ov.set_busy(False)
             ov.set_status("你已回复，等待对方的新消息")
+
+
+def phase_now():
+    """现在该是哪个形态。纯函数，只读既有事实，不记流水账——所以不会因为中间态而闪。
+
+    scanning 是静息态（采集开着、在等对方说话），不是「此刻正在跑 OCR」：OCR 占了一帧
+    85% 以上的时间，做成状态就是个常亮灯，没有信息量。"""
+    if time.monotonic() < state["notify_until"]:
+        return "notify"
+    if state["busy"]:
+        return "thinking"
+    if not capture_on.is_set():
+        return "idle"
+    if ov.has_reply():
+        return "ready"
+    return "scanning"
+
+
+def refresh_phase():
+    """phase 的唯一写者，唯一调用点是 tick() 的出口。
+
+    只在出口采样一次，drain() 中途一次都不调——这样 tick 里
+    「busy=False 紧跟 start_analyze 又置 True」那一瞬间的中间态永远不会被界面看到。"""
+    p = phase_now()
+    if p != state["phase"]:
+        state["phase"] = p
+        ov.set_phase(p)
 
 
 def tick():
@@ -258,6 +291,7 @@ def tick():
                 ov.set_busy(False)
                 ov.set_status("生成失败，请检查网络和服务设置；新消息到来后会重试。", "error")
                 ov.log(r)
+        refresh_phase()
     except Exception:
         traceback.print_exc()  # 一帧出错不退出
     ov.after(50, tick)

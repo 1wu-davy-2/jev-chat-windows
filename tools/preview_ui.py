@@ -17,7 +17,7 @@ from app import settings
 
 
 _STATES = ("ready", "waiting", "loading", "error", "setup", "settings", "paused", "debug",
-           "ime", "ime-thinking")
+           "ime", "ime-thinking", "pet", "bar")
 
 # 调试视图预览用的真微信截图（只读进内存，不改不存）；没有就退一张空画面
 _FRAME = Path("/private/tmp/claude-501/-Users-lpitiless-Documents-project-wechatjev"
@@ -125,6 +125,9 @@ def main() -> int:
                      "draft_base_url": "", "reply_target": True,
                      "style": "话少，基本不用标点，急了才发感叹号", "thinking": False,
                      "check_update": True, "debug_view": args.state == "debug",
+                     # 只有宠物相关的状态才开宠物形态；其余状态保持「面板直接可见」，
+                     # 不然面板从没 show 过，grab 出来是空的
+                     "pet_enabled": args.state in ("pet", "bar"), "pet_pos": None,
                      "relay_base_url": "https://中转站.example" if args.relay else "",
                      "relay_judge_path": "/v1/systemone",
                      "relay_thinking_style": "thinking"}
@@ -135,7 +138,7 @@ def main() -> int:
                            reply_target_on=None, style_text=None, thinking_on=None,
                            check_update_on=None, debug_view_on=None,
                            relay_base_url_text=None, relay_judge_path_text=None,
-                           relay_thinking_style_text=None):
+                           relay_thinking_style_text=None, pet_enabled_on=None):
         if relationship_text:
             demo_settings["relationship"] = relationship_text
         if context_n is not None:
@@ -152,7 +155,8 @@ def main() -> int:
             if key:
                 demo_settings[name] = key
         for name, value in (("reply_target", reply_target_on), ("thinking", thinking_on),
-                            ("check_update", check_update_on), ("debug_view", debug_view_on)):
+                            ("check_update", check_update_on), ("debug_view", debug_view_on),
+                            ("pet_enabled", pet_enabled_on)):
             if value is not None:
                 demo_settings[name] = bool(value)
 
@@ -190,6 +194,9 @@ def main() -> int:
         thinking=lambda: demo_settings["thinking"],
         check_update=lambda: demo_settings["check_update"],
         debug_view=lambda: demo_settings["debug_view"],
+        pet_enabled=lambda: demo_settings["pet_enabled"],
+        pet_pos=lambda: demo_settings["pet_pos"],
+        save_pet_pos=lambda x, y: demo_settings.update(pet_pos=(x, y)),
         save=save_demo_settings,
     ):
         from PySide6.QtCore import QTimer
@@ -206,7 +213,10 @@ def main() -> int:
         ov.win.setWindowTitle("JevChat-Windows · 界面演示（合成数据）")
         shot = ov.win  # 截图截哪个窗口；调试预览截调试窗
 
-        if args.state == "debug":
+        if args.state == "pet":
+            # 宠物形态：启动时就只有宠物，不用喂消息，也不用展开面板
+            shot = ov.pet
+        elif args.state == "debug":
             from app.debugwin import DebugWindow
 
             dbg = DebugWindow(on_close=lambda: ov.set_debug_switch(False))
@@ -237,6 +247,10 @@ def main() -> int:
                 ov.open_settings()
             elif args.state == "paused":
                 ov.set_capture(False)
+            elif args.state == "bar":
+                # 宠物 + 候选条（ready 态）：候选条会自己贴到宠物旁边
+                ov.set_phase("ready")
+                shot = ov.bar
             elif args.state in ("ime", "ime-thinking"):
                 # 宠物旁的紧凑候选条。得先 show()，没显示过的窗口 grab 出来是空的
                 ov.set_phase("ready" if args.state == "ime" else "thinking")

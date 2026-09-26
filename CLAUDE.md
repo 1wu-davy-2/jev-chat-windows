@@ -84,6 +84,24 @@ main.py（父进程，只管界面和网络）
 所以路径可配（`relay_judge_path`）。`judge_relay` 默认关、仍走 OpenRouter，没验过别默认它一定通。
 `probe/probe_relay.py` 是验这件事的探针。
 
+**宠物优先形态**（`pet_enabled`，默认开）：平时桌面上只有宠物，有消息才弹候选条。这是**三个独立
+顶层窗**，不是「一个窗变形」——改 `setWindowFlags` 会重建 HWND，位置会丢还会闪：
+
+| 窗口 | 类 | 说明 |
+| --- | --- | --- |
+| 宠物 | `app/pet.py:PetWindow` | 透明置顶，`Qt.Tool` 不进任务栏；拖拽/点击靠 4px 阈值区分 |
+| 候选条 | `app/overlay.py:_CandidateBar` | 280px，贴宠物上方（放不下翻下方） |
+| 面板 | `app/overlay.py:_MainWindow` | 就是原来那个悬浮窗，默认收起 |
+
+`phase`（idle/scanning/notify/thinking/ready）是**派生**出来的，不是事件流水账：
+`main.py:phase_now()` 是纯函数，`refresh_phase()` 是唯一写者、唯一调用点是 `tick()` 的出口。
+**别在 `drain()` 中途写 phase**，否则 `tick` 里「busy=False 紧跟 start_analyze 又置 True」那一瞬间
+的中间态会闪出来。`Overlay.set_phase()` 首行幂等，少了它每 50ms 重放一次、候选条会不停重建。
+
+**设计 token 在 `app/theme.py`**：界面代码一律从那儿取色取字号，别再写死十六进制值。Qt 没有
+box-shadow，卡片阴影只能靠 `theme.apply_shadow()`（一层 `QGraphicsDropShadowEffect`），
+**用了它的卡片，父容器边距和卡片间距都不能小于 `SHADOW_PAD`**，否则阴影被裁或被下一张卡盖住。
+
 **按会话隔离**：`main.py` 的 `chats[会话名]` 各存 history（deque maxlen=60）、上次结果、
 `senders`（群里发过言的人）、`target`（用户挑的回复对象）。每个会话一个 `ocr.Reader`，
 去重状态互不干扰。`rev` 是版本号：会话来了新消息就 +1，回来的结果 `revision` 对不上就丢掉
@@ -105,7 +123,9 @@ main.py（父进程，只管界面和网络）
   `app/overlay.py`（`_build_settings()` 建控件、`_load_settings()` 回填、`_save()` 提交）、
   `tools/preview_ui.py` 的 `patch.multiple(...)` 列表（漏了预览就炸）、README 的设置说明表。
 - **加一个新模块**要进 `jev.spec` 的 `hiddenimports`——spawn 出来的子进程和运行时才 import 的
-  `core/` 静态分析扫不到，漏了就是打包后启动即炸。
+  `core/` 静态分析扫不到，漏了就是打包后启动即炸。**加一个资源文件**要进同文件的 `datas`
+  （吉祥物那三张 PNG 就是），而且加载路径得认 `sys._MEIPASS`，别照抄 `settings._ROOT` 那种
+  「exe 旁边」的写法——素材在 onedir 下位于 `_internal/`。
 - **消息格式**统一是 `[(who, text)]` 或 `[(who, text, name)]`（也可 dict），`who ∈ {her, me}`，
   name 是群里的发言人，最新一条在最后。`engine.analyze()`、`questions.build_state()`、
   `draft.draft_candidates()` 都吃这一套，别在中间层换形状。

@@ -21,6 +21,7 @@ from qfluentwidgets import (
 )
 
 from app import settings, theme
+from app.pet import HotkeyHost, PetWindow
 from app.theme import (
     FONT_2XL, FONT_DISPLAY, FONT_H1, FONT_LG, FONT_MD, FONT_SM, FONT_XL, FONT_XS,
     GAP_LG, GAP_MD, GAP_SM, GAP_XL, GAP_XS, RADIUS_LG, RADIUS_MD, RADIUS_SM,
@@ -460,8 +461,8 @@ class Overlay:
         title.addWidget(self.captureSwitch)
         self.settingsButton = _tool(FIF.SETTING, "设置", self.open_settings, header)
         title.addWidget(self.settingsButton)
-        title.addWidget(_tool(FIF.REMOVE, "最小化", self.win.showMinimized, header))
-        title.addWidget(_tool(FIF.CLOSE, "关闭助手", self.win.close, header))
+        title.addWidget(_tool(FIF.MINIMIZE, "收起（宠物还在）", self.collapse, header))
+        title.addWidget(_tool(FIF.CLOSE, "退出助手", self._quit, header))
         outer.addWidget(header)
         self.updateBar = QWidget(self.win)
         update_row = QHBoxLayout(self.updateBar)
@@ -486,6 +487,25 @@ class Overlay:
         self._build_home()
         self._build_settings()
         self.bar = _CandidateBar(self)
+        # 宠物窗和候选条都是独立顶层窗，默认都不显示；由 set_phase / pet_enabled 决定
+        self.pet_enabled = settings.pet_enabled()
+        self.pet = PetWindow()
+        if self.pet.mascot.pix.isNull():
+            # 素材读不到（打包漏了 PNG 之类）就退回「只有面板」的老形态，别启动即炸
+            self.pet_enabled = False
+            self.log("[宠物] 吉祥物素材读不到，已退回只有面板的形态")
+        self.pet.clicked.connect(self.show_panel)
+        self.pet.dropped.connect(lambda x, y: settings.save_pet_pos(x, y))
+        pos = settings.pet_pos()
+        if pos:
+            self.pet.move(*pos)
+        self._barTimer = QTimer(self.win)
+        self._barTimer.setSingleShot(True)
+        self._barTimer.timeout.connect(self.bar.hide)
+        self.hotkeys = HotkeyHost()
+        self.hotkeys.hotkey.connect(lambda i: self._fill(i - 1))
+        self._hotkeyFailed = [i for i in (1, 2, 3) if not self.hotkeys.register(i, 0x30 + i)]
+        self.app.aboutToQuit.connect(self.hotkeys.unregister_all)
         footer = QHBoxLayout()
         footer.setContentsMargins(GAP_LG, GAP_SM, GAP_SM, GAP_SM)
         footer.addWidget(_label(f"仅填入输入框 · 发送由你确认 · v{VERSION}", FONT_XS, _MUTED), 1)
@@ -500,7 +520,11 @@ class Overlay:
         self._relayout(self.win.width(), self.win.height())  # resizeEvent 补不到构造时这一次
         self.set_status("等待新消息" if settings.has_key() else "需要配置模型",
                         "idle" if settings.has_key() else "warning")
-        self.win.show()
+        if self.pet_enabled:
+            self.pet.clamp_to_screen()  # 上次存的坐标可能已经不在屏幕里了（换显示器）
+            self.pet.show()
+        else:
+            self.win.show()
 
     def _scroll_page(self):
         scroll = ScrollArea()
@@ -747,6 +771,19 @@ class Overlay:
         box.addWidget(self._hint(
             "另开一个窗口实时显示截到的画面和识别框：绿 = 我、蓝 = 对方、灰 = 过滤掉的灰字、"
             "红 = 当成图片丢掉、黄 = 小字丢掉。只在内存里画，不存图。"
+        ))
+        pet_row = QHBoxLayout()
+        pet_row.addWidget(_label("桌面宠物", FONT_MD), 1)
+        self.petSwitch = SwitchButton()
+        self.petSwitch.setOnText("开")
+        self.petSwitch.setOffText("关")
+        self.petSwitch.setAccessibleName("桌面宠物")
+        self.petSwitch.checkedChanged.connect(self._pet_toggled)  # 跟调试视图一样，立刻生效
+        pet_row.addWidget(self.petSwitch)
+        box.addLayout(pet_row)
+        box.addWidget(self._hint(
+            "平时桌面上只有宠物，有消息才在它旁边弹候选条，点宠物展开完整面板。"
+            "关掉就是原来那样：面板一直开着。"
         ))
         body.addWidget(preference)
 
@@ -1015,6 +1052,9 @@ class Overlay:
         self.thinkingSwitch.setChecked(settings.thinking())
         self.updateSwitch.setChecked(settings.check_update())
         self.set_debug_switch(settings.debug_view())  # 屏蔽信号地拨，别在加载时开关一遍窗口
+        self.petSwitch.blockSignals(True)  # 同上：加载时别真去开关宠物
+        self.petSwitch.setChecked(settings.pet_enabled())
+        self.petSwitch.blockSignals(False)
         self._sync_model_fields()  # 上面屏蔽了信号，这里补一次
         self.settingsFeedback.hide()
 
@@ -1068,7 +1108,8 @@ class Overlay:
                           reply_target_on=self.targetSwitch.isChecked(),
                           style_text=self.styleEdit.text().strip(),
                           thinking_on=self.thinkingSwitch.isChecked(),
-                          check_update_on=self.updateSwitch.isChecked())
+                          check_update_on=self.updateSwitch.isChecked(),
+                          pet_enabled_on=self.petSwitch.isChecked())
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return
@@ -1086,6 +1127,19 @@ class Overlay:
         if self.on_toggle_debug:
             self.on_toggle_debug(on)
 
+    def _pet_toggled(self, on):
+        """宠物形态独立于「保存设置」：拨一下就换形态，顺手落盘，重启还在。"""
+        settings.save(pet_enabled_on=on)
+        self.pet_enabled = bool(on) and not self.pet.mascot.pix.isNull()
+        if self.pet_enabled:
+            self.pet.clamp_to_screen()
+            self.pet.show()
+            self.collapse()
+        else:
+            self.pet.hide()
+            self.bar.hide()
+            self.win.show()
+
     def set_debug_switch(self, on):
         """调试窗被用户直接关掉时把开关拨回去；屏蔽信号，免得又回调一圈。"""
         self.debugSwitch.blockSignals(True)
@@ -1100,6 +1154,8 @@ class Overlay:
         self.settingsFeedback.show()
 
     def open_settings(self):
+        # 先确保面板露出来：宠物形态下面板默认是收着的，没这行会把设置页开在一个看不见的窗里
+        self.show_panel()
         if self.pages.currentWidget() != self.settingsPage:
             self._load_settings()
         self.pages.setCurrentWidget(self.settingsPage)
@@ -1150,6 +1206,7 @@ class Overlay:
         self.captureSwitch.setChecked(on)
         self.captureSwitch.blockSignals(False)
         self._capture_text(on, reason)
+        self.pet.set_paused(not on)  # 宠物淡下去、去个色，一眼看出现在没在读屏
 
     def _capture_text(self, on, reason=""):
         """开关状态对应的状态行和空态文案。已有的候选不受影响，暂停了照样能填入/复制。"""
@@ -1230,12 +1287,59 @@ class Overlay:
             return
         self._phase = phase
         self._sync_bar()
+        if not self.pet_enabled:
+            return
+        self.pet.set_phase(phase)
+        self._barTimer.stop()
+        if phase in ("notify", "thinking", "ready"):
+            self._place_bar()
+            self.bar.show()
+            if phase == "ready":
+                self._barTimer.start(12000)  # 没人理就自动收回去，宠物上的角标留着
+        else:
+            self.bar.hide()
 
     def show_panel(self):
-        """展开完整面板。第 3 步接上宠物之后，这里还要顺手把宠物收起来。"""
+        """展开完整面板：贴到宠物旁边（没开宠物就还用原来那个右上角位置）。"""
+        if self.pet.isVisible():
+            self._place_panel()
         self.win.show()
         self.win.raise_()
         self.win.activateWindow()
+
+    def collapse(self):
+        """收起面板。宠物留着——它是常驻入口，也是拖拽的锚点。"""
+        self.win.hide()
+
+    def _quit(self):
+        """真退出：三个窗口一起收掉。「收起」和「退出」是两回事，别混。"""
+        self.hotkeys.unregister_all()
+        self.pet.hide()
+        self.bar.hide()
+        self.win.close()
+        self.app.quit()
+
+    def _place_panel(self):
+        """把面板摆在宠物旁边：优先左边，放不下就右边，最后夹到屏幕内。"""
+        area = self.win.screen().availableGeometry()
+        gap = 12
+        x = self.pet.x() - self.win.width() - gap
+        if x < area.left() + gap:
+            x = self.pet.x() + self.pet.width() + gap
+        x = min(max(x, area.left() + gap), area.right() - self.win.width() - gap)
+        y = min(max(self.pet.y(), area.top() + gap), area.bottom() - self.win.height() - gap)
+        self.win.move(x, y)
+
+    def _place_bar(self):
+        """候选条贴宠物上方；上面放不下就翻到下面，再横向夹到屏幕内。"""
+        area = self.bar.screen().availableGeometry()
+        gap = 8
+        x = self.pet.x() + self.pet.width() - self.bar.width()
+        y = self.pet.y() - self.bar.height() - gap
+        if y < area.top() + gap:
+            y = self.pet.y() + self.pet.height() + gap
+        x = min(max(x, area.left() + gap), area.right() - self.bar.width() - gap)
+        self.bar.move(x, y)
 
     def set_status(self, text, kind="idle"):
         colors = {"idle": _MUTED, "busy": _ACCENT, "success": _ACCENT,
