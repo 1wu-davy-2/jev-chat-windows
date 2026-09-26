@@ -7,7 +7,7 @@ from datetime import datetime
 from math import isfinite
 from types import SimpleNamespace
 
-from PySide6.QtCore import QObject, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QLocale, QObject, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QSizeGrip, QSizePolicy,
@@ -751,6 +751,10 @@ class Overlay:
         box.addWidget(context_label)
         self.contextBox = SpinBox()
         self.contextBox.setRange(3, 30)
+        # QSpinBox 用 locale() 格式化数字，而 Qt 的 zh_CN locale 会把它变成杭州码子
+        # （1→〡 U+3021、0→〇 U+3007、9→〩），在界面上就是"10"显示成"〡〇"、"9"显示成"〩"。
+        # 钉成 C locale 才显示成 10。QLocale.c() 只影响这个控件，不动全局。
+        self.contextBox.setLocale(QLocale.c())
         self.contextBox.setAccessibleName("参考的最近消息条数")
         context_label.setBuddy(self.contextBox)
         box.addWidget(self.contextBox)
