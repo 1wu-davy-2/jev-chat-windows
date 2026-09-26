@@ -39,6 +39,7 @@ def run(q, hwnd, enabled, debug_on):
     readers = {}  # {会话名: Reader}，一个会话一套去重状态
     title, head = "", None  # 当前会话名 / 上一帧的头部像素
     last_area = None  # 上次发给父进程的 4 元组，变了才再发一次
+    last_voice = None  # 上次发过去的语音气泡，变了才再发（拖动/滚动时位置一直在变，别每帧刷）
     warned = False  # 消息区识别失败是否已经报过，拖窗口时别每帧刷一条
     while True:
         if not enabled.is_set():
@@ -92,6 +93,12 @@ def run(q, hwnd, enabled, debug_on):
                     new = reader.new_lines(lines)
                     if new:
                         q.put(("lines", title, new, rect))
+                    # 语音气泡：Reader 那边按坐标裁剪过，这里加回裁剪原点，父进程才好换算成屏幕坐标
+                    voice = tuple((x0 + a, y0 + b, x0 + c, y0 + d, t)
+                                  for a, b, c, d, t in reader.last_voice)
+                    if voice != last_voice:
+                        q.put(("voice", title, voice))
+                        last_voice = voice
                 if debug_on.is_set():
                     q.put(("debug", _packet(full, area, title, reader, lines)))
         except Exception:

@@ -87,6 +87,7 @@ class Reader:
         self.lh = None  # 正常气泡字高，头一帧定
         self.seen = []  # [(who, name, text)]，累计，封顶 500
         self.last_boxes = []  # 调试视图用：[(x0,y0,x1,y1,kind,text)]，消息区裁剪坐标
+        self.last_voice = []  # 这一帧的语音气泡 [(x0,y0,x1,y1,时长)]，给「转文字」右键用
         self.last_ms = 0  # 上一帧 OCR 耗时
 
     def read(self, chat, pane_bg):
@@ -96,6 +97,7 @@ class Reader:
         res, _ = self.ocr(chat, use_cls=False)
         self.last_ms = int((time.perf_counter() - t0) * 1000)
         self.last_boxes = []
+        self.last_voice = []
         W = chat.shape[1]
         # 群聊：每条 her 气泡上方一行灰色发言人名（靠左、短、不带冒号、印在面板底色上），从上往下扫，名字带给后面的气泡。
         # 引用块/时间戳/公告带冒号，链接卡片灰字印在气泡底色上，都不会被当成名字。
@@ -106,7 +108,10 @@ class Reader:
             xs, ys = [p[0] for p in box], [p[1] for p in box]
             rect = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
             if _VOICE.fullmatch(text.strip()):
+                # 不进 raw（它没有正文，触发判断没意义），但位置记下来：
+                # 用户点「转文字」时要右键它。见 app/voice.py
                 self.last_boxes.append(rect + ("voice", text))
+                self.last_voice.append(rect + (text,))
                 continue
             if kind == "gray":
                 on_pane = np.abs(bg - pane_bg).sum() <= 6

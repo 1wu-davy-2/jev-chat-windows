@@ -20,6 +20,9 @@ Windows 上挂在微信（4.x，`Weixin.exe`）旁边的回复助手：截自己
    仅有的例外都在工具和探针里、且不碰运行时的帧：`tools/preview_ui.py --screenshot`（合成界面图）、
    `tools/make_icon.py`（图标）、`probe/probe_win.py`（调试用 `wechat_probe.png`，已在 .gitignore）。
 4. **绝不自动发送**：`app/fill.py` 到 Ctrl+V 为止，不发回车、不点发送按钮。
+   `app/voice.py` 是**唯一**一处会点微信界面的代码，边界写死在那儿：只在用户点了候选条上的
+   「转文字」之后才动，只右键用户指定的那条语音、只点菜单第一项，而且必须先确认右键菜单真的
+   弹出来了才点（认不出来就放弃）。发送/删除/撤回/转账/红包一律不碰。
 5. 不碰钱：转账/红包/收款相关的界面元素一律不碰，起草的 system prompt 里也禁了这几个话题。
 6. **API key 只进环境变量**（`OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `RELAY_API_KEY`，落
    `HKCU\Environment`），任何文件里不出现 key，也绝不进日志——报错文本一律过
@@ -121,6 +124,7 @@ box-shadow，卡片阴影只能靠 `theme.apply_shadow()`（一层 `QGraphicsDro
 | `area` | `(x0, y0, x1, y1)` | 窗口挪了，更新填入坐标 |
 | `chat` | `title` | 微信切了会话 |
 | `lines` | `title, [(who, name, text)], rect` | 这一帧新出现的消息 |
+| `voice` | `title, [(x0,y0,x1,y1,时长)]` | 这一帧认出来的语音气泡，坐标给「转文字」右键用 |
 | `status` / `dead` | `文本` | 单帧失败提示 / 采集彻底停了 |
 | `paused` / `resumed` | — | 子进程确认采集开关状态 |
 
@@ -167,6 +171,11 @@ box-shadow，卡片阴影只能靠 `theme.apply_shadow()`（一层 `QGraphicsDro
   （`app/ocr.py` 的 `_VOICE`）——13 次实测它每次都读得出来，只是会被读成 `(` `)` `?`；引号后还要
   再放最多两个字符，因为喇叭图标偶尔被读成字母（2.5 倍缩放下读成过 `G`）。**必须有引号**，
   这样 `6` `666` `5G` `8点见` `8-9` 这些真消息不会被误伤。改这个正则先跑 `python app/ocr.py`。
+- **WGC 按窗口抓图看不见弹出菜单**（实测：拿一个纯蓝 Qt 窗当靶子，菜单压在它上面，抓到的帧客户区
+  99.4% 还是蓝的，菜单该占的那 8.5% 一个像素都没有）。所以 `app/voice.py` **没法先 OCR 菜单确认
+  「语音转文字」在哪儿**，只能盲点第一项——这就是它为什么要先枚举顶层窗口、确认菜单真的弹出来了
+  才动手。UIA 那条路也堵死（微信界面自绘在 GPU 画布上，控件树是空的，见 README「为什么走 OCR」）。
+  菜单第一项的纵向位置按真实截图量的，是卡片高的 9.6%，写在 `_FIRST_ITEM_Y`。
 - **`chat_area()` 靠「面板 45% 高度以下第一根分隔线」找输入框顶**：输入框拉高超过面板一半会认错。
 - **PyInstaller 用 onedir**（`jev.spec`）：onefile 有 ~150MB 每次启动都要解压。
   `console=False`，所以 exe 里的 `print` 是看不到的，状态都走界面。

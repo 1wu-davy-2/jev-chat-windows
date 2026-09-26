@@ -17,7 +17,7 @@ from app import settings
 
 
 _STATES = ("ready", "waiting", "loading", "error", "setup", "settings", "paused", "debug",
-           "ime", "ime-thinking", "pet", "pet-menu", "bar")
+           "ime", "ime-thinking", "pet", "pet-menu", "bar", "voice")
 
 # 调试视图预览用的真微信截图（只读进内存，不改不存）；没有就退一张空画面
 _FRAME = Path("/private/tmp/claude-501/-Users-lpitiless-Documents-project-wechatjev"
@@ -127,7 +127,8 @@ def main() -> int:
                      "check_update": True, "debug_view": args.state == "debug",
                      # 只有宠物相关的状态才开宠物形态；其余状态保持「面板直接可见」，
                      # 不然面板从没 show 过，grab 出来是空的
-                     "pet_enabled": args.state in ("pet", "pet-menu", "bar"), "pet_pos": None,
+                     "pet_enabled": args.state in ("pet", "pet-menu", "bar", "voice"),
+                     "pet_pos": None,
                      "relay_base_url": "https://中转站.example" if args.relay else "",
                      "relay_judge_path": "/v1/systemone",
                      "relay_thinking_style": "thinking"}
@@ -255,6 +256,12 @@ def main() -> int:
             elif args.state == "bar":
                 # 宠物 + 候选条（ready 态）：候选条会自己贴到宠物旁边
                 ov.set_phase("ready")
+                shot = ov.bar
+            elif args.state == "voice":
+                # 语音消息：候选条上给「转文字」入口（坐标是编的，不会真去点）
+                ov.set_chat(_CHAT)
+                ov.set_voice(_CHAT, [(0, 0, 100, 30, '8"')])
+                ov.set_phase("notify")
                 shot = ov.bar
             elif args.state in ("ime", "ime-thinking"):
                 # 宠物旁的紧凑候选条。得先 show()，没显示过的窗口 grab 出来是空的

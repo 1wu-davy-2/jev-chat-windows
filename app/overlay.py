@@ -361,6 +361,28 @@ class _CandidateBar(QWidget):
         head_row.addWidget(self.pill, 0, Qt.AlignTop)
         box.addWidget(self.head)
 
+        # 语音消息那一块：没有正文可判断，给个「转文字」的入口顶上去
+        self.voice = QWidget()
+        self.voice.setObjectName("barVoice")
+        self.voice.setAttribute(Qt.WA_StyledBackground, True)
+        self.voice.setStyleSheet(
+            f"QWidget#barVoice {{ background: {theme.SAGE_SOFT}; "
+            f"border-radius: {RADIUS_MD}px; }}"
+        )
+        voice_col = QVBoxLayout(self.voice)
+        voice_col.setContentsMargins(10, GAP_SM, 10, GAP_SM)
+        voice_col.setSpacing(GAP_XS)
+        self.voiceLabel = _label("", FONT_MD, theme.INK, True)
+        voice_col.addWidget(self.voiceLabel)
+        voice_col.addWidget(_label("在微信里转成文字后，我会自动接着判断。", FONT_XS, _MUTED))
+        self.convertButton = PrimaryPushButton("转文字")
+        self.convertButton.setAccessibleName("把这条语音转成文字")
+        self.convertButton.setToolTip("右键那条语音并选「语音转文字」，转完自动判断")
+        self.convertButton.clicked.connect(owner._convert_voice)
+        voice_col.addWidget(self.convertButton)
+        self.voice.hide()
+        box.addWidget(self.voice)
+
         self.hint = _label("", FONT_MD, _MUTED)
         self.hint.hide()
         box.addWidget(self.hint)
@@ -407,8 +429,9 @@ class _CandidateBar(QWidget):
                 f"border-radius: {RADIUS_SM}px; padding: 1px 6px; }}"
             )
 
-    def set_items(self, items, suggest, phase, heard=""):
-        """items: [(序号, 正文, 百分比或 None, 是否推荐)]。
+    def set_items(self, items, suggest, phase, heard="", voice=""):
+        """items: [(序号, 正文, 百分比或 None, 是否推荐)]；voice 非空 = 这条会话有语音消息，
+        这时把「转文字」那一块顶上来，候选行让位。
 
         候选行、忙碌文案、建议行三者按 phase 互斥（跟设计稿的 CandidateIme 一个口径）：
         只有 ready 才摆候选，其余阶段只显示一句进度说明。这样即便上层忘了清候选，
@@ -416,6 +439,19 @@ class _CandidateBar(QWidget):
         self.heard.setText(heard or "…")
         self._set_pill(phase)
         ready = phase == "ready" and bool(items)
+        self.voiceLabel.setText(voice)
+        self.voice.setVisible(bool(voice))
+        # 有语音时连「对方刚说」那块一起收掉：那里挂的是上一条**文字**消息，
+        # 最新一条明明是语音，摆着它就成了张冠李戴。
+        self.head.setVisible(not voice)
+        if voice:
+            self.hint.hide()
+            self.suggest.hide()
+            self.foot.hide()
+            for row in self.rows:
+                row.hide()
+            self.adjustSize()
+            return
         busy = self._BUSY.get(phase)
         self.hint.setText(busy or "")
         self.hint.setVisible(bool(busy) and not ready)
@@ -437,10 +473,11 @@ class _CandidateBar(QWidget):
 
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
-                 on_toggle_debug=None):
+                 on_toggle_debug=None, on_voice_convert=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
-        on_toggle_debug(开不开) → 开关调试视图那个独立窗口。"""
+        on_toggle_debug(开不开) → 开关调试视图那个独立窗口。
+        on_voice_convert() → 用户点了「转文字」，返回 "" 或一句给用户看的失败原因。"""
         self.app = QApplication.instance() or QApplication([])
         self.app.setWindowIcon(_app_icon())
         setTheme(Theme.LIGHT)
@@ -449,7 +486,9 @@ class Overlay:
         self.on_toggle_capture = on_toggle_capture
         self.on_target_change = on_target_change
         self.on_toggle_debug = on_toggle_debug
+        self.on_voice_convert = on_voice_convert
         self.result_of = result_of
+        self._voices = {}  # {会话名: [(x0,y0,x1,y1,时长)]}，语音气泡的位置，转文字要右键它
         self.cands = []
         self.cards = []
         self._busy = False
@@ -1349,12 +1388,46 @@ class Overlay:
         valid = isinstance(score, (int, float)) and isfinite(score) and 0 <= score <= 9
         return f"建议：{action} · 紧张度 {score:.0f}/9" if valid else f"建议：{action}"
 
+    def set_voice(self, chat, items):
+        """子进程报来的语音气泡（位置+时长）。只有正看着的那个会话才反映到候选条上。"""
+        if items:
+            self._voices[chat] = list(items)
+        else:
+            self._voices.pop(chat, None)
+        if chat == self._shown:
+            self._sync_bar()
+
+    def _voice_text(self):
+        """候选条上那句「语音消息 8"」。已经有候选可看时让位给候选——那时用户要的是挑一句回，
+        不是转文字。没语音就返回空串。"""
+        if self._phase in ("thinking", "ready"):
+            return ""
+        items = self._voices.get(self._shown) or []
+        return f"语音消息 {items[-1][4]}" if items else ""
+
+    def _convert_voice(self):
+        """候选条上的「转文字」：交给父进程去右键那条语音、点菜单第一项。
+
+        转出来的文字会作为新气泡被采集链路照常读到并触发判断，这里点完就不管了。"""
+        if not self.on_voice_convert:
+            return
+        self.bar.hide()  # 先把自己的条收掉：它置顶，可能正好压在语音气泡上挡住右键
+        self._barTimer.stop()
+        reason = self.on_voice_convert()
+        if reason:
+            self.set_status(reason, "warning")
+            self._show_bar()  # 没成，把条摆回来让用户重试或自己手动转
+            return
+        self._voices.pop(self._shown, None)
+        self.set_status("已点了「语音转文字」，转出来我会自动接着判断。", "busy")
+
     def _sync_bar(self):
         """把紧凑候选条刷成和面板一致。两边共用 self.cands / self._ordered，不新增数据流。"""
         items = [(position + 1, self.cands[index], score, recommended)
                  for position, (index, score, recommended) in enumerate(self._ordered)]
         heard = self.hers.get(self._shown) or self.hers.get(self._chat) or ""
-        self.bar.set_items(items, self._suggest_text() if items else "", self._phase, heard)
+        self.bar.set_items(items, self._suggest_text() if items else "", self._phase, heard,
+                           self._voice_text())
 
     def set_phase(self, phase):
         """main.py 派生出来的流水线状态。同态重复调用是空操作，否则每 50ms 重放一次会闪。"""
@@ -1375,8 +1448,10 @@ class Overlay:
 
     def _show_bar(self):
         """悬停 / 单击宠物：把紧凑候选条摆出来。没有可看的东西就不弹，免得弹个空的。"""
-        if not self.pet_enabled or self._phase not in ("notify", "thinking", "ready"):
+        if not self.pet_enabled:
             return
+        if self._phase not in ("notify", "thinking", "ready") and not self._voice_text():
+            return  # 静息态又没语音可转，弹出来是空的
         self._place_bar()
         self.bar.show()
         self._barTimer.start(_BAR_HOLD_MS)

@@ -14,7 +14,7 @@ import time
 import traceback
 from collections import deque
 
-from app import settings, update, worker
+from app import settings, update, voice, worker
 from app.capture import find_wechat_hwnd
 from app.fill import fill
 from app.overlay import Overlay
@@ -29,7 +29,7 @@ chats = {}
 # phase 是派生出来的流水线状态（宠物换姿势、候选条显隐都看它），notify_until 是「刚来新消息」
 # 那一下的截止时刻——用时间戳而不是布尔量，省得还要找地方把它清掉
 state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "",
-         "phase": "idle", "notify_until": 0.0}
+         "phase": "idle", "notify_until": 0.0, "voice": None}
 _NOTIFY_HOLD = 0.9  # 新消息到了先闪这么久「提醒」，再进判断
 results = queue.Queue()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
@@ -58,6 +58,24 @@ def fill_reply(text):
         if target:
             text = f"@{target} " + text  # 纯文本，微信不认成真正的 @，只是让群里看得出在跟谁说
     fill(state["hwnd"], state["area"], text)
+
+
+def convert_voice():
+    """用户点了候选条上的「转文字」：右键那条语音 → 点菜单里的「语音转文字」。
+
+    转出来的文字会作为一条新气泡出现在聊天区，被采集链路照常读到、照常触发判断——
+    所以这里点完就完事，不用自己再去 OCR 一遍。返回 "" 表示成功，否则是给用户看的原因。"""
+    if state["hwnd"] is None:
+        return "未找到聊天窗口，请确认已经打开"
+    if not capture_on.is_set():
+        return "采集已暂停，先开启采集再转文字"
+    if not state["voice"] or not state["voice"][1]:
+        return "还没定位到那条语音，稍等一下再试"
+    # 坐标是相对那一帧的，只有微信现在开着的就是这条语音所在的会话，右键才落得准
+    title = state["voice"][0]
+    if title != state["chat"] or title != ov.current_chat():
+        return "微信现在开着的不是这条语音所在的会话，切回去再试"
+    return voice.convert(state["hwnd"], state["voice"][1][-1][:4])  # 取最近的那条（OCR 框自上而下排）
 
 
 def spawn_worker():
@@ -190,6 +208,14 @@ def drain():
             ov.set_status(msg[1], "warning")
             ov.log(msg[1])
             continue
+        if kind == "voice":  # 这一帧认出来的语音气泡（位置给「转文字」右键用）
+            title, items = msg[1], msg[2]
+            had = len(state["voice"][1]) if state["voice"] else 0
+            state["voice"] = (title, items)
+            ov.set_voice(title, items)
+            if len(items) > had:  # 多出来一条才提醒；拖动/滚动只是坐标变，不算新消息
+                state["notify_until"] = time.monotonic() + _NOTIFY_HOLD
+            continue
         if kind == "paused":  # 子进程确认已暂停
             ov.set_capture(False)
             continue
@@ -305,6 +331,7 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     debug_on = multiprocessing.Event()  # 同上，置位=子进程往队列里送整帧给调试窗
     ov = Overlay(on_fill=fill_reply, on_toggle_capture=on_toggle_capture,
                  on_target_change=on_target_change, on_toggle_debug=set_debug,
+                 on_voice_convert=convert_voice,
                  result_of=lambda t: chats.get(t, {}).get("result"))
     child = dbg = None
     try:

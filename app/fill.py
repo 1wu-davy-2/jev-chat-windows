@@ -46,6 +46,20 @@ def set_clipboard(text):
     raise RuntimeError("OpenClipboard 连续失败，剪贴板被其他程序占用")
 
 
+def foreground(hwnd):
+    """把窗口切到前台。SetForegroundWindow 有前台窗口保护，普通后台进程会被拒；AttachThreadInput 绕过。
+    app/voice.py 右键语音气泡之前也要先把微信切到前台，所以抽出来共用。"""
+    fg = u32.GetForegroundWindow()
+    if fg == hwnd:
+        return
+    fg_tid = u32.GetWindowThreadProcessId(fg, None)
+    our_tid = k32.GetCurrentThreadId()
+    u32.AttachThreadInput(our_tid, fg_tid, True)
+    u32.SetForegroundWindow(hwnd)
+    u32.AttachThreadInput(our_tid, fg_tid, False)
+    time.sleep(0.15)  # 给微信一点时间响应前台切换
+
+
 def fill(hwnd, area, text):
     """area = 消息区 (x0, y0, x1, y1)；输入框就在底线 y1 下面。"""
     from app.capture import unminimize
@@ -57,16 +71,7 @@ def fill(hwnd, area, text):
     x0, _, _, y1 = area
     cx, cy = r.left + x0 + 60, r.top + y1 + 40  # 分隔线下 40px = 输入框文字区；工具栏和「发送」在输入区最底下，碰不到
     unminimize(hwnd)
-
-    # SetForegroundWindow 有前台窗口保护，普通后台进程会被拒；AttachThreadInput 绕过
-    fg = u32.GetForegroundWindow()
-    if fg != hwnd:
-        fg_tid = u32.GetWindowThreadProcessId(fg, None)
-        our_tid = k32.GetCurrentThreadId()
-        u32.AttachThreadInput(our_tid, fg_tid, True)
-        u32.SetForegroundWindow(hwnd)
-        u32.AttachThreadInput(our_tid, fg_tid, False)
-        time.sleep(0.15)  # 给微信一点时间响应前台切换
+    foreground(hwnd)
 
     old = w.POINT()
     u32.GetCursorPos(ctypes.byref(old))
