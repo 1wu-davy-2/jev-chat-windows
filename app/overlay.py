@@ -103,6 +103,17 @@ def _tool(icon, title, callback, parent=None):
     return button
 
 
+def _tab_qss(active):
+    """设置页签的胶囊样式：选中 = 墨底纸字，未选中 = 奶油底墨字。
+
+    跟设计稿里「你们的关系」「桌面外观」那排胶囊一个口径（SettingsPanel.tsx 里
+    选中是 bg-ink text-paper，未选中是 bg-cream text-ink）。"""
+    bg = theme.INK if active else theme.CREAM
+    fg = theme.PAPER if active else theme.INK
+    return (f"QPushButton {{ background: {bg}; color: {fg}; border: none; "
+            f"border-radius: 15px; padding: 0 16px; font-weight: 600; }}")
+
+
 class _Surface(CardWidget):
     """卡片。底色/圆角走 token，柔和投影靠 theme.apply_shadow（Qt 没有 box-shadow）。
 
@@ -719,11 +730,24 @@ class Overlay:
         heading.addWidget(_label("设置", FONT_H1, theme.INK, True), 1)
         body.addLayout(heading)
         body.addWidget(_label("调整关系背景，配置判断和起草用的两个模型。", FONT_MD, _MUTED))
+        # 两块内容分页签摆，别堆成一长条滚动。标题交给页签，卡片里就不再重复写一遍
+        tabs = QHBoxLayout()
+        tabs.setSpacing(GAP_SM)
+        self.tabButtons = {}
+        for key, text in (("preference", "回复偏好"), ("models", "模型设置")):
+            button = QPushButton(text)
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFixedHeight(30)
+            button.clicked.connect(lambda _=False, k=key: self._switch_tab(k))
+            self.tabButtons[key] = button
+            tabs.addWidget(button)
+        tabs.addStretch(1)
+        body.addLayout(tabs)
         preference = _Surface()
         box = QVBoxLayout(preference)
         box.setContentsMargins(GAP_LG, GAP_LG, GAP_LG, GAP_LG)
         box.setSpacing(GAP_MD)
-        box.addWidget(_label("回复偏好", FONT_MD, theme.INK, True))
         relation_label = _label("你们的关系", FONT_MD)
         box.addWidget(relation_label)
         self.relationshipBox = ComboBox()
@@ -810,13 +834,13 @@ class Overlay:
             "平时桌面上只有宠物，有消息才在它旁边弹候选条，点宠物展开完整面板。"
             "关掉就是原来那样：面板一直开着。"
         ))
+        self.preferenceCard = preference
         body.addWidget(preference)
 
         models = _Surface()
         box = QVBoxLayout(models)
         box.setContentsMargins(GAP_LG, GAP_LG, GAP_LG, GAP_LG)
         box.setSpacing(GAP_MD)
-        box.addWidget(_label("模型", FONT_MD, theme.INK, True))
         self._fetched = _Fetched()
         self._fetched.done.connect(self._models_fetched)
         self.jev = self._model_group(box, "判断 · Jev", "jev", providers.JEV_PROVIDERS)
@@ -873,7 +897,9 @@ class Overlay:
             "表现为「起草结果解析不出候选」。probe/probe_relay.py 能把这两样挨个试出来。"
         )
         box.addWidget(self.relayHint)
+        self.modelsCard = models
         body.addWidget(models)
+        self._switch_tab("preference")  # 默认停在第一页
         self.settingsFeedback = _label("", FONT_MD, _ACCENT)
         self.settingsFeedback.hide()
         body.addWidget(self.settingsFeedback)
@@ -1185,7 +1211,19 @@ class Overlay:
             self._load_settings()
         self.pages.setCurrentWidget(self.settingsPage)
         self.settingsButton.setEnabled(False)
-        (self.relationshipBox if settings.has_key() else self.jev.keyEdit).setFocus()
+        # 还没配 key 就直接落在「模型设置」页，省得用户自己找那一页
+        configured = settings.has_key()
+        self._switch_tab("preference" if configured else "models")
+        (self.relationshipBox if configured else self.jev.keyEdit).setFocus()
+
+    def _switch_tab(self, key):
+        """设置页的两页签：只切显隐，控件不重建——重建会把用户填了一半的内容弄丢。"""
+        for name, button in self.tabButtons.items():
+            active = name == key
+            button.setChecked(active)
+            button.setStyleSheet(_tab_qss(active))
+        self.preferenceCard.setVisible(key == "preference")
+        self.modelsCard.setVisible(key == "models")
 
     def _back_home(self):
         self.jev.keyEdit.clear()

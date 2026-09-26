@@ -265,6 +265,8 @@ def main() -> int:
                     # --relay 要拍的「模型」卡片在设置页下半截，先滚下去，不然截到的还是上半截。
                     # settingsPage 自己就是那个 ScrollArea（_scroll_page 直接把 scroll 返回了）
                     if args.relay and args.state == "settings":
+                        # 中转那几项在「模型设置」页签里，先切过去再滚到底
+                        ov._switch_tab("models")
                         bar = ov.settingsPage.verticalScrollBar()
                         bar.setValue(bar.maximum())
                         ov.app.processEvents()
