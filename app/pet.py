@@ -70,18 +70,26 @@ def _gray(pix: QPixmap) -> QPixmap:
 
 
 class _Mascot(QWidget):
-    """只负责画吉祥物本身：漂浮靠移动自己，思考态再叠一点旋转。"""
+    """只负责画吉祥物本身。
+
+    漂浮**不是**靠 move() 挪自己：这个控件在布局里，手动 move 会和布局打架，
+    而且往上飘时负偏移会把脏区顶到窗口外面——透明窗上表现为
+    `UpdateLayeredWindowIndirect failed ... (参数错误)`，画面干脆画不出来。
+    所以控件尺寸固定、比贴图高出两倍浮动幅度，浮动和旋转都在 paintEvent 里做。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.pix = QPixmap()
         self.angle = 0.0
+        self.dy = 0.0  # 漂浮偏移，只在绘制时用
 
     def set_pixmap(self, pix: QPixmap):
         self.pix = pix
         if not pix.isNull():
             dpr = pix.devicePixelRatio() or 1.0
-            self.setFixedSize(QSize(int(pix.width() / dpr), int(pix.height() / dpr)))
+            # 上下各留 FLOAT_AMP，贴图才有地方飘
+            self.setFixedSize(QSize(int(pix.width() / dpr),
+                                    int(pix.height() / dpr) + int(2 * FLOAT_AMP)))
         self.update()
 
     def paintEvent(self, event):
@@ -89,11 +97,14 @@ class _Mascot(QWidget):
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
-        if self.angle:  # 绕中心转，对应设计稿的 rotate(±2deg)
-            p.translate(self.width() / 2, self.height() / 2)
+        top = FLOAT_AMP + self.dy  # 贴图在控件内的落点
+        if self.angle:  # 绕贴图中心转，对应设计稿的 rotate(±2deg)
+            dpr = self.pix.devicePixelRatio() or 1.0
+            cx, cy = self.width() / 2, top + self.pix.height() / dpr / 2
+            p.translate(cx, cy)
             p.rotate(self.angle)
-            p.translate(-self.width() / 2, -self.height() / 2)
-        p.drawPixmap(0, 0, self.pix)
+            p.translate(-cx, -cy)
+        p.drawPixmap(0, int(top), self.pix)
 
 
 class PetWindow(QWidget):
@@ -176,7 +187,7 @@ class PetWindow(QWidget):
         self.badge.move(self.width() - SHADOW_MARGIN - 26, SHADOW_MARGIN + 4)
 
     def _animate(self):
-        """漂浮 + 思考态旋转。窗口尺寸恒定，只挪里面的 mascot，不触发重排。"""
+        """漂浮 + 思考态旋转。控件位置不动，只改绘制偏移，脏区永远落在窗口内。"""
         if self.mascot.pix.isNull():
             return
         self._t += 0.033
@@ -186,11 +197,18 @@ class PetWindow(QWidget):
         else:
             period, amp = FLOAT_PERIOD, FLOAT_AMP
             self.mascot.angle = 0.0
-        dy = amp * sin(2 * pi * self._t / period)
-        base_x = (self.frame.width() - self.mascot.width()) // 2
-        base_y = (self.frame.height() - self.mascot.height()) // 2
-        self.mascot.move(base_x, int(base_y + dy))
+        self.mascot.dy = amp * sin(2 * pi * self._t / period)
         self.mascot.update()
+
+    def move_to_default(self):
+        """没存过位置就摆到右下角（设计稿里吉祥物也在那儿），别让 Qt 随便丢一个地方。"""
+        from PySide6.QtGui import QGuiApplication
+
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        self.move(area.right() - self.width() - 24, area.bottom() - self.height() - 40)
 
     def clamp_to_screen(self):
         """换显示器/拔了外接屏之后别让宠物落在屏幕外。找不到所在屏就回主屏。"""
