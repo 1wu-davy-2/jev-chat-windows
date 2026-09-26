@@ -7,6 +7,7 @@ pillow                        # only for the synthetic images in probe/
 
 # model SDKs: one official client per protocol, no hand-written HTTP (see core/llm.py)
 openai                        # OpenAI Chat Completions: DeepSeek, OpenRouter, Moonshot, GLM, Qwen, ...
+socksio                       # httpx builds a SOCKS transport at Client() time whenever ALL_PROXY is a socks5:// URL (Clash et al set one); without this the openai SDK dies before sending anything
 typesafe-sdk                  # Jev judging over TypeSafe direct (api.typesafe.ai)
 anthropic                     # Anthropic Messages
 google-genai                  # Google Gemini

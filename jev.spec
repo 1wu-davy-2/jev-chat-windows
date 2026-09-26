@@ -23,6 +23,7 @@ for pkg in (
     "windows_capture",       # Rust 编译的 .pyd
     # 四个模型 SDK：core/llm.py 和 jev_client 里是**函数内 import**，静态分析扫不到，必须显式收
     "openai",
+    "socksio",               # httpx 的 SOCKS 支持，ALL_PROXY 是 socks5:// 时没有它 client 都建不出来
     "typesafe_sdk",
     "anthropic",
     "google.genai",
