@@ -299,10 +299,11 @@ class _CandidateBar(QWidget):
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint |
                             Qt.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        self.setFixedWidth(280 + 2 * SHADOW_PAD)
+        self.setFixedWidth(280 + theme.SHADOW_PAD_FLOAT[0] + theme.SHADOW_PAD_FLOAT[2])
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(SHADOW_PAD, SHADOW_PAD, SHADOW_PAD, SHADOW_PAD)
+        # 投影余量必须够，不然脏区顶到窗口外、透明窗上直接画不出来
+        outer.setContentsMargins(*theme.SHADOW_PAD_FLOAT)
         outer.setSpacing(0)
         self.frame = QWidget()
         self.frame.setObjectName("candidateBar")
@@ -311,7 +312,7 @@ class _CandidateBar(QWidget):
             f"QWidget#candidateBar {{ background: {theme.PAPER}; "
             f"border-radius: {RADIUS_XL}px; }}"
         )
-        theme.apply_shadow(self.frame, pop=True)
+        theme.apply_shadow(self.frame, kind="float")
         outer.addWidget(self.frame)
         box = QVBoxLayout(self.frame)
         box.setContentsMargins(GAP_SM, GAP_SM, GAP_SM, GAP_SM)

@@ -26,7 +26,6 @@ _PHASES = {"thinking": "mascot-think.png", "notify": "mascot-alert.png"}
 _IDLE = "mascot-idle.png"
 
 PET_H = 128       # 设计稿里 h-32 = 128px
-SHADOW_MARGIN = 18  # 给投影留的余量，不留会被窗口边界裁掉
 FLOAT_AMP = 7.0     # 漂浮幅度（设计稿的 translateY(-7px)）
 FLOAT_PERIOD = 3.6  # 漂浮周期，秒
 THINK_PERIOD = 1.6  # 思考态晃得快点
@@ -137,13 +136,16 @@ class PetWindow(QWidget):
         self._pix = {}  # {阶段: (彩色, 灰色)}，只在第一次用到时算
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN)
+        # 投影余量：QGraphicsDropShadowEffect 按 blurRadius 向外扩、再按 offset 下移，
+        # 所以下方要多留一个 offset。留不够脏区就顶到窗口矩形外——透明窗上表现为
+        # UpdateLayeredWindowIndirect failed，阴影直接被裁掉。
+        outer.setContentsMargins(*theme.SHADOW_PAD_MASCOT)
         outer.setSpacing(0)
         # 阴影挂 frame，不挂 mascot：一个 QWidget 只能挂一个 QGraphicsEffect，
         # mascot 那个位置要留给别的东西（而且阴影得画在内容之外才有意义）
         self.frame = QWidget()
         self.frame.setAttribute(Qt.WA_TranslucentBackground, True)
-        theme.apply_shadow(self.frame, pop=True)
+        theme.apply_shadow(self.frame, kind="mascot")
         outer.addWidget(self.frame)
 
         stage = QVBoxLayout(self.frame)
@@ -194,7 +196,8 @@ class PetWindow(QWidget):
         self._place_badge()
 
     def _place_badge(self):
-        self.badge.move(self.width() - SHADOW_MARGIN - 26, SHADOW_MARGIN + 4)
+        pad_left, pad_top = theme.SHADOW_PAD_MASCOT[0], theme.SHADOW_PAD_MASCOT[1]
+        self.badge.move(self.width() - pad_left - 26, pad_top + 4)
 
     def _animate(self):
         """漂浮 + 思考态旋转。控件位置不动，只改绘制偏移，脏区永远落在窗口内。"""

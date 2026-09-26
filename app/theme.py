@@ -55,10 +55,6 @@ GAP_MD = 12
 GAP_LG = 16
 GAP_XL = 24
 
-# 卡片四周要给投影留的余量。容器边距、卡片之间的 spacing 都别小于这个数。
-SHADOW_PAD = 26
-
-
 def card_qss(bg=PAPER, radius=RADIUS_MD, ring=True):
     """卡片样式串：底色 + 圆角 + 1px 描边环。
 
@@ -68,20 +64,34 @@ def card_qss(bg=PAPER, radius=RADIUS_MD, ring=True):
     return f"background: {bg}; border-radius: {radius}px; {border}"
 
 
-def apply_shadow(widget, pop=False):
+# 每种阴影要留的最小余量，顺序是 (左, 上, 右, 下)。
+# QGraphicsDropShadowEffect 把边界按 blurRadius 向外扩、再按 offset 往下移，
+# 所以下方要多留一个 offset 的量。留不够脏区就顶到窗口矩形外——在透明窗上
+# （WA_TranslucentBackground）表现为 UpdateLayeredWindowIndirect failed，阴影被裁。
+SHADOW_PAD = 26                       # 卡片：blur 28 / offset 10
+SHADOW_PAD_POP = 56                   # 弹层：blur 40 / offset 16
+SHADOW_PAD_FLOAT = (28, 28, 28, 40)   # 候选条那种浮动窗：(左, 上, 右, 下)，blur 28 / offset 12
+SHADOW_PAD_MASCOT = (18, 18, 18, 32)  # 宠物窗：(左, 上, 右, 下)，blur 18 / offset 12
+
+_SHADOWS = {  # kind -> (blurRadius, offsetY, alpha)
+    "card": (28, 10, 34),    # CSS 三层里最重的 0 10px 28px rgba(28,25,23,.08)，抬高一点凑厚度
+    "pop": (40, 16, 41),     # 对应 CSS 的 0 16px 40px rgba(28,25,23,.16)
+    # 浮动窗：跟 pop 一样的 16% 浓度，但 blur 收到 28。透明窗的留白是实打实占鼠标事件的，
+    # blur 40 要留 56px 一圈，对一条 280 宽的候选条来说太浪费
+    "float": (28, 12, 41),
+    "mascot": (18, 12, 56),  # 设计稿里吉祥物的 drop-shadow(0 12px 18px rgba(28,25,23,.22))
+}
+
+
+def apply_shadow(widget, kind="card"):
     """给控件挂一层柔和投影，返回那个 effect（留着以后调参用）。
 
     注意 Qt 只支持一层阴影，CSS 里那三层叠不出，这里取视觉上最重的一层近似。
-    加了阴影的卡片，**父布局必须给它留出 SHADOW_PAD 的余量**，否则阴影被裁。"""
+    加了阴影的容器，**父布局必须按 SHADOW_PAD* 留够余量**，否则阴影被裁。"""
+    blur, offset, alpha = _SHADOWS[kind]
     effect = QGraphicsDropShadowEffect(widget)
-    if pop:  # 弹层（紧凑候选条那种浮在桌面上的）：对应 CSS 的 0 16px 40px rgba(28,25,23,.16)
-        effect.setBlurRadius(40)
-        effect.setOffset(0, 16)
-        effect.setColor(QColor(*_INK_RGB, 41))
-    else:  # 普通卡片：CSS 是三层叠出来的（6% 描边环 + 4% 近影 + 8% 远影），
-            # Qt 只能给一层，所以把最重那层的 8% 往上抬一点，凑出接近的厚度感
-        effect.setBlurRadius(28)
-        effect.setOffset(0, 10)
-        effect.setColor(QColor(*_INK_RGB, 34))
+    effect.setBlurRadius(blur)
+    effect.setOffset(0, offset)
+    effect.setColor(QColor(*_INK_RGB, alpha))
     widget.setGraphicsEffect(effect)
     return effect
