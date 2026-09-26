@@ -7,8 +7,8 @@ from datetime import datetime
 from math import isfinite
 from types import SimpleNamespace
 
-from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import QObject, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QSizeGrip, QSizePolicy,
     QStackedWidget, QVBoxLayout, QWidget,
@@ -20,14 +20,19 @@ from qfluentwidgets import (
     setCustomStyleSheet, setFont, setTheme, setThemeColor,
 )
 
-from app import settings
+from app import settings, theme
+from app.theme import (
+    FONT_2XL, FONT_DISPLAY, FONT_H1, FONT_LG, FONT_MD, FONT_SM, FONT_XL, FONT_XS,
+    GAP_LG, GAP_MD, GAP_SM, GAP_XL, GAP_XS, RADIUS_LG, RADIUS_MD, RADIUS_SM,
+    RADIUS_XL, SHADOW_PAD,
+)
 from app.version import VERSION
 from core import jev_client, llm, providers, relay
 from core.questions import CHOICE_LABELS
 
 _LOG_LINES = 300
-_MUTED = "#68776f"
-_GREEN = "#18794e"
+_MUTED = theme.MUTED   # 次要文字色（原来是偏绿的 #68776f，现在统一走 token）
+_ACCENT = theme.SAGE   # 强调色（原来是 #18794e）
 _RELATIONSHIPS = [
     ("恋人", "romantic partners"), ("朋友", "friends"), ("同事", "colleagues"),
     ("家人", "family"), ("自定义", None),
@@ -88,7 +93,7 @@ def _label(text="", size=14, color=None, bold=False, parent=None):
 
 def _tool(icon, title, callback, parent=None):
     button = TransparentToolButton(icon, parent)
-    button.setFixedSize(32, 32)
+    button.setFixedSize(28, 28)  # 设计稿里图标按钮是 size-7 = 28px
     button.setToolTip(title)
     button.setAccessibleName(title)
     button.clicked.connect(callback)
@@ -96,14 +101,19 @@ def _tool(icon, title, callback, parent=None):
 
 
 class _Surface(CardWidget):
+    """卡片。底色/圆角走 token，柔和投影靠 theme.apply_shadow（Qt 没有 box-shadow）。
+
+    挂了阴影之后，**放它的容器必须留出 SHADOW_PAD 的边距**，卡片之间的间距也要够，
+    否则阴影会被裁掉、或者被下一张卡盖住。"""
     def __init__(self, parent=None, accent=False):
         self.accent = accent
         super().__init__(parent)
-        self.setBorderRadius(12)
+        self.setBorderRadius(RADIUS_LG)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        theme.apply_shadow(self)
 
     def _normalBackgroundColor(self):
-        return QColor("#edf7f0" if self.accent else "#ffffff")
+        return QColor(theme.SAGE_SOFT if self.accent else theme.PAPER)
 
     def _hoverBackgroundColor(self):
         return self._normalBackgroundColor()
@@ -140,10 +150,25 @@ class _TitleBar(QWidget):
 
 
 class _MainWindow(QWidget):
-    """窗口大小变了就叫 Overlay 重新排布；断点没跨过时 _relayout 自己不做事，这里不用防抖。"""
+    """窗口大小变了就叫 Overlay 重新排布；断点没跨过时 _relayout 自己不做事，这里不用防抖。
+
+    底色和圆角是手绘的：开了 WA_TranslucentBackground 之后 Qt 不再自动填窗口底，
+    而普通 QWidget 的 QSS `background` 在这种窗口上压根不会被绘制（实测连
+    WA_StyledBackground 也救不回来），所以只能自己画圆角矩形，顺带把描边一起画了。"""
     def __init__(self, relayout):
         super().__init__()
         self._relayout = relayout
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        # 内缩半像素，1px 的描边才落在像素格上，不然会糊成两像素的灰边
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(rect, RADIUS_XL, RADIUS_XL)
+        p.fillPath(path, QColor(theme.CREAM))
+        p.setPen(QPen(QColor(theme.LINE), 1))
+        p.drawPath(path)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -155,17 +180,16 @@ class _ReplyCard(_Surface):
         super().__init__(accent=recommended)
         box = QVBoxLayout(self)
         self.box = box
-        box.setSpacing(10)
+        box.setSpacing(GAP_SM)
         top = QHBoxLayout()
         label = "推荐回复" if recommended else f"备选 {number}"
         if score is not None:
             label += f" · {round(score * 100)}%"
-        top.addWidget(_label(label, 12, _GREEN if recommended else _MUTED, True))
+        top.addWidget(_label(label, FONT_XS, _ACCENT if recommended else _MUTED, True))
         self.copyButton = _tool(FIF.COPY, "复制这条回复", lambda: owner._copy(index), self)
-        self.copyButton.setFixedSize(24, 24)
         top.addWidget(self.copyButton)
         box.addLayout(top)
-        self.text = _label(owner.cands[index], 15)
+        self.text = _label(owner.cands[index], FONT_LG)
         self.text.setTextInteractionFlags(Qt.TextSelectableByMouse)
         box.addWidget(self.text)
         bottom = QHBoxLayout()
@@ -182,7 +206,8 @@ class _ReplyCard(_Surface):
         self.copyButton.setEnabled(enabled)
 
     def set_compact(self, compact):
-        self.box.setContentsMargins(12, 8, 12, 8) if compact else self.box.setContentsMargins(16, 12, 16, 12)
+        self.box.setContentsMargins(*(GAP_MD, GAP_SM, GAP_MD, GAP_SM) if compact
+                                    else (GAP_LG, GAP_MD, GAP_LG, GAP_MD))
         self.fillButton.setMinimumWidth(80 if compact else 100)
 
 
@@ -194,7 +219,7 @@ class Overlay:
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。"""
         self.app = QApplication.instance() or QApplication([])
         setTheme(Theme.LIGHT)
-        setThemeColor(_GREEN, save=False)
+        setThemeColor(_ACCENT, save=False)
         self.on_fill = on_fill
         self.on_toggle_capture = on_toggle_capture
         self.on_target_change = on_target_change
@@ -217,9 +242,9 @@ class Overlay:
         self.win.setObjectName("assistantWindow")
         self.win.setWindowTitle("JevChat-Windows")
         self.win.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.win.setStyleSheet(
-            "QWidget#assistantWindow { background: #f5f7f6; border: 1px solid #dce3de; border-radius: 14px; }"
-        )
+        # 开透明是为了让 _MainWindow 手绘的那个圆角真的透出去；不开的话窗口是矩形，
+        # 圆角外那几像素在桌面上没东西画。底色和描边都在 _MainWindow.paintEvent 里。
+        self.win.setAttribute(Qt.WA_TranslucentBackground, True)
         self.win.setMinimumWidth(320)
         self.win.setMaximumWidth(640)
         outer = QVBoxLayout(self.win)
@@ -227,13 +252,13 @@ class Overlay:
         outer.setSpacing(0)
         header = _TitleBar(self.win)
         title = QHBoxLayout(header)
-        title.setContentsMargins(18, 12, 10, 10)
-        title.setSpacing(8)
-        name = _label("Jev", 20, "#233c2f", True)
+        title.setContentsMargins(GAP_LG, GAP_MD, GAP_SM, GAP_SM)
+        title.setSpacing(GAP_SM)
+        name = _label("Jev", FONT_2XL, theme.INK, True)
         name.setFixedWidth(40)
         name.setAttribute(Qt.WA_TransparentForMouseEvents)
         title.addWidget(name)
-        self.subtitle = _label("JevChat-Windows", 12, _MUTED)
+        self.subtitle = _label("JevChat-Windows", FONT_SM, _MUTED)
         self.subtitle.setAttribute(Qt.WA_TransparentForMouseEvents)
         title.addWidget(self.subtitle, 1)
         self.captureSwitch = SwitchButton(header)
@@ -251,9 +276,9 @@ class Overlay:
         outer.addWidget(header)
         self.updateBar = QWidget(self.win)
         update_row = QHBoxLayout(self.updateBar)
-        update_row.setContentsMargins(18, 4, 8, 4)
-        update_row.setSpacing(8)
-        self.updateLabel = _label("", 12, _GREEN, True)
+        update_row.setContentsMargins(GAP_LG, GAP_XS, GAP_SM, GAP_XS)
+        update_row.setSpacing(GAP_SM)
+        self.updateLabel = _label("", FONT_SM, _ACCENT, True)
         update_row.addWidget(self.updateLabel, 1)
         self.updateLink = HyperlinkButton("", "去下载", self.updateBar)
         self.updateLink.setFixedHeight(24)
@@ -272,8 +297,8 @@ class Overlay:
         self._build_home()
         self._build_settings()
         footer = QHBoxLayout()
-        footer.setContentsMargins(20, 9, 8, 8)
-        footer.addWidget(_label(f"仅填入输入框 · 发送由你确认 · v{VERSION}", 11, _MUTED), 1)
+        footer.setContentsMargins(GAP_LG, GAP_SM, GAP_SM, GAP_SM)
+        footer.addWidget(_label(f"仅填入输入框 · 发送由你确认 · v{VERSION}", FONT_XS, _MUTED), 1)
         grip = QSizeGrip(self.win)
         grip.setFixedSize(16, 16)
         footer.addWidget(grip, 0, Qt.AlignBottom)
@@ -298,8 +323,9 @@ class Overlay:
         content.setObjectName("pageContent")
         content.setStyleSheet("QWidget#pageContent { background: transparent; }")
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(20, 8, 20, 12)
-        layout.setSpacing(14)
+        # 左右和下方要留够：卡片挂了投影，阴影画在卡片矩形之外，容器不留位置就被裁
+        layout.setContentsMargins(GAP_LG, GAP_LG, GAP_LG, SHADOW_PAD)
+        layout.setSpacing(GAP_LG)
         scroll.setWidget(content)
         self.pages.addWidget(scroll)
         self._pageLayouts.append(layout)
@@ -322,7 +348,8 @@ class Overlay:
             label.setVisible(not compact)
         self.referenceNote.setVisible(bool(self.cands) and not compact)
         self._sync_model_fields()
-        margins = (12, 8, 12, 12) if compact else (20, 8, 20, 12)
+        margins = ((GAP_MD, GAP_MD, GAP_MD, SHADOW_PAD) if compact
+                   else (GAP_LG, GAP_LG, GAP_LG, SHADOW_PAD))
         for layout in self._pageLayouts:
             layout.setContentsMargins(*margins)
         for card in self.cards:
@@ -331,14 +358,14 @@ class Overlay:
     def _build_home(self):
         self.home, body = self._scroll_page()
         heading = QHBoxLayout()
-        heading.addWidget(_label("回复建议", 23, "#24382d", True), 1)
-        self.updated = _label("", 11, _MUTED)
+        heading.addWidget(_label("回复建议", FONT_H1, theme.INK, True), 1)
+        self.updated = _label("", FONT_XS, _MUTED)
         self.updated.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         heading.addWidget(self.updated)
         body.addLayout(heading)
         chat_row = QHBoxLayout()
-        chat_row.setSpacing(8)
-        prefix = _label("当前会话", 12, _MUTED)
+        chat_row.setSpacing(GAP_SM)
+        prefix = _label("当前会话", FONT_SM, _MUTED)
         prefix.setFixedWidth(56)
         chat_row.addWidget(prefix)
         self.chatBox = _FitCombo()
@@ -347,7 +374,7 @@ class Overlay:
         self.chatBox.setToolTip("聊天窗口切到哪个会话这里就跟到哪个；也可以自己选一个，只看它的记录和建议")
         self.chatBox.currentIndexChanged.connect(self._on_chat_selected)
         chat_row.addWidget(self.chatBox, 1)
-        self.chatFollow = _label("", 11, _MUTED)
+        self.chatFollow = _label("", FONT_XS, _MUTED)
         self.chatFollow.setFixedWidth(52)
         self.chatFollow.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         chat_row.addWidget(self.chatFollow)
@@ -355,8 +382,8 @@ class Overlay:
         self.targetRow = QWidget()  # 只有开了「群聊指定回复对象」且这个会话是群聊才露出来
         target_row = QHBoxLayout(self.targetRow)
         target_row.setContentsMargins(0, 0, 0, 0)
-        target_row.setSpacing(8)
-        target_prefix = _label("回复对象", 12, _MUTED)
+        target_row.setSpacing(GAP_SM)
+        target_prefix = _label("回复对象", FONT_SM, _MUTED)
         target_prefix.setFixedWidth(56)
         target_row.addWidget(target_prefix)
         self.targetBox = _FitCombo()
@@ -370,7 +397,7 @@ class Overlay:
         target_row.addWidget(self.atCheck)
         self.targetRow.hide()
         body.addWidget(self.targetRow)
-        self.status = _label("", 12, _MUTED)
+        self.status = _label("", FONT_SM, _MUTED)
         body.addWidget(self.status)
         self.progress = IndeterminateProgressBar()
         self.progress.setFixedHeight(3)
@@ -379,9 +406,9 @@ class Overlay:
         self.context = QWidget()
         context_box = QVBoxLayout(self.context)
         context_box.setContentsMargins(0, 0, 0, 0)
-        context_box.setSpacing(5)
-        context_box.addWidget(_label("对方最近说", 11, _MUTED))
-        self.latest = _label("", 14, "#42574a")
+        context_box.setSpacing(GAP_XS)
+        context_box.addWidget(_label("对方最近说", FONT_XS, _MUTED))
+        self.latest = _label("", FONT_MD, theme.INK)
         self.latest.setTextInteractionFlags(Qt.TextSelectableByMouse)
         context_box.addWidget(self.latest)
         self.context.hide()
@@ -389,18 +416,18 @@ class Overlay:
 
         self.insight = _Surface()
         insight_box = QVBoxLayout(self.insight)
-        insight_box.setContentsMargins(14, 12, 14, 12)
-        insight_box.setSpacing(7)
+        insight_box.setContentsMargins(GAP_LG, GAP_MD, GAP_LG, GAP_MD)
+        insight_box.setSpacing(GAP_SM)
         row = QHBoxLayout()
-        self.insightTitle = _label("对话参考", 12, _MUTED)
+        self.insightTitle = _label("对话参考", FONT_XS, _MUTED)
         row.addWidget(self.insightTitle, 1)
-        self.tension = _label("", 11)
+        self.tension = _label("", FONT_XS)
         self.tension.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         row.addWidget(self.tension)
         insight_box.addLayout(row)
-        self.summary = _label("", 14, "#304c3c", True)
+        self.summary = _label("", FONT_MD, theme.INK, True)
         insight_box.addWidget(self.summary)
-        self.intent = _label("", 12, _MUTED)
+        self.intent = _label("", FONT_XS, _MUTED)
         insight_box.addWidget(self.intent)
         self.insight.setToolTip("根据当前聊天片段推测，可能理解有偏差。紧张度为 0–9 的参考评分。")
         self.insight.hide()
@@ -408,15 +435,15 @@ class Overlay:
 
         self.empty = _Surface()
         empty_box = QVBoxLayout(self.empty)
-        empty_box.setContentsMargins(24, 36, 24, 36)
-        empty_box.setSpacing(14)
-        symbol = _label("…", 30, _GREEN, True)
+        empty_box.setContentsMargins(GAP_XL, 36, GAP_XL, 36)
+        empty_box.setSpacing(GAP_LG)
+        symbol = _label("…", FONT_DISPLAY, _ACCENT, True)
         symbol.setAlignment(Qt.AlignCenter)
         empty_box.addWidget(symbol)
-        self.emptyTitle = _label("等待对方的新消息", 17, "#304c3c", True)
+        self.emptyTitle = _label("等待对方的新消息", FONT_XL, theme.INK, True)
         self.emptyTitle.setAlignment(Qt.AlignCenter)
         empty_box.addWidget(self.emptyTitle)
-        self.emptyHint = _label("保持聊天窗口打开。\n收到新消息后，回复建议会出现在这里。", 13, _MUTED)
+        self.emptyHint = _label("保持聊天窗口打开。\n收到新消息后，回复建议会出现在这里。", FONT_SM, _MUTED)
         self.emptyHint.setAlignment(Qt.AlignCenter)
         empty_box.addWidget(self.emptyHint)
         self.setupButton = PrimaryPushButton("前往设置")
@@ -428,9 +455,11 @@ class Overlay:
             self.emptyHint.setText("配置模型和关系背景，\n让建议更贴近你们的对话。")
         body.addWidget(self.empty)
         self.replyBox = QVBoxLayout()
-        self.replyBox.setSpacing(10)
+        # 卡片之间要留得比设计稿宽：Qt 里后画的兄弟控件会盖住前一张卡片的投影，
+        # 间距太小的话下面那张卡会把上面的阴影切掉一条
+        self.replyBox.setSpacing(GAP_XL)
         body.addLayout(self.replyBox)
-        self.referenceNote = _label("AI 建议仅供参考，按你的语气调整后再发送。", 11, _MUTED)
+        self.referenceNote = _label("AI 建议仅供参考，按你的语气调整后再发送。", FONT_XS, _MUTED)
         self.referenceNote.hide()
         body.addWidget(self.referenceNote)
 
@@ -452,15 +481,15 @@ class Overlay:
         self.settingsPage, body = self._scroll_page()
         heading = QHBoxLayout()
         heading.addWidget(_tool(FIF.RETURN, "返回回复建议", self._back_home))
-        heading.addWidget(_label("设置", 23, "#24382d", True), 1)
+        heading.addWidget(_label("设置", FONT_H1, theme.INK, True), 1)
         body.addLayout(heading)
-        body.addWidget(_label("调整关系背景，配置判断和起草用的两个模型。", 13, _MUTED))
+        body.addWidget(_label("调整关系背景，配置判断和起草用的两个模型。", FONT_MD, _MUTED))
         preference = _Surface()
         box = QVBoxLayout(preference)
         box.setContentsMargins(16, 16, 16, 18)
         box.setSpacing(12)
-        box.addWidget(_label("回复偏好", 16, "#304c3c", True))
-        relation_label = _label("你们的关系", 13)
+        box.addWidget(_label("回复偏好", FONT_MD, theme.INK, True))
+        relation_label = _label("你们的关系", FONT_MD)
         box.addWidget(relation_label)
         self.relationshipBox = ComboBox()
         self.relationshipBox.setMinimumWidth(0)
@@ -476,7 +505,7 @@ class Overlay:
             lambda index: self.relEdit.setVisible(_RELATIONSHIPS[index][1] is None)
         )
         box.addWidget(self._hint("帮助助手把握称呼、语气和回应分寸。"))
-        style_label = _label("说话风格（可选）", 13)
+        style_label = _label("说话风格（可选）", FONT_MD)
         box.addWidget(style_label)
         self.styleEdit = LineEdit()
         self.styleEdit.setPlaceholderText("例如：话少、不用标点、偶尔用 doge、不说客套话")
@@ -484,7 +513,7 @@ class Overlay:
         style_label.setBuddy(self.styleEdit)
         box.addWidget(self.styleEdit)
         box.addWidget(self._hint("候选本来就照着你最近发的消息模仿；这里可以再补一句你自己的口吻。"))
-        context_label = _label("参考上下文", 13)
+        context_label = _label("参考上下文", FONT_MD)
         box.addWidget(context_label)
         self.contextBox = SpinBox()
         self.contextBox.setRange(3, 30)
@@ -495,7 +524,7 @@ class Overlay:
             "生成和判断时看最近这么多条消息。太少会丢上下文，太多会稀释重点，建议 6–12。"
         ))
         target_row = QHBoxLayout()
-        target_row.addWidget(_label("群聊指定回复对象", 13), 1)
+        target_row.addWidget(_label("群聊指定回复对象", FONT_MD), 1)
         self.targetSwitch = SwitchButton()
         self.targetSwitch.setOnText("开")
         self.targetSwitch.setOffText("关")
@@ -506,7 +535,7 @@ class Overlay:
             "开了以后群聊里可以选回复给谁，候选会针对 TA 写，填入时可带 @。关了就正常回复。"
         ))
         update_row = QHBoxLayout()
-        update_row.addWidget(_label("启动时检查更新", 13), 1)
+        update_row.addWidget(_label("启动时检查更新", FONT_MD), 1)
         self.updateSwitch = SwitchButton()
         self.updateSwitch.setOnText("开")
         self.updateSwitch.setOffText("关")
@@ -517,7 +546,7 @@ class Overlay:
             "只向 GitHub 查最新版本号，不发送任何数据。国内访问 GitHub 慢的话关掉也行。"
         ))
         debug_row = QHBoxLayout()
-        debug_row.addWidget(_label("调试视图", 13), 1)
+        debug_row.addWidget(_label("调试视图", FONT_MD), 1)
         self.debugSwitch = SwitchButton()
         self.debugSwitch.setOnText("开")
         self.debugSwitch.setOffText("关")
@@ -535,7 +564,7 @@ class Overlay:
         box = QVBoxLayout(models)
         box.setContentsMargins(16, 16, 16, 18)
         box.setSpacing(12)
-        box.addWidget(_label("模型", 16, "#304c3c", True))
+        box.addWidget(_label("模型", FONT_MD, theme.INK, True))
         self._fetched = _Fetched()
         self._fetched.done.connect(self._models_fetched)
         self.jev = self._model_group(box, "判断 · Jev", "jev", providers.JEV_PROVIDERS)
@@ -548,7 +577,7 @@ class Overlay:
             "默认 DeepSeek 官网直连，国内最快。"
         ))
         think_row = QHBoxLayout()
-        think_row.addWidget(_label("起草时开启思考模式", 13), 1)
+        think_row.addWidget(_label("起草时开启思考模式", FONT_MD), 1)
         self.thinkingSwitch = SwitchButton()
         self.thinkingSwitch.setOnText("开")
         self.thinkingSwitch.setOffText("关")
@@ -560,14 +589,14 @@ class Overlay:
             "只有 " + " / ".join(providers.THINKING) + " 认这个开关。"
         ))
         # 中转那几项：来源选了「第三方中转」才露出来，起草和判断共用同一个地址
-        self.relayLabel = _label("中转地址", 13)
+        self.relayLabel = _label("中转地址", FONT_MD)
         box.addWidget(self.relayLabel)
         self.relayEdit = LineEdit()
         self.relayEdit.setPlaceholderText("https://你的中转站（带不带 /v1 都认）")
         self.relayEdit.setAccessibleName("第三方中转地址")
         self.relayLabel.setBuddy(self.relayEdit)
         box.addWidget(self.relayEdit)
-        self.judgePathLabel = _label("判断接口路径", 13)
+        self.judgePathLabel = _label("判断接口路径", FONT_MD)
         box.addWidget(self.judgePathLabel)
         self.judgePathEdit = LineEdit()
         self.judgePathEdit.setPlaceholderText(relay.DEFAULT_JUDGE_PATH)
@@ -575,7 +604,7 @@ class Overlay:
         self.judgePathLabel.setBuddy(self.judgePathEdit)
         box.addWidget(self.judgePathEdit)
         style_row = QHBoxLayout()
-        style_row.addWidget(_label("思考开关的传法", 13), 1)
+        style_row.addWidget(_label("思考开关的传法", FONT_MD), 1)
         self.thinkStyleBox = ComboBox()
         self.thinkStyleBox.setMinimumWidth(0)
         self.thinkStyleBox.setAccessibleName("中转认哪种思考开关")
@@ -593,7 +622,7 @@ class Overlay:
         )
         box.addWidget(self.relayHint)
         body.addWidget(models)
-        self.settingsFeedback = _label("", 13, _GREEN)
+        self.settingsFeedback = _label("", FONT_MD, _ACCENT)
         self.settingsFeedback.hide()
         body.addWidget(self.settingsFeedback)
         actions = QHBoxLayout()
@@ -611,7 +640,7 @@ class Overlay:
 
     def _hint(self, text):
         """设置页字段下面的灰字说明：记下来，紧凑模式一起隐藏。"""
-        label = _label(text, 12, _MUTED)
+        label = _label(text, FONT_XS, _MUTED)
         self._hintLabels.append(label)
         return label
 
@@ -622,12 +651,12 @@ class Overlay:
                                 stored_key=lambda k=kind: (settings.jev_key() if k == "jev"
                                                            else settings.llm_key()))
         heading = QHBoxLayout()
-        heading.addWidget(_label(title, 14, "#304c3c", True), 1)
-        group.keyState = _label("", 12, _GREEN)
+        heading.addWidget(_label(title, FONT_MD, theme.INK, True), 1)
+        group.keyState = _label("", FONT_XS, _ACCENT)
         group.keyState.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         heading.addWidget(group.keyState)
         box.addLayout(heading)
-        source_label = _label("来源", 13)
+        source_label = _label("来源", FONT_MD)
         box.addWidget(source_label)
         group.providerBox = ComboBox()
         group.providerBox.setMinimumWidth(0)  # 选项文字长短不一，别让它撑开设置页
@@ -636,14 +665,14 @@ class Overlay:
         source_label.setBuddy(group.providerBox)
         box.addWidget(group.providerBox)
         if kind == "draft":  # 只有两个「自定义」来源要自己填地址，别的来源这一行藏着
-            self.baseLabel = _label("Base URL", 13)
+            self.baseLabel = _label("Base URL", FONT_MD)
             box.addWidget(self.baseLabel)
             self.baseEdit = LineEdit()
             self.baseEdit.setPlaceholderText("https://你的服务/v1")
             self.baseEdit.setAccessibleName("自定义来源 Base URL")
             self.baseLabel.setBuddy(self.baseEdit)
             box.addWidget(self.baseEdit)
-        key_label = _label("密钥", 13)
+        key_label = _label("密钥", FONT_MD)
         box.addWidget(key_label)
         group.keyEdit = PasswordLineEdit()
         group.keyEdit.setAccessibleName(f"{title} API 密钥")
@@ -653,7 +682,7 @@ class Overlay:
         box.addWidget(self._hint(
             "OpenRouter 的 key 或 TypeSafe 的 key，看上面选的来源。" if kind == "jev"
             else "上面选哪家就填哪家的 key；换来源重填一次，只存这一把。"))
-        model_label = _label("模型", 13)
+        model_label = _label("模型", FONT_MD)
         box.addWidget(model_label)
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -667,7 +696,7 @@ class Overlay:
         group.fetchButton.clicked.connect(lambda: self._fetch_models(group))
         row.addWidget(group.fetchButton)
         box.addLayout(row)
-        group.status = _label("", 12, _MUTED)
+        group.status = _label("", FONT_XS, _MUTED)
         box.addWidget(group.status)
         group.providerBox.currentIndexChanged.connect(lambda _: self._provider_changed(group))
         return group
@@ -874,7 +903,7 @@ class Overlay:
         self.debugSwitch.blockSignals(False)
 
     def _settings_feedback(self, text, error=False):
-        color = "#b44832" if error else _GREEN
+        color = theme.DANGER if error else _ACCENT
         qss = f"BodyLabel {{ color: {color}; background: transparent; }}"
         setCustomStyleSheet(self.settingsFeedback, qss, qss)
         self.settingsFeedback.setText(text)
@@ -984,8 +1013,8 @@ class Overlay:
             card.set_available(False)
 
     def set_status(self, text, kind="idle"):
-        colors = {"idle": _MUTED, "busy": _GREEN, "success": _GREEN,
-                  "warning": "#93611d", "error": "#b44832"}
+        colors = {"idle": _MUTED, "busy": _ACCENT, "success": _ACCENT,
+                  "warning": theme.WARN, "error": theme.DANGER}
         markers = {"idle": "●", "busy": "●", "success": "✓", "warning": "!", "error": "!"}
         qss = f"BodyLabel {{ color: {colors.get(kind, _MUTED)}; background: transparent; }}"
         setCustomStyleSheet(self.status, qss, qss)
@@ -1169,9 +1198,9 @@ class Overlay:
         score = (answers.get("danger_level") or {}).get("score")
         valid_score = isinstance(score, (int, float)) and isfinite(score) and 0 <= score <= 9
         self.tension.setText(f"紧张度 {score:.0f}/9" if valid_score else "紧张度待判断")
-        color = "#996819" if valid_score and score >= 3 else _MUTED
+        color = theme.WARN if valid_score and score >= 3 else _MUTED
         if valid_score and score >= 6:
-            color = "#b44832"
+            color = theme.DANGER
         qss = f"BodyLabel {{ color: {color}; background: transparent; }}"
         setCustomStyleSheet(self.tension, qss, qss)
         self.empty.setVisible(not self.cands)
