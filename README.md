@@ -1,4 +1,4 @@
-# JevChat-Windows
+# jev-chat
 
 本仓库只维护当前这一套识别。有能力的人可以 Fork 后自行适配别的聊天窗口，作者不提供这项适配，也不对 Fork 出去的改动负责。
 
@@ -14,9 +14,9 @@
 
 👉 **[下载最新版](https://github.com/jev-chat/jev-chat-windows/releases/latest)**
 
-1. 在 Releases 页下载 `jev-chat-windows-vX.Y.Z.zip`（约 146 MB）
+1. 在 Releases 页下载 `jev-chat-vX.Y.Z.zip`（约 146 MB）
 2. 解压到一个固定目录（整个文件夹一起，exe 要用旁边那堆文件）
-3. 双击 `jev-chat-windows.exe`
+3. 双击 `jev-chat.exe`
 
 要求：Windows 10 1903+ / 11，聊天窗口开着，两个 API key（判断一个、起草一个，见下）。
 
@@ -294,7 +294,7 @@ pip install -r requirements.txt pyinstaller
 pyinstaller --noconfirm --clean jev.spec
 ```
 
-出来的是 `dist\jev-chat-windows\`，整个文件夹就是成品（onedir：onefile 有 150MB 要每次启动解压）。
+出来的是 `dist\jev-chat\`，整个文件夹就是成品（onedir：onefile 有 150MB 要每次启动解压）。
 推一个 `v*` tag，`.github/workflows/release.yml` 会在 `windows-latest` 上打好、压成 zip 挂到 Release 上；
 手动触发（workflow_dispatch）只出 artifact，方便试打包。
 

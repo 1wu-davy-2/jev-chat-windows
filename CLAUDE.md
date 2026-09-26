@@ -43,7 +43,7 @@ set PYTHONPATH=. && python tools/demo.py
 python tools/preview_ui.py --state ready
 python tools/preview_ui.py --state ready --screenshot docs/ui_home.png
 
-# 打包（onedir，产物 dist\jev-chat-windows\ 整个文件夹才是成品）
+# 打包（onedir，产物 dist\jev-chat\ 整个文件夹才是成品）
 build.bat
 pyinstaller --noconfirm --clean jev.spec
 ```

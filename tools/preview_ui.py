@@ -210,7 +210,7 @@ def main() -> int:
 
         # 只有当前会话有结果，切到另一个会话就是空态——跟真实情况一致
         ov = Overlay(on_fill=simulate_fill, result_of=lambda t: _RESULT if t == _CHAT else None)
-        ov.win.setWindowTitle("JevChat-Windows · 界面演示（合成数据）")
+        ov.win.setWindowTitle("jev-chat · 界面演示（合成数据）")
         shot = ov.win  # 截图截哪个窗口；调试预览截调试窗
 
         if args.state == "pet":

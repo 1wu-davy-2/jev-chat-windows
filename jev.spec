@@ -4,7 +4,7 @@ onedir 不是 onefile：PySide6 + onnxruntime 打出来 ~150MB，onefile 每次�
 只在 Windows 上跑，下面的 collect_all 也只认 Windows 上装好的那几个包。"""
 from PyInstaller.utils.hooks import collect_all
 
-NAME = "jev-chat-windows"
+NAME = "jev-chat"
 
 hiddenimports = [
     # spawn 出来的采集子进程按名字 import app.worker，再顺着它拉 capture/ocr；
@@ -38,6 +38,9 @@ for pkg in (
 # app/pet.py 按 sys._MEIPASS 找（别照抄 settings._ROOT 那种「exe 旁边」的写法）
 datas += [(f"app/assets/{name}", "app/assets") for name in
           ("mascot-idle.png", "mascot-think.png", "mascot-alert.png")]
+# 图标也收一份：exe 自己的图标走下面的 icon=，但窗口/任务栏那个要运行时 setWindowIcon，
+# 源码跑时是从仓库的 docs/ 读，打包后得从 _MEIPASS/docs 读
+datas += [("docs/icon.ico", "docs")]
 
 excludes = [
     # 确认没人用：rapidocr 只 import 了 cv2 / PIL / yaml / pyclipper / shapely（PIL 千万别排，读图要它）

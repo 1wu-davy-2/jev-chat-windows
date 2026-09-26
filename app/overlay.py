@@ -8,7 +8,7 @@ from math import isfinite
 from types import SimpleNamespace
 
 from PySide6.QtCore import QLocale, QObject, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QSizeGrip, QSizePolicy,
     QStackedWidget, QVBoxLayout, QWidget,
@@ -101,6 +101,16 @@ def _tool(icon, title, callback, parent=None):
     button.setAccessibleName(title)
     button.clicked.connect(callback)
     return button
+
+
+def _app_icon():
+    """窗口/任务栏用的图标：源码跑从仓库的 docs/ 读，打包后从 _MEIPASS/docs 读。
+
+    不设的话任务栏按钮用的是 python.exe 的图标（源码跑时），设了才是那个绿底白「J」。
+    exe 文件本身的图标是另一回事，那个由 jev.spec 的 icon= 在打包时嵌进去。"""
+    base = (getattr(sys, "_MEIPASS", None)
+            or os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return QIcon(os.path.join(base, "docs", "icon.ico"))
 
 
 def _tab_qss(active):
@@ -432,6 +442,7 @@ class Overlay:
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。"""
         self.app = QApplication.instance() or QApplication([])
+        self.app.setWindowIcon(_app_icon())
         setTheme(Theme.LIGHT)
         setThemeColor(_ACCENT, save=False)
         self.on_fill = on_fill
@@ -457,7 +468,7 @@ class Overlay:
         self._phase = "idle"  # 流水线状态，由 main.py 派生后经 set_phase() 推进来
         self.win = _MainWindow(self._relayout)
         self.win.setObjectName("assistantWindow")
-        self.win.setWindowTitle("JevChat-Windows")
+        self.win.setWindowTitle("jev-chat")
         self.win.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         # 开透明是为了让 _MainWindow 手绘的那个圆角真的透出去；不开的话窗口是矩形，
         # 圆角外那几像素在桌面上没东西画。底色和描边都在 _MainWindow.paintEvent 里。
@@ -475,7 +486,7 @@ class Overlay:
         name.setFixedWidth(40)
         name.setAttribute(Qt.WA_TransparentForMouseEvents)
         title.addWidget(name)
-        self.subtitle = _label("JevChat-Windows", FONT_SM, _MUTED)
+        self.subtitle = _label("jev-chat", FONT_SM, _MUTED)
         self.subtitle.setAttribute(Qt.WA_TransparentForMouseEvents)
         title.addWidget(self.subtitle, 1)
         self.captureSwitch = SwitchButton(header)
