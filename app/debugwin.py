@@ -11,7 +11,8 @@ from qfluentwidgets import PlainTextEdit
 # (kind, 画框的色, 色的中文, 这类是什么)：跟设置页那条提示一个口径
 _KINDS = (("me", "#18794e", "绿", "我"), ("her", "#1f6fd0", "蓝", "对方"),
           ("gray", "#8a8a8a", "灰", "过滤掉的灰字"), ("name", "#e08b18", "橙", "当成发言人名"),
-          ("image", "#d0342c", "红", "当成图片丢掉"), ("tiny", "#d4b106", "黄", "小字丢掉"))
+          ("image", "#d0342c", "红", "当成图片丢掉"), ("tiny", "#d4b106", "黄", "小字丢掉"),
+          ("voice", "#c026d3", "紫", "语音消息丢掉"))
 _COLOR = {k: c for k, c, _, _ in _KINDS}
 _NAME = {k: n for k, _, _, n in _KINDS}
 _AREA = "#1f6fd0"  # 消息区

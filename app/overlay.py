@@ -831,7 +831,7 @@ class Overlay:
         box.addLayout(debug_row)
         box.addWidget(self._hint(
             "另开一个窗口实时显示截到的画面和识别框：绿 = 我、蓝 = 对方、灰 = 过滤掉的灰字、"
-            "红 = 当成图片丢掉、黄 = 小字丢掉。只在内存里画，不存图。"
+            "红 = 当成图片丢掉、黄 = 小字丢掉、紫 = 语音消息丢掉。只在内存里画，不存图。"
         ))
         pet_row = QHBoxLayout()
         pet_row.addWidget(_label("桌面宠物", FONT_MD), 1)

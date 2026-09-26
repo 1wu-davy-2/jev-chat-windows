@@ -32,9 +32,10 @@ Windows 上挂在微信（4.x，`Weixin.exe`）旁边的回复助手：截自己
 # 源码运行（首次会弹设置页填 key）
 python main.py
 
-# 内置自测（就这两处，跑完打印 ok）
+# 内置自测（就这三处，跑完打印 ok）
 python core/draft.py        # 候选解析器 + 防注入过滤的断言
 python -m app.update        # 版本号比较，monkeypatch urlopen，不联网
+python app/ocr.py           # 语音消息过滤正则（纯正则，不加载 OCR 引擎）
 
 # 端到端冒烟：写死的一段对话跑完整链，需 key + 联网
 set PYTHONPATH=. && python tools/demo.py
@@ -161,6 +162,11 @@ box-shadow，卡片阴影只能靠 `theme.apply_shadow()`（一层 `QGraphicsDro
   黄框跟着消失——所以 `worker.run()` 里暂停是真的 `cap.stop()`，不是跳过帧。
 - **OCR 的「文字必须落在平底色上」规则只对精确像素的帧成立**（众数颜色占比 <45% 判为图片里的字）：
   缩放/压缩过的图（拿预览窗再截一次）底色会糊成几百种颜色，整屏都会被当图片丢掉。
+- **语音消息气泡里没有正文，只有「时长 + 喇叭图标」**，OCR 出来是 `8"` 这种碎片。不拦的话它会被
+  当成对方说的一句 `8"`，白白触发一整套 Jev 判断（还花钱）。拦的锚点是时长后面那个引号
+  （`app/ocr.py` 的 `_VOICE`）——13 次实测它每次都读得出来，只是会被读成 `(` `)` `?`；引号后还要
+  再放最多两个字符，因为喇叭图标偶尔被读成字母（2.5 倍缩放下读成过 `G`）。**必须有引号**，
+  这样 `6` `666` `5G` `8点见` `8-9` 这些真消息不会被误伤。改这个正则先跑 `python app/ocr.py`。
 - **`chat_area()` 靠「面板 45% 高度以下第一根分隔线」找输入框顶**：输入框拉高超过面板一半会认错。
 - **PyInstaller 用 onedir**（`jev.spec`）：onefile 有 ~150MB 每次启动都要解压。
   `console=False`，所以 exe 里的 `print` 是看不到的，状态都走界面。

@@ -10,6 +10,17 @@ from rapidocr_onnxruntime import RapidOCR
 
 _ENGINE = None
 
+# 语音消息：气泡里只有「时长 + 喇叭图标」，没有正文。OCR 出来就是「8"」这种碎片，
+# 不认的话它会被当成对方说的一句「8"」，白白触发一整套 Jev 判断（还花钱）。
+#
+# 拿时长后面那个引号当锚点：它在 13 次实测里每次都读得出来，只是会被读成 ( ) ? 等，
+# 所以符号集要放宽。引号之后再放最多两个字符——喇叭图标偶尔会被读成一个字母
+# （2.5 倍缩放下读成过「G」），不放过它就漏了。
+#
+# 必须有那个引号，纯数字的消息才不会被误伤：「6」「666」「88」「5G」「8点见」「8-9」
+# 都不带引号，照常放行。
+_VOICE = re.compile(r"\d{1,3}\s*[\"”″＂'′’‘()（）?？!！|｜]{1,2}.{0,2}")
+
 
 def _engine():
     """OCR 引擎全进程共用：一个实例 ~40MB，每个会话一个 Reader，不能各带一个。
@@ -94,6 +105,9 @@ class Reader:
             kind, bg, h = who_said(chat, box)
             xs, ys = [p[0] for p in box], [p[1] for p in box]
             rect = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+            if _VOICE.fullmatch(text.strip()):
+                self.last_boxes.append(rect + ("voice", text))
+                continue
             if kind == "gray":
                 on_pane = np.abs(bg - pane_bg).sum() <= 6
                 taken = bool(on_pane and box[0][0] < 0.25 * W and len(text) <= 16
@@ -135,3 +149,18 @@ class Reader:
     def _seen(self, who, name, text):
         # 名字不参与判重：名字行滚出画面后同一条消息会从 her(LO) 变成 her，不能算新消息
         return any(w == who and similar(t, text) for w, _, t in self.seen)
+
+
+if __name__ == "__main__":
+    def voice(t):
+        return bool(_VOICE.fullmatch(t.strip()))
+
+    # 实测读出来的样子（前三个是这台机器上跑出来的），加同族推断
+    for t in ('8"', '8"(', '8 (', '8" G', '8" ', '8 "', '8?', '8”', "8'", '12"', '60"',
+              '100"', '8!', '8（', '8)', '8｜', '8"( '):
+        assert voice(t), t
+    # 真消息不能误伤：纯数字、单独的问号、带数字的正常短句
+    for t in ("8", "666", "88", "2024", "?", "？", "在吗", "好", "8点见", "8 点", "8-9",
+              "5G", "8G", '8" 屏幕', "3D", "8楼"):
+        assert not voice(t), t
+    print("ocr._VOICE ok")
