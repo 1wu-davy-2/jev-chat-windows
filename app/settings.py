@@ -153,6 +153,11 @@ def opener_minutes() -> int:
         return _DEFAULT_OPENER_MINUTES
     return max(1, min(720, n))
 
+def chat_pin() -> str:
+    """固定盯着哪个会话（"" = 跟随微信切到哪个就跟哪个）。界面上「当前会话」右边那个小按钮管的，
+    存了重启还算数——固定是「我就盯着这个人」的意思，不该开一次应用就没了。"""
+    return str(_read("chat_pin") or "").strip()
+
 def thinking() -> bool:
     """起草时是否开思考模式：慢且贵，默认关。只有 DeepSeek / OpenRouter / Anthropic / Gemini 吃它。"""
     return bool(_read("thinking", False))
@@ -250,7 +255,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          relay_base_url_text: str | None = None, relay_judge_path_text: str | None = None,
          relay_thinking_style_text: str | None = None,
          pet_enabled_on: bool | None = None, opener_on: bool | None = None,
-         opener_minutes_n: int | None = None, history_on: bool | None = None) -> None:
+         opener_minutes_n: int | None = None, history_on: bool | None = None,
+         chat_pin_text: str | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -297,6 +303,9 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "check_update": flag(check_update_on, check_update),
         "debug_view": flag(debug_view_on, debug_view),
         "pet_enabled": flag(pet_enabled_on, pet_enabled),
+        # 「固定盯着哪个会话」也不归这儿管（界面上那个小按钮走 save_chat_pin），但同样**必须
+        # 带过去**：这里是把整份配置重写一遍，漏了哪个键就等于把它删了。
+        "chat_pin": keep(chat_pin_text, "chat_pin"),
         # 宠物位置不归这儿管（save_pet_pos 单独写），但**必须原样带过去**：这里是把整份
         # 配置重写一遍，漏了哪个键就等于把它删了——以前漏了 pet_pos，点一次「保存设置」
         # 宠物下次就跳回默认角落。
@@ -314,6 +323,17 @@ def _load_all() -> dict:
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def save_chat_pin(name: str) -> None:
+    """只更新「固定盯着哪个会话」，别的字段原样带过去。
+
+    跟 save_pet_pos 一个道理：这不是设置页里保存一次的那种改动，界面上拨一下就得写盘，
+    走 save() 的话每次都要把两把 key 重写一遍注册表、再广播一次 WM_SETTINGCHANGE。"""
+    data = _load_all()
+    data["chat_pin"] = str(name or "").strip()
+    with open(_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
 
 
 def save_pet_pos(x: int, y: int) -> None:

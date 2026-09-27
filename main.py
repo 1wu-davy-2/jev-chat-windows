@@ -34,8 +34,11 @@ from core.engine import analyze, analyze_opener
 chats = {}
 # phase 是派生出来的流水线状态（宠物换姿势、候选条显隐都看它），notify_until 是「刚来新消息」
 # 那一下的截止时刻——用时间戳而不是布尔量，省得还要找地方把它清掉
+# chat 是**我们盯着的**那个会话（固定模式下 = pin），screen 是微信屏幕上**当前开着的**那个：
+# 平时两者一样，固定之后微信切走了就分家——消息按 screen 归户、建议只给 chat 出。
 state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "",
-         "phase": "idle", "notify_until": 0.0, "voice": None, "pending": None}
+         "phase": "idle", "notify_until": 0.0, "voice": None, "pending": None,
+         "screen": "", "pin": ""}
 _NOTIFY_HOLD = 0.9  # 新消息到了先闪这么久「提醒」，再进判断
 _VOICE_WINDOW = 20.0  # 点了「转文字」之后，子进程认「语音气泡下面的新文字」的窗口（秒）
 _HISTORY_DUP = 24  # 判重时往回看这么多条（一屏大概也就十来条）
@@ -58,6 +61,31 @@ def chat_of(title):
                                     "target": None, "senders": [], "run_id": None,
                                     "nudge": None, "nudge_at": 0.0, "nudge_len": 0,
                                     "nudged": False})
+
+
+def tracked(title):
+    """这个会话现在归不归我们管。固定模式下只有固定那一个算数（见 set_pin）。
+
+    别的会话的消息照记（聊天记录、去重、回复对象名单都留着，切回去就是现成的），
+    只是不点火、不弹提醒、不出建议——固定就是要它别跟着微信跑。"""
+    pin = state["pin"]
+    return not pin or title == pin
+
+
+def _alias(title):
+    """固定模式下 OCR 抖出来的别名（「白金搬砖小分队」↔「白金搬砖小分认」）并回固定那个名字。
+
+    子进程那份「相似就并成一个名字」认的是它自己这一轮见过的名字，跨进程重开就没了；
+    而固定那个名字是用户点按钮那会儿记下来的。不并的话，标题一抖就会被当成「微信开着
+    别的会话」，固定这个会话的消息还记到另一个键上，面板里一条都看不见。
+
+    **字数得一样**，比 ocr.similar() 自己那套更严：「张三」和「张三丰」的相似度有 0.8，
+    但那是两个人。并错了比不并坏——不并最多是这个会话暂时读不进来（状态栏里写着微信开着
+    哪个），并错了是拿别人的话替固定这个人起草。"""
+    pin = state["pin"]
+    if pin and title != pin and len(title) == len(pin) and similar(pin, title):
+        return pin
+    return title
 
 
 def _already_read(chat, item):
@@ -129,6 +157,45 @@ def mark_replied(title=None):
     ov.set_status("你已回复，等待对方的新消息")
 
 
+def set_pin(name):
+    """固定盯着某个会话（name 为空 = 回到跟随）。界面上「当前会话」右边那个按钮、以及启动时
+    读上次存的那个，都走这儿。
+
+    固定：把盯着的会话换成它，在等着的那次判断要是别的会话的就收掉——那个结果回头贴到固定
+    这个会话上就串了。回到跟随：盯着微信现在开着的那个（跟默认行为一样），要是它最后一句
+    正好是对方说的，就照常走一遍静默窗口给建议（固定期间攒下的消息没点过火，这会儿补上）。
+
+    设置存盘走 save_chat_pin（只改这一个键），跟宠物位置一个道理：拨一下按钮不该把两把 key
+    重写一遍注册表。"""
+    name = str(name or "")
+    before, state["pin"] = state["pin"], name
+    ov.set_pin(name)  # 先让界面知道现在的模式：下面 unpin 那支要靠它才会真的切过去
+    if name:
+        state["chat"] = name
+        if state["pending"] and state["pending"][0] != name:
+            state["pending"] = None
+            state["notify_until"] = 0.0
+    else:
+        # 屏幕上还没认出来是谁就是空，等「chat」那一帧补上（别留着固定那个名字：
+        # 那会儿已经没人盯着它了）
+        state["chat"] = state["screen"]
+        if state["pending"] and state["pending"][0] != state["screen"]:
+            state["pending"] = None
+            state["notify_until"] = 0.0
+        if state["screen"]:
+            ov.set_chat(state["screen"])  # 面板跟过去；这会儿已经是跟随模式了，所以它会真的切
+            msgs = list(chat_of(state["screen"])["history"])
+            if capture_on.is_set() and msgs and msgs[-1][0] == "her":
+                schedule_analyze(state["screen"])
+                ov.set_waiting()
+                ov.set_status("已回到跟随，等他把话说完就给建议", "busy")
+    if name != before:
+        try:
+            settings.save_chat_pin(name)
+        except Exception:  # 存不下也不该把按钮点崩（config.json 只读之类）
+            pass
+
+
 def target_of(title):
     """这个会话现在的回复对象：用户挑过且人还在就用它，否则用最近说话的那个；单聊没有发言人 → None。"""
     chat = chat_of(title)
@@ -142,6 +209,10 @@ def fill_reply(text):
         raise RuntimeError("未找到聊天窗口，请确认已经打开")
     if state["area"] is None:
         raise RuntimeError("输入区域尚不可用，请确认聊天窗口可见（不要最小化）")
+    if ov.current_chat() != ov.screen_chat():
+        # 界面那边已经拦过一道（固定模式下按钮灰着、点候选条会给提示），这儿是最后一道：
+        # 粘贴是直接发给微信当前会话的，「按会话隔离」在我们这儿成立、在它那儿不成立。
+        raise RuntimeError(f"微信现在开着的不是「{ov.current_chat()}」，切回去再填")
     if settings.reply_target() and ov.at_prefix_enabled():
         target = target_of(ov.current_chat())  # 填进去的是界面上正看着的那个会话的对象
         if target:
@@ -162,7 +233,9 @@ def convert_voice():
         return "还没定位到那条语音，稍等一下再试"
     # 坐标是相对那一帧的，只有微信现在开着的就是这条语音所在的会话，点下去才落得准
     title = state["voice"][0]
-    if title != state["chat"] or title != ov.current_chat():
+    # 认的是**屏幕上开着**的那个（screen_chat），不是面板里摆着的那个：固定模式下面板钉在 A，
+    # 微信可能早开到 B 了，照面板去点等于在 B 的聊天区乱点
+    if title != ov.screen_chat() or title != ov.current_chat():
         return "微信现在开着的不是这条语音所在的会话，切回去再试"
     last = state["voice"][1][-1]  # 取最近的那条（气泡自上而下排）
     reason = voice.convert(state["hwnd"], last[:4])
@@ -445,7 +518,7 @@ def opener_again():
         ov.set_status("还没识别到会话，稍等一下再试", "warning")
         return
     if title != ov.current_chat():
-        ov.set_status(f"微信现在开着的不是「{ov.current_chat()}」，切回去再换一批", "warning")
+        ov.set_status(f"现在看的是「{ov.current_chat()}」，切回「{title}」再换一批", "warning")
         return
     start_opener(title, manual=True)
 
@@ -474,12 +547,16 @@ def drain():
         except queue.Empty:
             return
         kind = msg[0]
+        if kind in ("chat", "lines", "voice", "noise"):  # 都带着会话名，先按固定那个名字归一
+            msg = (kind, _alias(msg[1])) + tuple(msg[2:])
         if kind == "area":  # 只是窗口挪了位置，坐标跟着更新，别的什么都不用动
             state["area"] = msg[1]
             continue
-        if kind == "chat":  # 微信切了会话，界面跟过去（用户正浏览别的会话时也跟，微信是准的）
-            state["chat"] = msg[1]
+        if kind == "chat":  # 微信切了会话：界面按固定状态决定跟不跟；盯着的那个只有跟随模式才换
+            state["screen"] = msg[1]
             ov.set_chat(msg[1])
+            if not state["pin"]:
+                state["chat"] = msg[1]
             continue
         if kind == "debug":  # 调试视图的一帧；窗口不在就直接丢掉
             if dbg is not None:
@@ -500,6 +577,8 @@ def drain():
                 # 不进喂模型的那份 history——「🔊 语音消息 3"」对模型是噪音）。
                 # 谁发的按气泡底色走：自己发的语音别挂到对方头上
                 ov.log_message(v[5], f"🔊 语音消息 {_voice_label(v[4])}", chat=title)
+            if not tracked(title):
+                continue  # 固定盯着别的会话：语音照记进那个会话的记录，但不提醒、不点火
             if fresh and latest == "me":
                 mark_replied(title)  # 最新那条是我发的语音 = 我已经回了，跟回了句文字一样
             elif fresh:
@@ -562,6 +641,10 @@ def drain():
                     chat["senders"].remove(name)
                 chat["senders"].insert(0, name)
         ov.set_targets(title, chat["senders"], target_of(title))  # 显不显示这一行由悬浮窗按开关决定
+        if not tracked(title):
+            # 固定模式盯着别的会话：这些照记（history、去重、聊天记录、发言人名单都留着，
+            # 切回去就是现成的），但不点火、不弹角标、不出建议——固定就是要它别跟着微信跑
+            continue
         # fresh 里就是 new 里那几个元组本身，所以能按身份比：屏幕上最新那条是不是真新的
         if not said or said[-1] is not new[-1]:
             continue  # 只有转写/补记的是中间那条：流水线按屏幕最底下那条走，别动它
@@ -665,12 +748,16 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     # 点了「转文字」之后盖的时间戳（time.monotonic()，同机同基准），子进程拿它决定
     # 认不认「语音气泡下面的新文字」。见 convert_voice() 和 app/worker.py
     voice_until = multiprocessing.Value("d", 0.0)
+    state["pin"] = settings.chat_pin()  # 上次固定在哪个会话（"" = 跟随微信切），下面照样摆到界面上
+    state["chat"] = state["pin"]
     ov = Overlay(on_fill=fill_reply, on_toggle_capture=on_toggle_capture,
                  on_target_change=on_target_change, on_toggle_debug=set_debug,
                  on_voice_convert=convert_voice, on_opener_again=opener_again,
                  on_settings_saved=on_settings_saved, on_open_history=open_history,
-                 on_use=mark_used,
+                 on_use=mark_used, on_pin_change=set_pin,
                  result_of=lambda t: chats.get(t, {}).get("result"))
+    if state["pin"]:
+        ov.set_pin(state["pin"])  # 面板先摆到固定那个会话上，等子进程读到微信开着谁再各归各位
     child = dbg = hist = None
     try:
         state["hwnd"] = find_wechat_hwnd()

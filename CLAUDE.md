@@ -61,7 +61,7 @@ python tools/preview_ui.py --state ready
 python tools/preview_ui.py --state ready --screenshot docs/ui_home.png
 # 可用的 --state：ready / waiting / loading / error / degraded / setup / settings / paused /
 #   debug / ime / ime-thinking / pet / pet-menu / bar / voice / log /
-#   opener / opener-bar / opener-loading / history
+#   opener / opener-bar / opener-loading / history / pinned
 # （history 会往临时目录写一个演示库，不碰本机那份 history.db）
 
 # 打包（onedir，产物 dist\jev-chat\ 整个文件夹才是成品）
@@ -242,6 +242,38 @@ scrollbar 的 `maximum()` 还是旧值，跟底得 `QTimer.singleShot(0, ...)`�
 一丢就把整屏当新消息重报一遍。父进程这道拦下来：整批都是旧的就 `continue`，一条也不记、不触发。
 判断「屏幕上最新那条要不要分析」看的是 `new[-1]` 本身新不新（`fresh[-1] is new[-1]`），不是过滤后
 剩下的最后一条——不然往上翻一屏，最后剩个中间的旧消息也能把判断点着。
+
+**固定 / 跟随**（「当前会话」右边那个按钮，`settings.chat_pin()` 存着固定哪个会话）。默认跟随：
+微信切到哪个会话面板就跟到哪个。点一下固定住，`state["pin"]` = 那个会话名，从此**两个会话名分家**：
+
+| 名字 | 谁是 | 干什么用的 |
+| --- | --- | --- |
+| `state["screen"]` / `Overlay._chat` | 微信屏幕上**当前开着**的 | 消息按它归户、填入选人、右键语音点坐标 |
+| `state["pin"]` | 用户钉住的那个（"" = 跟随） | — |
+| `state["chat"]` / `Overlay._shown` | **我们盯着的**那个（跟随模式 = screen） | 点火、出建议、开场白、界面上摆的 |
+
+三条规矩，改这块先看这三条：
+
+1. **能不能填只看「微信开着的 == 面板里那个」**，跟盯谁无关。`Overlay._fillable()` 是唯一判据
+   （`_sync_fillable()` 刷按钮灰显），`_fill()` 里还有一道拦，`main.fill_reply()` 里是最后一道。
+   粘贴是发给微信当前会话的，「按会话隔离」在我们这儿成立、在微信那儿不成立——固定模式下面板
+   一直摆着 A 的候选，微信可能早开到 B 了，照面板填就发错人。**复制不受限**（剪贴板不发给谁）。
+2. **只有盯着的那个会话才点火**：`main.tracked(title)` 是唯一判据，在 `drain()` 的 `lines` / `voice`
+   两支各拦一次（记进 `chats[title]`、聊天记录、`senders` 都照旧，拦的是 `schedule_analyze` /
+   `mark_replied` / `notify_until` / 「转文字」那套）。别的会话照记是为了切回去就是现成的，
+   不代表它也该给你出建议。**不拦的后果是花钱+串味**：别人来条消息就替他起草、候选条上还写着
+   「对方刚说」；别人会话里**我**发的语音会走 `mark_replied`，把固定会话正等着的那次判断取消掉。
+3. **OCR 抖出来的别名要并回固定那个名字**（`main._alias()`，`ocr.similar` 加一条「字数得一样」）。
+   固定那个名字是用户点按钮那会儿记下来的，子进程重开后认不出它，不并就会被当成「微信开着别的
+   会话」——固定着却一条都读不到。那条「字数得一样」比 `similar` 自己更严，是故意的：
+   「张三」和「张三丰」相似度 0.8 但是两个人，并错了比不并坏（见函数里的注释）。
+
+另外几处跟着它走的：`set_pin()`（唯一的写者，界面上拨按钮和启动读配置都走它）→ `Overlay.set_pin()`
+只管摆样子（按钮文字/颜色、`_shown`、灰显），**判断在哪半边都不重做**；`_offline_note()` 是
+「微信开着的不是面板里这个」那句话的唯一出处（固定和浏览两种说法）；`convert_voice()` 比的是
+`ov.screen_chat()`（曾经比的是 `state["chat"]`，固定之后那个是面板里的会话，会照着旧坐标去点别人）；
+`_sync_bar()` 里那句兜底的「对方刚说」固定时不许退到 `hers[screen]`。存盘走
+`settings.save_chat_pin()`（只改这一个键，跟 `save_pet_pos` 一个道理），但 `save()` 里**必须带过去**。
 
 **队列消息形状**（`main.py:drain()` 是唯一的消费点，加新的 kind 要两边一起改）：
 

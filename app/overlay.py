@@ -436,7 +436,8 @@ class _CandidateBar(QWidget):
         self.foot = QWidget()
         foot_row = QHBoxLayout(self.foot)
         foot_row.setContentsMargins(GAP_XS, GAP_XS, GAP_XS, 0)
-        foot_row.addWidget(_label("按 Ctrl+1/2/3 填入", FONT_XS, _MUTED), 1)
+        self.footHint = _label("按 Ctrl+1/2/3 填入", FONT_XS, _MUTED)
+        foot_row.addWidget(self.footHint, 1)
         self.againButton = QPushButton("换一批")
         self.againButton.setFlat(True)
         self.againButton.setCursor(Qt.PointingHandCursor)
@@ -476,7 +477,7 @@ class _CandidateBar(QWidget):
                 f"border-radius: {RADIUS_SM}px; padding: 1px 6px; }}"
             )
 
-    def set_items(self, items, suggest, phase, heard="", voice="", opener=False):
+    def set_items(self, items, suggest, phase, heard="", voice="", opener=False, blocked=False):
         """items: [(候选原始下标, 序号, 正文, 百分比或 None, 是否推荐)]；voice 非空 = 这条会话
         有语音消息，这时把「转文字」那一块顶上来，候选行让位。
 
@@ -485,6 +486,9 @@ class _CandidateBar(QWidget):
         opener 非空 = 现在摆的是冷场开场白（正在起草或已经摆出来）：标题那句从「对方刚说」改成
         「对方还没回」、角标改成「开场白」、生成中那句话也不用「Jev 判断中」（根本没那一步）、
         底下多一个「换一批」。
+
+        blocked 非空 = 候选摆着但填不了（固定着、微信开在别的会话）：底下那句提示不能再说
+        「按 Ctrl+1/2/3 填入」，那是句反话。
 
         候选行、忙碌文案、建议行三者按 phase 互斥（跟设计稿的 CandidateIme 一个口径）：
         只有 ready 才摆候选，其余阶段只显示一句进度说明。这样即便上层忘了清候选，
@@ -511,6 +515,9 @@ class _CandidateBar(QWidget):
         self.hint.setVisible(bool(busy) and not ready)
         self.suggest.setText(suggest or "")
         self.suggest.setVisible(ready and bool(suggest))
+        # 填不了的时候（固定着、微信开在别人那儿）提示别说「按 Ctrl+1/2/3 填入」，那是句反话。
+        # 复制不受影响，所以说这个——每行右边就有复制按钮
+        self.footHint.setText("可以先复制" if blocked else "按 Ctrl+1/2/3 填入")
         self.foot.setVisible(ready)
         self.againButton.setVisible(ready and opener)
         for i, row in enumerate(self.rows):
@@ -726,7 +733,7 @@ class _ChatLog(QWidget):
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
                  on_toggle_debug=None, on_voice_convert=None, on_opener_again=None,
-                 on_settings_saved=None, on_open_history=None, on_use=None):
+                 on_settings_saved=None, on_open_history=None, on_use=None, on_pin_change=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。
@@ -734,7 +741,9 @@ class Overlay:
         on_opener_again() → 用户点了「换一批」，要重新起草一批开场白。
         on_settings_saved() → 设置存盘了，父进程有些「按新设置现算一次」的事要做。
         on_open_history() → 用户点了标题栏那个「AI 记录」，开（或收起）记录窗。
-        on_use(原始下标, "fill"|"copy") → 用户用了第几条候选，父进程记进 AI 记录里。"""
+        on_use(原始下标, "fill"|"copy") → 用户用了第几条候选，父进程记进 AI 记录里。
+        on_pin_change(会话名或 "") → 用户点了「跟随/固定」，要不要固定、固定哪个由父进程定
+        （它才是准的那一份，界面这边只是照着显示，见 set_pin）。"""
         self.app = QApplication.instance() or QApplication([])
         self.app.setWindowIcon(_app_icon())
         setTheme(Theme.LIGHT)
@@ -748,6 +757,7 @@ class Overlay:
         self.on_settings_saved = on_settings_saved
         self.on_open_history = on_open_history
         self.on_use = on_use
+        self.on_pin_change = on_pin_change
         self.result_of = result_of
         self._voices = {}  # {会话名: [(x0,y0,x1,y1,时长)]}，语音气泡的位置，转文字要右键它
         self._opener = {}  # {会话名: 对方多少分钟没回}，现在摆的是开场白（不是回复）的会话
@@ -764,8 +774,9 @@ class Overlay:
         self.counts = {}  # {会话名: 消息条数}
         self.hers = {}  # {会话名: 对方最近一句}
         self.targets = {}  # {会话名: ([发言人], 当前回复对象)}
-        self._chat = ""  # 微信当前开着的会话
-        self._shown = ""  # 界面上正在看的会话（浏览时和上面不一样）
+        self._chat = ""  # 微信当前开着的会话。**能不能填只看它**（粘贴是发给微信的，跟面板看谁无关）
+        self._shown = ""  # 界面上正在看的会话（浏览、固定时和上面不一样）
+        self._pinned = ""  # 固定盯着哪个会话（"" = 跟随微信切）。父进程那份是准的，这里只是镜像
         self._ordered = []  # [(candidates 里的原始索引, 百分比, 是否推荐)]，按推荐顺序排好
         self._answers = {}  # 上一次判断的 7 道题答案，候选条和面板共用
         self._errorDetail = ""  # 最近一次失败的原文，「查看详情」里显示它
@@ -944,10 +955,16 @@ class Overlay:
         self.chatBox.setToolTip("聊天窗口切到哪个会话这里就跟到哪个；也可以自己选一个，只看它的记录和建议")
         self.chatBox.currentIndexChanged.connect(self._on_chat_selected)
         chat_row.addWidget(self.chatBox, 1)
-        self.chatFollow = _label("", FONT_XS, _MUTED)
+        # 跟随 / 固定：固定 = 面板钉在这一个会话上，微信切到别的会话也不跟过去（见 set_pin）。
+        # 做成按钮而不是原来那个纯文字标签，是因为它现在点得动——文字本身就写着现在是什么模式
+        self.chatFollow = QPushButton("")
+        self.chatFollow.setFlat(True)
         self.chatFollow.setFixedWidth(52)
-        self.chatFollow.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        chat_row.addWidget(self.chatFollow)
+        self.chatFollow.setCursor(Qt.PointingHandCursor)
+        setFont(self.chatFollow, FONT_XS)
+        self.chatFollow.clicked.connect(self._toggle_pin)
+        chat_row.addWidget(self.chatFollow, 0, Qt.AlignVCenter)
+        self._follow_text()  # 还没认到会话：空着 + 点不动，别摆个能点却没反应的按钮
         body.addLayout(chat_row)
         self.targetRow = QWidget()  # 只有开了「群聊指定回复对象」且这个会话是群聊才露出来
         target_row = QHBoxLayout(self.targetRow)
@@ -1728,6 +1745,12 @@ class Overlay:
     def _fill(self, index):
         if self._busy or not self._current or index >= len(self.cands):
             return
+        if self._shown != self._chat:
+            # 微信屏幕上开着的不是面板里这个会话，按下去会把话打进另一个人的输入框。
+            # 跟随模式下走不到这儿（一换会话候选就作废了），固定模式是常态：面板一直摆着
+            # 固定那个会话的候选，微信可能早切走了。复制不受影响（剪贴板不发给谁）。
+            self.set_status(self._offline_note(), "warning")
+            return
         try:
             self.on_fill(self.cands[index])
             self._used(index, "fill")
@@ -1746,6 +1769,27 @@ class Overlay:
         self.app.clipboard().setText(self.cands[index])
         self._used(index, "copy")
         self.set_status("回复已复制，可粘贴并修改。", "success")
+
+    def _fillable(self):
+        """现在能不能把候选填进去：有候选、不在生成中，而且**微信屏幕上开着的正是面板里这个会话**。
+
+        最后一条是固定模式带出来的：微信切走之后候选还摆在面板上，按钮看着能点，一点却打进
+        别人的输入框。填不了的时候按钮就灰着（_sync_fillable），点候选条那条路走 _fill 里那道拦。"""
+        return bool(self._current) and not self._busy and bool(self._shown) and self._shown == self._chat
+
+    def _sync_fillable(self):
+        for card in self.cards:
+            card.set_available(self._fillable())
+
+    def _offline_note(self):
+        """微信开着的不是面板里这个会话，说清楚为什么填不了、怎么才能填。
+
+        固定模式下这是常态（微信切走了，面板还钉在固定的那个会话上），所以文案跟「浏览中」
+        分开写——那时候用户是自己在翻记录，这时候是微信被切走了。"""
+        if self._pinned:
+            here = f"「{self._chat}」" if self._chat else "别的会话"
+            return f"已固定「{self._pinned}」；微信现在开着{here}，切回去才能填入。"
+        return f"正在浏览「{self._shown}」，只看不填；切回这个会话才能用。"
 
     def _capture_toggled(self, on):
         """用户自己拨的开关：界面先改，再通知父进程去开/停采集。"""
@@ -1805,8 +1849,7 @@ class Overlay:
             self.progress.stop()
             if not self.cands:
                 self._empty_text()
-        for card in self.cards:
-            card.set_available(self._current and not busy)
+        self._sync_fillable()
         self._sync_bar()
 
     def set_waiting(self):
@@ -1900,14 +1943,23 @@ class Overlay:
         # 只在 thinking/ready 两态这么摆：notify 是「对方刚来消息」，那会儿说「还没回」就是撒谎。
         opener = self._phase in ("thinking", "ready") and (self._busy_opener
                                                            or self._shown in self._opener)
-        if self._shown in self._opener:
+        frozen = bool(self._pinned) and self._shown != self._chat  # 固定着，但微信开在别人那儿
+        if frozen:
+            # 这一行改成说清楚为什么点不动。「对方刚说 XX」那会儿也不该摆——固定这个会话
+            # 这会儿根本没在被读，那句话早就不新鲜了。摆在这儿是因为面板可能收着（宠物形态），
+            # 点一下没反应会以为程序卡了；条子只有 280px，这句已经占满了，
+            # 全话在面板状态栏里（_offline_note）
+            heard = "固定中，切回微信才能填"
+        elif self._shown in self._opener:
             heard = f"距你上一条 {self._opener[self._shown]} 分钟"
         elif self._busy_opener and self._opener_wait:
             heard = f"距你上一条 {self._opener_wait} 分钟"
         else:
-            heard = self.hers.get(self._shown) or self.hers.get(self._chat) or ""
+            # 兜底那一句（这个会话还没读到她的文字）不能用微信开着的那个会话的：固定模式下
+            # 那是别人的话，摆在「对方刚说」的位置上就张冠李戴了
+            heard = self.hers.get(self._shown) or ("" if self._pinned else self.hers.get(self._chat)) or ""
         self.bar.set_items(items, self._suggest_text() if items else "", self._phase, heard,
-                           self._voice_text(), opener=opener)
+                           self._voice_text(), opener=opener, blocked=frozen)
 
     def set_phase(self, phase):
         """main.py 派生出来的流水线状态。同态重复调用是空操作，否则每 50ms 重放一次会闪。"""
@@ -2132,17 +2184,32 @@ class Overlay:
         """界面上正在看的会话（不一定是微信当前开着的那个）。"""
         return self._shown
 
+    def screen_chat(self):
+        """微信屏幕上**当前开着**的会话。填入选人的输入框、右键语音点坐标，认的都是它。
+
+        跟 current_chat() 分开是固定模式带出来的：那会儿面板钉在 A 上，微信可能早开到 B 了，
+        照着面板去填就会打进 B 的输入框。"""
+        return self._chat
+
     def set_chat(self, title):
-        """微信切到了哪个会话：登记进下拉框并自动跟过去，不触发用户选择的回调。"""
+        """微信切到了哪个会话：登记进下拉框。跟随模式跟过去，固定模式面板不动（见 set_pin）。"""
         if not title:
             return
         browsing = self._shown != self._chat  # 正看着的就是它、但之前是「浏览中」：也得重画，把填入放开
         self._chat = title
         self._add_chat(title)
+        if self._pinned:
+            # 固定：面板一直摆着固定那个会话。微信开着的那个（可能是别的）只影响「能不能填」
+            self._sync_fillable()
+            self._follow_text()
+            if self._shown != self._chat:
+                self.set_status(self._offline_note(), "idle")
+            elif self.cands:
+                # 不写一句的话，上一条「切回去才能填入」会赖着不走，看着像还没切回来
+                self.set_status(f"已切回「{self._pinned}」，可以填入了。", "idle")
+            return
         if title != self._shown or browsing:
-            self.chatBox.blockSignals(True)
-            self.chatBox.setCurrentIndex(self.chatBox.findText(title))
-            self.chatBox.blockSignals(False)
+            self._select_in_box(title)
             self._switch_to(title)
         self._follow_text()
 
@@ -2152,6 +2219,12 @@ class Overlay:
             return
         self.chatBox.blockSignals(True)
         self.chatBox.addItem(title)
+        self.chatBox.blockSignals(False)
+
+    def _select_in_box(self, title):
+        """把下拉框拨到某个会话上，别让它触发 _on_chat_selected（那等于用户自己挑的）。"""
+        self.chatBox.blockSignals(True)
+        self.chatBox.setCurrentIndex(self.chatBox.findText(title))
         self.chatBox.blockSignals(False)
 
     def _on_chat_selected(self, index):
@@ -2209,8 +2282,55 @@ class Overlay:
         """填入时要不要带「@名字 」前缀（只记在界面上，不落盘）。"""
         return self.atCheck.isChecked()
 
+    def set_pin(self, name):
+        """固定到某个会话（"" = 跟随微信切）。父进程才是准的那一份，这里只负责摆成它的样子。
+
+        固定之后面板一直摆着这一个：微信切到别的会话也不跟过去（`set_chat` 里那个分叉），
+        而且微信屏幕上一旦不是它，就填不了（`_offline_note` / `_fillable`）——粘贴是直接发给
+        微信当前会话的，按会话隔离在它那儿不存在，照着面板填就会打进别人的输入框。
+
+        启动时带着上次固定那个会话进来时，`_shown` 还是空的：面板先摆过去，等子进程读到
+        微信开着的会话再各归各位。"""
+        self._pinned = str(name or "")
+        if self._pinned and self._pinned != self._shown:
+            self._add_chat(self._pinned)
+            self._select_in_box(self._pinned)
+            self._switch_to(self._pinned)
+        self._follow_text()
+        self._sync_fillable()
+
+    def _toggle_pin(self):
+        """「跟随/固定」那个按钮：固定 = 钉住现在看的这个会话；再点一下回到跟随。
+
+        只把意图报给父进程，由它落定（名单、消息归谁、要不要收掉在等的判断都在它手里）。"""
+        if not self.on_pin_change:
+            return
+        if not self._pinned and not self._shown:
+            self.set_status("还没识别到会话，等它读一帧再固定", "warning")
+            return
+        self.on_pin_change("" if self._pinned else self._shown)
+
     def _follow_text(self):
-        self.chatFollow.setText(("跟随" if self._shown == self._chat else "浏览中") if self._chat else "")
+        """那个按钮上写什么、什么颜色：它显示的是**现在是什么模式**，点一下就换一种。
+
+        固定是「我给过指令」的状态，用实底标出来（微信切走了面板还不动，不显眼会让人以为卡了）。"""
+        if self._pinned:
+            text = "固定"
+            tip = (f"已固定「{self._pinned}」：微信切到别的会话也不跟过去，这个会话有消息照样给建议。"
+                   "点一下回到跟随。")
+            qss = (f"QPushButton {{ color: {theme.PAPER}; background: {theme.SAGE}; border: none;"
+                   f" border-radius: {theme.RADIUS_SM}px; padding: 1px 6px; }}")
+        else:
+            # 还没认到会话就空着（两个都是空串，别当成「跟随」——那看着像已经跟着谁了）
+            text = ("跟随" if self._shown == self._chat else "浏览中") if self._chat else ""
+            tip = "微信切到哪个会话，面板就跟到哪个；点一下把现在这个固定住，之后切走也不跟。"
+            qss = (f"QPushButton {{ color: {_MUTED}; background: transparent; border: none; }}"
+                   f"QPushButton:hover {{ color: {theme.SAGE}; }}"
+                   f"QPushButton:disabled {{ color: {theme.LINE}; }}")
+        self.chatFollow.setText(text)
+        self.chatFollow.setToolTip(tip)
+        self.chatFollow.setEnabled(bool(self._pinned or self._chat))
+        self.chatFollow.setStyleSheet(qss)
 
     def show_cached(self, result):
         """把某个会话上次的结果放回界面；没有就回到空态。浏览别的会话时只给看不给填——
@@ -2228,7 +2348,7 @@ class Overlay:
             self._empty_text()
         if self._shown != self._chat:
             self.invalidate_replies()
-            self.set_status(f"正在浏览「{self._shown}」，只看不填；切回这个会话才能用。")
+            self.set_status(self._offline_note())
 
     def show(self, result):
         """按推荐顺序展示，按钮始终绑定 candidates 的原始索引。
@@ -2305,6 +2425,7 @@ class Overlay:
             self.set_status("建议已更新，选一句适合你的回复", "success")
         else:
             self.set_status("未生成可用回复，请等待下一条新消息。", "error")
+        self._sync_fillable()  # 卡片是刚建的，默认是能点的——固定模式下微信切走了就得灰着
         self._sync_bar()
 
     def _clear_cards(self):

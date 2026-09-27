@@ -20,7 +20,7 @@ from core import styles
 
 _STATES = ("ready", "waiting", "loading", "error", "degraded", "setup", "settings", "paused",
            "debug", "ime", "ime-thinking", "pet", "pet-menu", "bar", "voice", "log",
-           "opener", "opener-bar", "opener-loading", "history")
+           "opener", "opener-bar", "opener-loading", "history", "pinned")
 
 # 调试视图预览用的真微信截图（只读进内存，不改不存）；没有就退一张空画面
 _FRAME = Path("/private/tmp/claude-501/-Users-lpitiless-Documents-project-wechatjev"
@@ -373,6 +373,11 @@ def main() -> int:
                     ov._switch_tab(args.tab)
             elif args.state == "paused":
                 ov.set_capture(False)
+            elif args.state == "pinned":
+                # 固定：面板钉在这个会话上，微信那边切走了。顺序跟真跑一样（先固定、再收到
+                # 「微信切到别的会话」那一帧），候选还摆着但填不了、状态栏说明为什么
+                ov.set_pin(_CHAT)
+                ov.set_chat("老同学")
             elif args.state == "log":
                 # 聊天记录（气泡形态）：默认是收起的，展开才截得到
                 ov.log("演示模式：这条是采集状态行，混在记录里居中显示。")
