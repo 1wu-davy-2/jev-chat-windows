@@ -9,7 +9,7 @@ import traceback
 import numpy as np
 
 from app.capture import Capture, chat_area, unminimize
-from app.ocr import Reader, read_title, similar
+from app.ocr import Reader, bottom_speaker, read_title, similar
 
 _TAIL_H = 150  # 「画面变了却没认出新文字」看的是消息区最底下这么高一条
 _TAIL_DIFF = 0.08  # 变了这么多才算对方发了东西，鼠标划过高亮那点变化不算
@@ -110,16 +110,25 @@ def run(q, hwnd, enabled, debug_on, voice_until=None):
                     # 只有刚点过「转文字」那一小会儿，才认插在语音气泡下面的新文字
                     converting = voice_until is not None and time.monotonic() < voice_until.value
                     new = reader.new_lines(lines, under_voice=converting)
+                    fresh_voice = reader.new_voices()  # 这一帧新出现的语音，父进程拿去记聊天记录
+                    # 画面最底下那条是谁说的（文字和语音一起算）：父进程拿它判「最后说话的是不是我」，
+                    # 自己发的语音也是「我已经回了」。放在 lines 里是因为「我方回复」能把 lines
+                    # 刚点着的那次判断取消掉，它得跟 lines 同一批到
+                    latest = bottom_speaker(lines, reader.last_voice)
                     if new:
-                        q.put(("lines", title, new, rect))
+                        q.put(("lines", title, new, rect, latest))
                     elif moved:
                         q.put(("noise", title))
                     # 语音气泡：Reader 那边按坐标裁剪过，这里加回裁剪原点，父进程才好换算成屏幕坐标。
-                    # 只发**还没转过文字**的（last_voice_open）——转过的就别再提示「转文字」了
+                    # 只发**还没转过文字**的（last_voice_open）——转过的就别再提示「转文字」了。
+                    # 后面那份是本帧新出现的（可能不止一条），新出现必然让前一份也变，所以
+                    # 下面这个「变了才发」不会把新语音漏掉
                     voice = tuple((x0 + a, y0 + b, x0 + c, y0 + d, t, k)
                                   for a, b, c, d, t, k in reader.last_voice_open)
-                    if voice != last_voice:
-                        q.put(("voice", title, voice))
+                    if voice != last_voice or fresh_voice:
+                        q.put(("voice", title, voice,
+                               tuple((x0 + a, y0 + b, x0 + c, y0 + d, t, k)
+                                     for a, b, c, d, t, k in fresh_voice), latest))
                         last_voice = voice
                 if debug_on.is_set():
                     q.put(("debug", _packet(full, area, title, reader, lines)))

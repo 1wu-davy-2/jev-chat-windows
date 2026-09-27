@@ -84,6 +84,18 @@ def schedule_analyze(title):
     state["notify_until"] = deadline
 
 
+def mark_replied():
+    """最新那条是自己说的（文字或语音）：等着的那次判断取消，提醒也一起收掉。
+
+    对方那句已经答过了，再问一次模型既费钱又打扰人，结论还必然是「你已经回过了」。
+    **自己发的语音也算**——语音读不出正文，但「我发过东西」这件事屏幕上看得见。"""
+    state["pending"] = None
+    state["notify_until"] = 0.0
+    state["rerun"] = None
+    ov.set_busy(False)
+    ov.set_status("你已回复，等待对方的新消息")
+
+
 def target_of(title):
     """这个会话现在的回复对象：用户挑过且人还在就用它，否则用最近说话的那个；单聊没有发言人 → None。"""
     chat = chat_of(title)
@@ -262,16 +274,20 @@ def drain():
             ov.set_status(msg[1], "warning")
             ov.log(msg[1])
             continue
-        if kind == "voice":  # 这一帧认出来的语音气泡（位置给「转文字」右键用）
-            title, items = msg[1], msg[2]
-            had = len(state["voice"][1]) if state["voice"] else 0
+        if kind == "voice":  # 语音气泡：前一份给「转文字」用，后一份是新出现的，末位是「最底下那条谁说的」
+            title, items, fresh, latest = msg[1], msg[2], msg[3], msg[4]
             state["voice"] = (title, items)
             ov.set_voice(title, items)
-            if len(items) > had:  # 多出来一条才提醒；拖动/滚动只是坐标变，不算新消息
+            # 新出现的可能不止一条，一条一行全记下来。是不是新的由子进程判（它有每会话的去重
+            # 状态），这里只负责写；拖动/滚动只是坐标变，那边不会当新消息报上来
+            for v in fresh:
                 # 聊天记录里也留一行，不然这条语音在界面上等于不存在（只有显示用，
                 # 不进喂模型的那份 history——「🔊 语音消息 3"」对模型是噪音）。
                 # 谁发的按气泡底色走：自己发的语音别挂到对方头上
-                ov.log_message(items[-1][5], f"🔊 语音消息 {_voice_label(items[-1][4])}", chat=title)
+                ov.log_message(v[5], f"🔊 语音消息 {_voice_label(v[4])}", chat=title)
+            if fresh and latest == "me":
+                mark_replied()  # 最新那条是我发的语音 = 我已经回了，跟回了句文字一样
+            elif fresh:
                 # 语音也是「对方还在说」：有等着的那次就把静默窗口往后推。没有就不新开一次
                 # 判断——光一条语音没正文，问了也没得判断，等他自己转文字或者接着说
                 if state["pending"] and state["pending"][0] == title:
@@ -306,17 +322,21 @@ def drain():
                 child.join()
                 child = None
             continue
-        _, title, new, area = msg
+        _, title, new, area, latest = msg
         state["area"] = area
         chat = chat_of(title)
         fresh = [m for m in new if not _already_read(chat, m)]  # 屏幕上翻出来的旧消息不算数
         if not fresh:
             continue  # 整批都是旧的（子进程重开、往上翻、把窗口拉高）：不记不触发
-        # fresh 里就是 new 里那几个元组本身，所以能按身份比：屏幕上最新那条是不是真新的
-        newest = fresh[-1] is new[-1]
-        chat["rev"] += 1  # 这个会话有新消息了，它在跑的分析作废
-        if title == ov.current_chat():  # 看的是别的会话就别把人家的候选划掉
-            ov.invalidate_replies()
+        # 转文字出来的那几行要分两种：**对方那条**语音转出来的字算「他说了句话」（他确实说了，
+        # 只是我们读不出声），照常点火；**自己那条**转出来的只是把我早说过的话补进记录，不是
+        # 新消息——拿它点火会白问一次模型（真机上报过），拿它走 mark_replied 又会把对方刚来、
+        # 正等着的那次判断给取消掉。所以这种一律不算数，只补 history 和聊天记录
+        said = [m for m in fresh if not m[3] or m[0] == "her"]
+        if said:
+            chat["rev"] += 1  # 这个会话有新消息了，它在跑的分析作废
+            if title == ov.current_chat():  # 看的是别的会话就别把人家的候选划掉
+                ov.invalidate_replies()
         for who, name, text, dur in fresh:
             chat["history"].append((who, text, name))  # 喂模型的那份不带语音标记
             # dur 非空 = 这条是语音转出来的字，值是那条语音的时长：界面拿它并回「🔊 语音消息 N"」
@@ -326,18 +346,17 @@ def drain():
                     chat["senders"].remove(name)
                 chat["senders"].insert(0, name)
         ov.set_targets(title, chat["senders"], target_of(title))  # 显不显示这一行由悬浮窗按开关决定
-        if not newest:
-            continue  # 补记的是中间那条，流水线按屏幕最底下那条走，别动它
-        if new[-1][0] == "her":  # 只有对方最新说话才值得分析
+        # fresh 里就是 new 里那几个元组本身，所以能按身份比：屏幕上最新那条是不是真新的
+        if not said or said[-1] is not new[-1]:
+            continue  # 只有转写/补记的是中间那条：流水线按屏幕最底下那条走，别动它
+        # 只有「对方最新说话」才值得分析：最后一句是我说的（文字或语音）就不用问——
+        # 自己发的语音也是我已经回了，见 mark_replied
+        if said[-1][0] == "her" and latest != "me":
             schedule_analyze(title)  # 不立刻问：等他不说了再问（见 schedule_analyze）
             ov.set_status("对方刚发来消息，等他发完再给建议", "busy")
             ov.set_waiting()
         else:
-            state["pending"] = None  # 自己回了话，等着的那次就不用问了
-            state["notify_until"] = 0.0  # 提醒一起收掉：自己回的话，不用再「有新消息」的样子
-            state["rerun"] = None
-            ov.set_busy(False)
-            ov.set_status("你已回复，等待对方的新消息")
+            mark_replied()
 
 
 def phase_now():
