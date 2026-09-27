@@ -16,6 +16,8 @@ hiddenimports = [
     "app.historywin",  # AI 记录窗，点了标题栏那个图标才 import
     "core.engine", "core.draft", "core.jev_client", "core.questions", "core.providers",
     "core.llm", "core.relay", "core.styles", "core.trace",  # trace 是 AI 记录的库（stdlib sqlite3）
+    "core.relations",  # 关系（谁是谁 + 按这个关系怎么说话），styles 从它取正文
+    "core.chatlog",    # 聊天记录库（stdlib sqlite3），界面那串气泡和喂模型的上下文都从它来
 ]
 datas, binaries = [], []
 for pkg in (

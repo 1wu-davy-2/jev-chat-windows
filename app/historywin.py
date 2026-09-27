@@ -103,7 +103,9 @@ def _lines(row: dict) -> list[str]:
             out.append(f"  {name}: {text}")
     scene = (row.get("scene") or "").strip()
     if scene:
-        out += ["", "  场景模板正文（跟着一起发出去的）：", "  " + scene.replace("\n", "\n  ")]
+        # 这段正文按会话现取：场景模板挑了就用挑的那一型，没挑就是这个会话自己那种关系的正文
+        out += ["", "  这次的口吻正文（关系 / 场景模板，跟着一起发出去的）：",
+                "  " + scene.replace("\n", "\n  ")]
 
     # ── 起草 ──
     out += ["", _head("起草", row, "draft")]

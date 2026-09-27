@@ -28,7 +28,7 @@ from app.theme import (
     RADIUS_XL, SHADOW_PAD,
 )
 from app.version import VERSION
-from core import jev_client, llm, providers, relay, styles
+from core import chatlog, jev_client, llm, providers, relations, relay, styles
 from core.questions import CHOICE_LABELS
 
 _LOG_LINES = 300
@@ -36,13 +36,6 @@ _BAR_HOLD_MS = 25000  # 候选条自己待多久没人理就收起来（鼠标�
 _BAR_LEAVE_MS = 700   # 鼠标离开候选条后宽限这么久再收，够从宠物挪到条上
 _MUTED = theme.MUTED   # 次要文字色（原来是偏绿的 #68776f，现在统一走 token）
 _ACCENT = theme.SAGE   # 强调色（原来是 #18794e）
-_RELATIONSHIPS = [
-    ("恋人", "romantic partners"), ("朋友", "friends"), ("同事", "colleagues"),
-    ("家人", "family"), ("自定义", None),
-]
-# 「场景模板」下拉的选项 → core/styles 里的键。空串 = 不用，什么都不追加
-_PRESET_CHOICES = ((("", "不用"),) + tuple((k, styles.NAMES[k]) for k in styles.KEYS)
-                   + ((styles.CUSTOM, styles.CUSTOM_NAME),))
 # 「思考开关的传法」下拉框的索引 → core/relay.py 里的键。顺序得跟下面 addItems 一致
 _THINK_STYLE_ORDER = ("thinking", "reasoning", "none")
 
@@ -106,6 +99,18 @@ class _ErrorBox(MessageBoxBase):
         self.viewLayout.addWidget(self.textEdit)
         self.yesButton.setText("知道了")
         self.cancelButton.hide()
+
+
+class _ConfirmBox(MessageBoxBase):
+    """删除类操作问一句再动手。删了没有撤销，别做成点一下就没了。"""
+
+    def __init__(self, title, text, parent=None):
+        super().__init__(parent)
+        self.titleLabel = SubtitleLabel(title, self)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(_label(text, FONT_MD))
+        self.yesButton.setText("确定")
+        self.cancelButton.setText("取消")
 
 
 def _label(text="", size=14, color=None, bold=False, parent=None):
@@ -737,7 +742,8 @@ class _ChatLog(QWidget):
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
                  on_toggle_debug=None, on_voice_convert=None, on_opener_again=None,
-                 on_settings_saved=None, on_open_history=None, on_use=None, on_pin_change=None):
+                 on_settings_saved=None, on_open_history=None, on_use=None, on_pin_change=None,
+                 on_relation_change=None, on_scene_change=None, on_toggle_chatlog=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。
@@ -747,7 +753,10 @@ class Overlay:
         on_open_history() → 用户点了标题栏那个「AI 记录」，开（或收起）记录窗。
         on_use(原始下标, "fill"|"copy") → 用户用了第几条候选，父进程记进 AI 记录里。
         on_pin_change(会话名或 "") → 用户点了「跟随/固定」，要不要固定、固定哪个由父进程定
-        （它才是准的那一份，界面这边只是照着显示，见 set_pin）。"""
+        （它才是准的那一份，界面这边只是照着显示，见 set_pin）。
+        on_relation_change(会话名, 关系键) → 用户给这个会话挑了关系；on_scene_change 同理，
+        挑的是场景模板（第二项为空串 = 跟随关系）。两个都是拨一下立刻写盘、下次生成才用。
+        on_toggle_chatlog(开不开) → 「聊天会话存储」那个开关，拨一下立刻生效（父进程配库）。"""
         self.app = QApplication.instance() or QApplication([])
         self.app.setWindowIcon(_app_icon())
         setTheme(Theme.LIGHT)
@@ -762,6 +771,9 @@ class Overlay:
         self.on_open_history = on_open_history
         self.on_use = on_use
         self.on_pin_change = on_pin_change
+        self.on_relation_change = on_relation_change
+        self.on_scene_change = on_scene_change
+        self.on_toggle_chatlog = on_toggle_chatlog
         self.result_of = result_of
         self._voices = {}  # {会话名: [(x0,y0,x1,y1,时长)]}，语音气泡的位置，转文字要右键它
         self._opener = {}  # {会话名: 对方多少分钟没回}，现在摆的是开场白（不是回复）的会话
@@ -778,6 +790,8 @@ class Overlay:
         self.counts = {}  # {会话名: 消息条数}
         self.hers = {}  # {会话名: 对方最近一句}
         self.targets = {}  # {会话名: ([发言人], 当前回复对象)}
+        self._relKeys = []  # 「关系」下拉的选项 [(键, 名字)]，跟控件里的行号一一对应
+        self._sceneKeys = []  # 「场景模板」下拉的选项，同上
         self._chat = ""  # 微信当前开着的会话。**能不能填只看它**（粘贴是发给微信的，跟面板看谁无关）
         self._shown = ""  # 界面上正在看的会话（浏览、固定时和上面不一样）
         self._pinned = ""  # 固定盯着哪个会话（"" = 跟随微信切）。父进程那份是准的，这里只是镜像
@@ -847,6 +861,8 @@ class Overlay:
         outer.addWidget(self.pages, 1)
         self._build_home()
         self._build_settings()
+        # 两个下拉先按「还没有会话」填上（灰着）；等 set_chat 认到会话再拨到它那一型
+        self._render_relations()
         self.bar = _CandidateBar(self)
         # 宠物窗和候选条都是独立顶层窗，默认都不显示；由 set_phase / pet_enabled 决定
         self.pet_enabled = settings.pet_enabled()
@@ -959,6 +975,16 @@ class Overlay:
         self.chatBox.setToolTip("聊天窗口切到哪个会话这里就跟到哪个；也可以自己选一个，只看它的记录和建议")
         self.chatBox.currentIndexChanged.connect(self._on_chat_selected)
         chat_row.addWidget(self.chatBox, 1)
+        # 这个会话是哪一型关系（朋友/恋人/同事……）。**按会话存**，不是全局一个：
+        # 原来设置页那个「你们的关系」是一份配置管所有会话，等于拿对家人那套口气去回客户。
+        # 拨一下立刻写盘（走 on_relation_change → save_chat_relation），下次生成就用新的。
+        self.relationBox = _FitCombo()
+        self.relationBox.setFixedWidth(86)
+        self.relationBox.setAccessibleName("关系")
+        self.relationBox.setToolTip("这个会话里的人跟你是什么关系，决定称呼、语气和分寸。"
+                                    "每种关系的正文在「设置 → 个人风格」里改。")
+        self.relationBox.currentIndexChanged.connect(self._on_relation_selected)
+        chat_row.addWidget(self.relationBox, 0, Qt.AlignVCenter)
         # 跟随 / 固定：固定 = 面板钉在这一个会话上，微信切到别的会话也不跟过去（见 set_pin）。
         # 做成按钮而不是原来那个纯文字标签，是因为它现在点得动——文字本身就写着现在是什么模式
         self.chatFollow = QPushButton("")
@@ -970,6 +996,20 @@ class Overlay:
         chat_row.addWidget(self.chatFollow, 0, Qt.AlignVCenter)
         self._follow_text()  # 还没认到会话：空着 + 点不动，别摆个能点却没反应的按钮
         body.addLayout(chat_row)
+        # 场景模板：给这个会话**临时换个口吻**，用另一型关系的正文说话。默认「跟随关系」，
+        # 也就是用上面那个「关系」自己的正文——绝大多数会话根本不用碰这一行。
+        scene_row = QHBoxLayout()
+        scene_row.setSpacing(GAP_SM)
+        scene_prefix = _label("场景模板", FONT_SM, _MUTED)
+        scene_prefix.setFixedWidth(56)  # 跟「当前会话」对齐
+        scene_row.addWidget(scene_prefix)
+        self.sceneBox = _FitCombo()
+        self.sceneBox.setAccessibleName("场景模板")
+        self.sceneBox.setToolTip("挑一型就用那一型的正文说话（比如对一个客户用「同事」那套口气）；"
+                                 "不挑就跟着上面那个「关系」走。")
+        self.sceneBox.currentIndexChanged.connect(self._on_scene_selected)
+        scene_row.addWidget(self.sceneBox, 1)
+        body.addLayout(scene_row)
         self.targetRow = QWidget()  # 只有开了「群聊指定回复对象」且这个会话是群聊才露出来
         target_row = QHBoxLayout(self.targetRow)
         target_row.setContentsMargins(0, 0, 0, 0)
@@ -1096,13 +1136,13 @@ class Overlay:
         heading.addWidget(_tool(FIF.RETURN, "返回回复建议", self._back_home))
         heading.addWidget(_label("设置", FONT_H1, theme.INK, True), 1)
         body.addLayout(heading)
-        body.addWidget(_label("调整关系背景和说话风格，配置判断和起草用的两个模型。", FONT_MD, _MUTED))
+        body.addWidget(_label("维护每种关系的说话方式，配置判断和起草用的两个模型。", FONT_MD, _MUTED))
         # 两块内容分页签摆，别堆成一长条滚动。标题交给页签，卡片里就不再重复写一遍
         tabs = QHBoxLayout()
         tabs.setSpacing(GAP_SM)
         self.tabButtons = {}
         for key, text in (("preference", "回复偏好"), ("models", "模型设置"),
-                          ("style", "个人风格")):
+                          ("style", "个人风格"), ("system", "系统设置")):
             button = QPushButton(text)
             button.setCheckable(True)
             button.setCursor(Qt.PointingHandCursor)
@@ -1116,22 +1156,8 @@ class Overlay:
         box = QVBoxLayout(preference)
         box.setContentsMargins(GAP_LG, GAP_LG, GAP_LG, GAP_LG)
         box.setSpacing(GAP_MD)
-        relation_label = _label("你们的关系", FONT_MD)
-        box.addWidget(relation_label)
-        self.relationshipBox = ComboBox()
-        self.relationshipBox.setMinimumWidth(0)
-        self.relationshipBox.addItems([name for name, value in _RELATIONSHIPS])
-        self.relationshipBox.setAccessibleName("你们的关系")
-        relation_label.setBuddy(self.relationshipBox)
-        box.addWidget(self.relationshipBox)
-        self.relEdit = LineEdit()
-        self.relEdit.setPlaceholderText("例如：刚认识的朋友，正在慢慢熟悉")
-        self.relEdit.setAccessibleName("自定义关系背景")
-        box.addWidget(self.relEdit)
-        self.relationshipBox.currentIndexChanged.connect(
-            lambda index: self.relEdit.setVisible(_RELATIONSHIPS[index][1] is None)
-        )
-        box.addWidget(self._hint("帮助助手把握称呼、语气和回应分寸。"))
+        # 「你们的关系」原来就在这儿，是**一份配置管所有会话**——等于拿对家人那套口气去回客户。
+        # 现在关系按会话走、正文按关系走，整块都搬到「个人风格」页了（面板上那个下拉改的就是它）。
         context_label = _label("参考上下文", FONT_MD)
         box.addWidget(context_label)
         self.contextBox = SpinBox()
@@ -1180,6 +1206,49 @@ class Overlay:
             "没什么可接的就现编一个由头。每个冷场只自动出一次，对方回了话才算下一个冷场；"
             "不满意可以点「换一批」。关着就完全不管，一次都不调模型。"
         ))
+        self.preferenceCard = preference
+        body.addWidget(preference)
+
+        # 第四页签「系统设置」：存储和本机行为那几项。原来散在「回复偏好」「模型设置」里，
+        # 跟回复本身没关系，归到一堆更好找（见 _switch_tab 的 tabButtons）
+        system = _Surface()
+        box = QVBoxLayout(system)
+        box.setContentsMargins(GAP_LG, GAP_LG, GAP_LG, GAP_LG)
+        box.setSpacing(GAP_MD)
+        chatlog_row = QHBoxLayout()
+        chatlog_row.addWidget(_label("聊天会话存储", FONT_MD), 1)
+        self.chatlogSwitch = SwitchButton()
+        self.chatlogSwitch.setOnText("开")
+        self.chatlogSwitch.setOffText("关")
+        self.chatlogSwitch.setAccessibleName("聊天会话存储")
+        self.chatlogSwitch.checkedChanged.connect(self._chatlog_toggled)  # 拨一下立刻生效
+        chatlog_row.addWidget(self.chatlogSwitch)
+        box.addLayout(chatlog_row)
+        box.addWidget(self._hint(
+            "界面上的聊天记录和 AI 看的上下文都存到本机的 chatlog.db 里，重启之后还在、模型还接得上"
+            "上次聊到哪儿。写库前统一脱敏（不存密钥），只留最近 90 天。关掉就不再写，"
+            "已经存下的一条都不动——要删点下面那个按钮。"
+        ))
+        stat_row = QHBoxLayout()
+        self.chatlogStats = _label("", FONT_SM, _MUTED)
+        stat_row.addWidget(self.chatlogStats, 1)
+        self.chatlogClear = PushButton("清空聊天记录")
+        self.chatlogClear.clicked.connect(self._clear_chatlog)
+        stat_row.addWidget(self.chatlogClear)
+        box.addLayout(stat_row)
+        history_row = QHBoxLayout()
+        history_row.addWidget(_label("记录 AI 调用", FONT_MD), 1)
+        self.historySwitch = SwitchButton()
+        self.historySwitch.setOnText("开")
+        self.historySwitch.setOffText("关")
+        self.historySwitch.setAccessibleName("记录 AI 调用")
+        history_row.addWidget(self.historySwitch)
+        box.addLayout(history_row)
+        box.addWidget(self._hint(
+            "每一轮问了什么、模型回了什么、你最后用了哪条，都记在本机的 history.db 里，"
+            "点标题栏那个「AI 记录」能翻。存的是聊天原文（不存密钥，写库前统一脱敏）；"
+            "关掉就一次都不写，已有的记录还在，去记录窗里清空。跟上面那个是两个库，互不影响。"
+        ))
         update_row = QHBoxLayout()
         update_row.addWidget(_label("启动时检查更新", FONT_MD), 1)
         self.updateSwitch = SwitchButton()
@@ -1217,49 +1286,76 @@ class Overlay:
             "平时桌面上只有宠物，有消息才在它旁边弹候选条，点宠物展开完整面板。"
             "关掉就是原来那样：面板一直开着。"
         ))
-        self.preferenceCard = preference
-        body.addWidget(preference)
+        self.systemCard = system
+        body.addWidget(system)
 
-        # 第三页签「个人风格」：选一个场景模板，正文摊在大框里，可以直接改。
-        # 内置原文只有一份（core/styles.py），改过的版本按类型分开存在 config.json 的 style_texts 里
+        # 第三页签「个人风格」：**关系**在这儿维护——默认用哪一型、每一型的正文是什么。
+        # 正文只有这一份（core/relations.py 是内置原文，改过的按型存在 config.json 的 relations.texts
+        # 里）；面板上那个「关系」下拉只是挑某个会话用哪一型，不在这儿。
         style = _Surface()
         box = QVBoxLayout(style)
         box.setContentsMargins(GAP_LG, GAP_LG, GAP_LG, GAP_LG)
         box.setSpacing(GAP_MD)
-        self._presetTexts = {}  # 内存里正在改的各型正文，点保存才落盘
-        self._presetShown = ""  # 框里现在装的是哪一型：换型前得按它先把字收回来
-        top = QHBoxLayout()
-        top.addWidget(_label("场景模板", FONT_MD), 1)
-        top.addWidget(_label("类型", FONT_MD))
-        self.presetBox = ComboBox()
-        self.presetBox.setMinimumWidth(0)
-        self.presetBox.setAccessibleName("场景模板类型")
-        self.presetBox.addItems([name for _, name in _PRESET_CHOICES])
-        top.addWidget(self.presetBox)
-        box.addLayout(top)
-        box.addWidget(_label("追加到 AI 上下文的内容", FONT_MD))
-        self.presetEdit = TextEdit()
-        self.presetEdit.setPlaceholderText("选一个类型，这里会填上它的正文；也可以自己写。留空 = 不追加。")
-        self.presetEdit.setFixedHeight(180)
-        self.presetEdit.setAccessibleName("追加到 AI 上下文的内容")
-        box.addWidget(self.presetEdit)
-        preset_row = QHBoxLayout()
-        self.presetReset = PushButton("重置为内置原文")
-        self.presetReset.clicked.connect(self._preset_reset)
-        preset_row.addWidget(self.presetReset)
-        preset_row.addStretch(1)
-        self.presetSave = PrimaryPushButton("保存")  # 跟页面底部那个「保存设置」是同一个动作
-        self.presetSave.clicked.connect(self._save)
-        preset_row.addWidget(self.presetSave)
-        box.addLayout(preset_row)
-        self.presetCount = _label("", FONT_XS, _MUTED)
-        box.addWidget(self.presetCount)
+        self._relTexts = {}  # 内存里正在改的各型正文，点保存才落盘
+        self._relCustoms = []  # 用户自己加的关系 [{"key","name","text"}]，键自动编（r1、r2……）
+        self._relShown = ""  # 文本框里现在装的是哪一型：换型前得按它先把字收回来
+        default_row = QHBoxLayout()
+        default_row.addWidget(_label("默认关系", FONT_MD), 1)
+        self.defaultRelBox = ComboBox()
+        self.defaultRelBox.setMinimumWidth(0)
+        self.defaultRelBox.setAccessibleName("默认关系")
+        default_row.addWidget(self.defaultRelBox)
+        box.addLayout(default_row)
         box.addWidget(self._hint(
-            "选中的这段正文会拼进每次起草的上下文，管称呼、语气和分寸；判断那一步不喂，它只看意图和"
-            "紧张度。改过的版本按类型分开存着，点「重置为内置原文」就回到出厂那份。"))
+            "还没单独指定过关系的会话（刚加的好友、刚打开的群、群里换了回复对象）一律按这个来。"
+            "具体某个会话用什么，在面板上「当前会话」右边那个下拉里改。"))
+        type_row = QHBoxLayout()
+        type_row.addWidget(_label("关系类型", FONT_MD), 1)
+        self.relTypeBox = ComboBox()
+        self.relTypeBox.setMinimumWidth(0)
+        self.relTypeBox.setAccessibleName("关系类型")
+        type_row.addWidget(self.relTypeBox)
+        self.relAddButton = PushButton("+ 新增")
+        self.relAddButton.clicked.connect(self._rel_add)
+        type_row.addWidget(self.relAddButton)
+        self.relDelButton = PushButton("删除")
+        self.relDelButton.clicked.connect(self._rel_del)
+        type_row.addWidget(self.relDelButton)
+        box.addLayout(type_row)
+        box.addWidget(self._hint(
+            "内置这几型（朋友、恋人、暧昧、同事、职场、家人）各有出厂正文，可以随便改；自己新增的"
+            "（前女友、老板……）名字和正文都自己写。"))
+        self.relNameLabel = _label("这种关系叫什么", FONT_MD)
+        box.addWidget(self.relNameLabel)
+        self.relNameEdit = LineEdit()
+        self.relNameEdit.setPlaceholderText("例如：前女友、老板、房东")
+        self.relNameEdit.setAccessibleName("这种关系叫什么")
+        self.relNameLabel.setBuddy(self.relNameEdit)
+        box.addWidget(self.relNameEdit)
+        box.addWidget(_label("按这个关系该怎么说话", FONT_MD))
+        self.relTextEdit = TextEdit()
+        self.relTextEdit.setPlaceholderText("这段会拼进每次起草的上下文，管称呼、语气和分寸。")
+        self.relTextEdit.setFixedHeight(180)
+        self.relTextEdit.setAccessibleName("按这个关系该怎么说话")
+        box.addWidget(self.relTextEdit)
+        rel_row = QHBoxLayout()
+        self.relReset = PushButton("重置为内置原文")
+        self.relReset.clicked.connect(self._rel_reset)
+        rel_row.addWidget(self.relReset)
+        rel_row.addStretch(1)
+        self.relSave = PrimaryPushButton("保存")  # 跟页面底部那个「保存设置」是同一个动作
+        self.relSave.clicked.connect(self._save)
+        rel_row.addWidget(self.relSave)
+        box.addLayout(rel_row)
+        self.relCount = _label("", FONT_XS, _MUTED)
+        box.addWidget(self.relCount)
+        box.addWidget(self._hint(
+            "这段正文拼进每次**起草**的上下文，判断那一步不喂（它只看意图和紧张度）。"
+            "改过的版本按关系分开存着，点「重置为内置原文」就回到出厂那份。"
+            "想让某个会话临时换成另一型的口气，在面板的「场景模板」里挑，不用在这儿另写一份。"))
         # 信号接在控件都建好之后：addItems 自己会发一次 currentIndexChanged，那会儿框还没建出来
-        self.presetBox.currentIndexChanged.connect(self._preset_type_changed)
-        self.presetEdit.textChanged.connect(self._preset_count)
+        self.relTypeBox.currentIndexChanged.connect(self._rel_type_changed)
+        self.relTextEdit.textChanged.connect(self._rel_count)
         self.styleCard = style
         body.addWidget(style)
 
@@ -1290,19 +1386,7 @@ class Overlay:
             "关：秒回，够用。开：模型先想再写，更斟酌但慢好几倍、贵一些。"
             "只有 " + " / ".join(providers.THINKING) + " 认这个开关。"
         ))
-        history_row = QHBoxLayout()
-        history_row.addWidget(_label("记录 AI 调用", FONT_MD), 1)
-        self.historySwitch = SwitchButton()
-        self.historySwitch.setOnText("开")
-        self.historySwitch.setOffText("关")
-        self.historySwitch.setAccessibleName("记录 AI 调用")
-        history_row.addWidget(self.historySwitch)
-        box.addLayout(history_row)
-        box.addWidget(self._hint(
-            "每一轮问了什么、模型回了什么、你最后用了哪条，都记在本机的 history.db 里，"
-            "点标题栏那个「AI 记录」能翻。存的是聊天原文（不存密钥，写库前统一脱敏）；"
-            "关掉就一次都不写，已有的记录还在，去记录窗里清空。"
-        ))
+        # 「记录 AI 调用」原来在这儿，现在归「系统设置」页（跟聊天会话存储摆一起，都是存储）
         # 中转那几项：来源选了「第三方中转」才露出来，起草和判断共用同一个地址
         self.relayLabel = _label("中转地址", FONT_MD)
         box.addWidget(self.relayLabel)
@@ -1523,17 +1607,12 @@ class Overlay:
         group.status.setText("")
 
     def _load_settings(self):
-        relationship = settings.relationship()
-        index = next((i for i, (_, value) in enumerate(_RELATIONSHIPS) if value == relationship),
-                     len(_RELATIONSHIPS) - 1)
-        self.relationshipBox.setCurrentIndex(index)
-        self.relEdit.setText(relationship if _RELATIONSHIPS[index][1] is None else "")
-        self.relEdit.setVisible(_RELATIONSHIPS[index][1] is None)
-        self._presetTexts = dict(settings.style_texts())
-        self._presetShown = ""  # 下面 setCurrentIndex 会触发换型，别拿上一轮的键去收框里的字
-        self.presetBox.setCurrentIndex(
-            next((i for i, (k, _) in enumerate(_PRESET_CHOICES) if k == settings.style_preset()), 0))
-        self._preset_type_changed()  # 索引没变时上面不发信号，框得自己刷一次
+        model = settings.relations_dict()
+        self._relTexts = dict(model["texts"])
+        self._relCustoms = [dict(c) for c in model["customs"]]
+        # _relShown 先清掉：下面填下拉会触发换型，别拿上一轮的键去收框里的字
+        self._relShown = ""
+        self._fill_rel_boxes(model["default"], model["default"])
         self.contextBox.setValue(settings.context())
         self.targetSwitch.setChecked(settings.reply_target())
         self.openerBox.setValue(settings.opener_minutes())
@@ -1553,19 +1632,23 @@ class Overlay:
         self.petSwitch.blockSignals(True)  # 同上：加载时别真去开关宠物
         self.petSwitch.setChecked(settings.pet_enabled())
         self.petSwitch.blockSignals(False)
+        self.chatlogSwitch.blockSignals(True)  # 同上：加载时别真去配一遍库
+        self.chatlogSwitch.setChecked(settings.chatlog())
+        self.chatlogSwitch.blockSignals(False)
+        self._sync_chatlog()
         self._sync_model_fields()  # 上面屏蔽了信号，这里补一次
         self.settingsFeedback.hide()
 
     def _save(self):
-        relationship = _RELATIONSHIPS[self.relationshipBox.currentIndex()][1]
-        relationship = relationship or self.relEdit.text().strip()
         jev_provider = self._provider_of(self.jev)
         draft_provider = self._provider_of(self.draft)
         base = self.baseEdit.text().strip()
-        if not relationship:
-            self._settings_feedback("请填写关系背景，或选择一个已有选项。", error=True)
-            self.relEdit.setFocus()
-            return
+        # 关系模型：默认哪一型、每型的正文、自建的那几条。`chats`（哪个会话用哪一型）不归这一页管，
+        # 但得原样带过去——这里是整份模型的提交，漏了就等于把所有会话的选择清空了。
+        relation_model = dict(settings.relations_dict())
+        relation_model.update({"default": self._default_rel_key(),
+                               "texts": self._rel_dirty(),
+                               "customs": [dict(c) for c in self._relCustoms]})
         if draft_provider in providers.CUSTOM and draft_provider != "relay" and not base:
             self._settings_feedback("自定义来源要填 Base URL。", error=True)
             self.baseEdit.setFocus()
@@ -1591,7 +1674,8 @@ class Overlay:
                 group.modelBox.setFocus()
                 return
         try:
-            settings.save(relationship, self.contextBox.value(),
+            settings.save(self.contextBox.value(),
+                          relation_model=relation_model,
                           jev_provider_text=jev_provider,
                           jev_key_text=self.jev.keyEdit.text().strip() or None,
                           jev_model_text=self.jev.modelBox.text().strip(),
@@ -1606,17 +1690,17 @@ class Overlay:
                           reply_target_on=self.targetSwitch.isChecked(),
                           opener_on=self.openerSwitch.isChecked(),
                           opener_minutes_n=self.openerBox.value(),
-                          style_preset_text=self._preset_key(),
-                          style_texts_dict=self._preset_dirty(),
                           thinking_on=self.thinkingSwitch.isChecked(),
                           history_on=self.historySwitch.isChecked(),
                           check_update_on=self.updateSwitch.isChecked(),
-                          pet_enabled_on=self.petSwitch.isChecked())
+                          pet_enabled_on=self.petSwitch.isChecked(),
+                          chatlog_on=self.chatlogSwitch.isChecked())
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return
         self._load_settings()
         self._render_targets()  # 开关刚改过，回到首页时这一行该显该藏得重算一次
+        self._render_relations()  # 刚加的关系得马上出现在面板的下拉里，默认关系换了也要跟着变
         self._settings_feedback("设置已保存，将用于下一次回复。")
         self.setupButton.hide()
         if self.on_settings_saved:
@@ -1625,42 +1709,123 @@ class Overlay:
             self._empty_text()
             self.set_status("设置已就绪，等待新消息", "idle")
 
-    def _preset_key(self):
-        """下拉里选中的类型键；空串 = 不用。"""
-        return _PRESET_CHOICES[max(0, self.presetBox.currentIndex())][0]
+    def _rel_keys(self):
+        """「关系类型」下拉里现在有哪些型：内置的几型 + 用户自建的，顺序就是下拉里的顺序。"""
+        return [*relations.KEYS, *(c["key"] for c in self._relCustoms)]
 
-    def _preset_stash(self):
-        """把框里正在改的正文收回内存——换类型、保存之前都得先收一次。"""
-        if self._presetShown:
-            self._presetTexts[self._presetShown] = self.presetEdit.toPlainText().strip()
+    def _rel_name(self, key):
+        return relations.label(key, self._relCustoms)
 
-    def _preset_dirty(self):
-        """收回内存之后，挑出跟内置原文不一样的那些——只有这些值得写进 config.json。"""
-        self._preset_stash()
-        return {k: t for k, t in self._presetTexts.items() if t != styles.default_text(k)}
+    def _rel_key(self):
+        """「关系类型」下拉里选中的键。"""
+        keys = self._rel_keys()
+        return keys[max(0, self.relTypeBox.currentIndex())] if keys else ""
 
-    def _preset_type_changed(self, _=None):
-        """换了类型：先把框里那份收好，再换上这一型的（改过的优先，没改过就用内置原文）。
-        「不用」把框灰掉——那会儿框里写什么都进不了 prompt，别让人白写。"""
-        self._preset_stash()
-        key = self._preset_key()
-        self._presetShown = key
-        self.presetEdit.setPlainText(self._presetTexts.get(key, styles.default_text(key)))
-        self.presetEdit.setEnabled(bool(key))
-        self.presetReset.setEnabled(bool(key))
-        self.presetReset.setText("清空" if key == styles.CUSTOM else "重置为内置原文")
+    def _default_rel_key(self):
+        """「默认关系」下拉里选中的键。"""
+        keys = self._rel_keys()
+        return keys[max(0, self.defaultRelBox.currentIndex())] if keys else relations.DEFAULT
 
-    def _preset_reset(self):
-        """回到内置原文（自定义就是清空）。只动框里的字，落盘还是走保存。"""
-        key = self._preset_key()
-        self._presetTexts.pop(key, None)
-        self.presetEdit.setPlainText(styles.default_text(key))
+    def _rel_text(self, key):
+        """某一型该显示在框里的正文：自建的取它自己那条，内置的取改过的、没改过取出厂原文。"""
+        for c in self._relCustoms:
+            if c["key"] == key:
+                return str(c.get("text") or "")
+        return self._relTexts.get(key, relations.default_text(key))
 
-    def _preset_count(self):
-        """框里多少字。内置的都压在 200 以内，自己加写的超过这个数就该掂量一下了。"""
-        n = len(self.presetEdit.toPlainText().strip())
-        self.presetCount.setText(f"{n} 字" + (f"，超过 {styles.LIMIT} 了，会盖过对话本身"
-                                              if n > styles.LIMIT else ""))
+    def _rel_stash(self):
+        """把框里正在改的东西收回内存——换型、新增、删除、保存之前都得先收一次。
+
+        名字也跟着收：自建关系的名字就在旁边那个框里，改名字**不改键**，指向它的会话不会丢。"""
+        key = self._relShown
+        if not key:
+            return
+        text = self.relTextEdit.toPlainText().strip()
+        if relations.is_builtin(key):
+            self._relTexts[key] = text
+            return
+        for c in self._relCustoms:
+            if c["key"] == key:
+                c["text"] = text
+                c["name"] = self.relNameEdit.text().strip()
+
+    def _rel_dirty(self):
+        """收回内存之后挑出跟出厂原文不一样的那些——只有这些值得写进 config.json。
+        自建的关系不在这儿，它们的正文在 customs 那条里跟着走。"""
+        self._rel_stash()
+        return {k: t for k, t in self._relTexts.items()
+                if relations.is_builtin(k) and t != relations.default_text(k)}
+
+    def _fill_rel_boxes(self, stype="", sdefault=""):
+        """按当前的自建关系重填「关系类型」和「默认关系」两个下拉（新增/删除之后要重填）。
+        两个下拉共用同一份选项，只是各自拨到不同的键上。"""
+        keys = self._rel_keys()
+        names = [self._rel_name(k) for k in keys]
+        for box, want in ((self.relTypeBox, stype), (self.defaultRelBox, sdefault)):
+            box.blockSignals(True)
+            box.clear()
+            box.addItems(names)
+            box.setCurrentIndex(keys.index(want) if want in keys else 0)
+            box.blockSignals(False)
+        # 重填时屏蔽了信号，换型那一套（名字框显隐、删除按钮亮灰、正文框）得自己补一次
+        self._rel_type_changed()
+
+    def _rel_type_changed(self, _=None):
+        """换了类型：先把框里那份收好，再换上这一型的（改过的优先，没改过就用出厂原文）。
+        自建的那几型多一个名字框——关系叫什么就是它。删除只对自建的开放。"""
+        self._rel_stash()
+        key = self._rel_key()
+        self._relShown = key
+        custom = bool(key) and not relations.is_builtin(key)
+        self.relNameLabel.setVisible(custom)
+        self.relNameEdit.setVisible(custom)
+        self.relNameEdit.setText(self._rel_name(key) if custom else "")
+        self.relTextEdit.setPlainText(self._rel_text(key))
+        self.relReset.setEnabled(bool(key))
+        self.relReset.setText("清空" if custom else "重置为内置原文")
+        self.relDelButton.setEnabled(custom)
+        self._rel_count()
+
+    def _rel_reset(self):
+        """回到出厂原文（自建的没有出厂原文，就是清空）。只动框里的字，落盘还是走「保存设置」。"""
+        key = self._rel_key()
+        if not key:
+            return
+        if relations.is_builtin(key):
+            self._relTexts.pop(key, None)
+        else:
+            for c in self._relCustoms:
+                if c["key"] == key:
+                    c["text"] = ""
+        self.relTextEdit.setPlainText(relations.default_text(key))
+
+    def _rel_add(self):
+        """新增一种关系：键自动编（r1、r2……，编好就不再变），名字和正文空着等人填。"""
+        self._rel_stash()
+        key = relations.new_key([c["key"] for c in self._relCustoms])
+        self._relCustoms.append({"key": key, "name": "", "text": ""})
+        self._relShown = ""  # 下面重填会走换型，别把刚建的空条目又当成「上一型」收一遍
+        self._fill_rel_boxes(key, self._default_rel_key())
+        self.relNameEdit.setFocus()
+        self._settings_feedback("填好名字和正文，点「保存设置」生效。")
+
+    def _rel_del(self):
+        """删掉一种自建关系。指向它的会话会退回默认关系（落盘时由 _clean_relations 清掉）。"""
+        key = self._rel_key()
+        if not key or relations.is_builtin(key):
+            return
+        name = self._rel_name(key)
+        self._relShown = ""  # 同上：别把要删的那型又收回来
+        self._relCustoms = [c for c in self._relCustoms if c["key"] != key]
+        self._relTexts.pop(key, None)
+        self._fill_rel_boxes("", self._default_rel_key())
+        self._settings_feedback(f"删掉了「{name}」，用它的会话会退回默认关系；点「保存设置」生效。")
+
+    def _rel_count(self):
+        """框里多少字。出厂的几型都压在 200 以内，自己加写的超过这个数就该掂量一下了。"""
+        n = len(self.relTextEdit.toPlainText().strip())
+        self.relCount.setText(f"{n} 字" + (f"，超过 {relations.LIMIT} 了，会盖过对话本身"
+                                           if n > relations.LIMIT else ""))
 
     def _opener_toggled(self, on):
         """只灰掉/点亮那个分钟数。落盘还是走「保存设置」——跟调试视图那种拨一下立刻生效的
@@ -1672,6 +1837,39 @@ class Overlay:
         settings.save(debug_view_on=on)
         if self.on_toggle_debug:
             self.on_toggle_debug(on)
+
+    def _sync_chatlog(self):
+        """存储那一行的现状。关着的时候**不读库**（读一下 sqlite 就会把库文件建出来，
+        违背「关着就一个字都不往磁盘写」），只按文件大小说话。"""
+        size = chatlog.size()
+        if not self.chatlogSwitch.isChecked():
+            self.chatlogStats.setText(
+                f"已关闭；硬盘上已经存的不动（占着 {chatlog.human_size(size)}）。" if size
+                else "已关闭，硬盘上还没存过东西。")
+        else:
+            self.chatlogStats.setText(
+                f"已存 {chatlog.count()} 条 · {chatlog.human_size(size)}。" if size
+                else "还没存过东西；有消息就读进来。")
+        self.chatlogClear.setEnabled(self.chatlogSwitch.isChecked() and size > 0)
+
+    def _chatlog_toggled(self, on):
+        """聊天会话存储：拨一下立刻生效 + 落盘（跟调试视图、桌面宠物一个路子）。"""
+        self._sync_chatlog()
+        if self.on_toggle_chatlog:
+            self.on_toggle_chatlog(on)
+        self._sync_chatlog()  # 父进程刚配好库，条数这会儿才读得出来
+
+    def _clear_chatlog(self):
+        """清空本机存的聊天记录。**只清库**，界面上正摆着的这些是这次运行读到的，
+        内存里那份不动——清了内存反而会让 `_already_read` 放行，屏幕上那几屏又被记一遍。"""
+        if not _ConfirmBox("清空聊天记录？",
+                           "本机存的聊天记录全部删掉，删了找不回来。关系和设置不受影响，"
+                           "AI 记录也不受影响。界面上现在摆着的这些是这次运行读到的，"
+                           "关掉应用才会跟着没。", self.win).exec():
+            return
+        chatlog.clear()
+        self._sync_chatlog()
+        self._settings_feedback("本机存的聊天记录已清空。")
 
     def _pet_toggled(self, on):
         """宠物形态独立于「保存设置」：拨一下就换形态，顺手落盘，重启还在。"""
@@ -1709,7 +1907,7 @@ class Overlay:
         # 还没配 key 就直接落在「模型设置」页，省得用户自己找那一页
         configured = settings.has_key()
         self._switch_tab("preference" if configured else "models")
-        (self.relationshipBox if configured else self.jev.keyEdit).setFocus()
+        (self.contextBox if configured else self.jev.keyEdit).setFocus()
 
     def _switch_tab(self, key):
         """设置页的页签：只切显隐，控件不重建——重建会把用户填了一半的内容弄丢。"""
@@ -1720,6 +1918,9 @@ class Overlay:
         self.preferenceCard.setVisible(key == "preference")
         self.modelsCard.setVisible(key == "models")
         self.styleCard.setVisible(key == "style")
+        self.systemCard.setVisible(key == "system")
+        if key == "system":
+            self._sync_chatlog()  # 占用多少、有多少条，进来的时候现算一次
 
     def _back_home(self):
         self.jev.keyEdit.clear()
@@ -2146,8 +2347,23 @@ class Overlay:
         """采集状态行：只进正在看的那个会话，不按会话存。"""
         self.feed.system(line)
 
+    def restore(self, chat, rows):
+        """开机把上次存下来的聊天记录填回内存（rows 是 core.chatlog 读出来的五元组，正序）。
+
+        **只填不写库**，跟 log_message 分成两条路是故意的：那条会往库里再插一遍，
+        重启一次记录就翻一倍。没配库 / 开关关着的时候没人调它。"""
+        lines = [tuple(r) for r in rows][-_LOG_LINES:]
+        if not lines:
+            return
+        self.feeds[chat] = lines
+        self.counts[chat] = len(lines)
+        hers = [t for who, t, *_ in lines if who == "her"]
+        if hers:
+            self.hers[chat] = hers[-1]
+        self._add_chat(chat)
+
     def log_message(self, who, text, name="", timestamp=None, chat=None, voice=""):
-        """按会话存一份；只有正在看的那个会往显示区里写。
+        """按会话存一份（内存 + 本地库）；只有正在看的那个会往显示区里写。
 
         voice 非空 = 这条是语音转出来的字，值是那条语音的时长（`3"`）：能对上前面那条
         「🔊 语音消息 3"」就并成一条（微信那边本来就是一条：气泡 + 转写），对不上就单独
@@ -2164,6 +2380,8 @@ class Overlay:
         lines = self.feeds.setdefault(chat, [])
         lines.append((who, text, name, timestamp, voice))
         del lines[:-_LOG_LINES]
+        # 落库：开关关着 / 没配库时 chatlog 自己空转，这儿不用问（见 core/chatlog.py）
+        chatlog.append(chat, who, text, name, timestamp, voice)
         if who == "her":
             self.hers[chat] = text
         self._add_chat(chat)
@@ -2186,6 +2404,9 @@ class Overlay:
             _, old, _, stamp, _ = lines[i]
             if old == mark:
                 lines[i] = (who, text, name, stamp, dur)
+                # 库里那条占位也跟着换掉：不换的话重启之后画出来的是「🔊 语音消息 3"」，
+                # 而这行字早就转成文字了（id 和时间都不动，顺序和显示都一样）
+                chatlog.merge_voice(chat, mark, who, text, dur)
                 if chat == self._shown:
                     self._render_feed()
                 return True
@@ -2274,6 +2495,7 @@ class Overlay:
         self._history_title()
         self._follow_text()
         self._render_targets()
+        self._render_relations()  # 关系是按会话存的，换会话就得跟着换
         self.show_cached(self.result_of(title) if self.result_of else None)
 
     def set_targets(self, chat, senders, current):
@@ -2295,6 +2517,47 @@ class Overlay:
         self.targetBox.addItems(senders)
         self.targetBox.setCurrentIndex(senders.index(current) if current in senders else 0)
         self.targetBox.blockSignals(False)
+
+    def _render_relations(self):
+        """把「关系」和「场景模板」两个下拉拨到这个会话现在的样子。
+
+        选项每次都现取：设置页里刚加的那型关系，回到首页就该出现在下拉里。重填时屏蔽信号，
+        别把自己的填充当成用户挑的。还没认到会话就整个灰掉——那会儿拨了也没有对象可改。"""
+        chat = self._shown
+        self._relKeys = list(settings.relation_choices())
+        self._sceneKeys = list(styles.choices(settings.relation_customs()))
+        for box, keys, current in (
+                (self.relationBox, self._relKeys, settings.relation_of(chat) if chat else ""),
+                (self.sceneBox, self._sceneKeys, settings.scene_of(chat) if chat else "")):
+            box.blockSignals(True)
+            box.clear()
+            box.addItems([name for _, name in keys])
+            box.setCurrentIndex(next((i for i, (k, _) in enumerate(keys) if k == current), 0))
+            box.blockSignals(False)
+            box.setEnabled(bool(chat))
+        self.sceneBox.setToolTip(
+            "挑一型就用那一型的正文说话（比如对一个客户用「同事」那套口气）；"
+            "不挑就跟着上面那个「关系」走。正文在「设置 → 个人风格」里按关系改。")
+
+    def _on_relation_selected(self, index):
+        """用户给这个会话挑了关系。拨一下立刻写盘，**下次生成才生效**——手上那三条候选是上一个
+        关系写出来的，不因为改这个就作废（要马上看新的，回候选条点「换一批」或等新消息）。"""
+        if not self._shown or not 0 <= index < len(self._relKeys):
+            return
+        key, name = self._relKeys[index]
+        self.set_status(f"「{self._shown}」按「{name}」来写，下次生成生效。", "idle")
+        if self.on_relation_change:
+            self.on_relation_change(self._shown, key)
+
+    def _on_scene_selected(self, index):
+        """用户给这个会话挑了场景模板（口吻覆盖）。跟「关系」一样，下次生成才生效。"""
+        if not self._shown or not 0 <= index < len(self._sceneKeys):
+            return
+        key, name = self._sceneKeys[index]
+        self.set_status(f"「{self._shown}」的口吻跟着「关系」走。" if not key else
+                        f"「{self._shown}」按「{name}」那套口气来写，下次生成生效。", "idle")
+        if self.on_scene_change:
+            self.on_scene_change(self._shown, key)
 
     def _on_target_selected(self, index):
         """用户挑了回复对象。浏览别的会话时改的就是那个会话的对象——记录、候选也都按会话走，口径一致。"""

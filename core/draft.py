@@ -236,9 +236,10 @@ def _prompt(messages: list, relationship: str, keep: int, reply_to: str | None,
     samples = [t for t in said if t and len(t) <= 60 and "http" not in t][-12:]
     if len(samples) >= 2:
         user += "\n\n我平时是这么说话的（模仿用词、长短、标点习惯）：\n" + "\n".join(samples)
-    # 场景模板：管这个关系里怎么说话（称呼、分寸、禁忌、长度）
+    # 这次说话的口气：一般是这个会话那种关系的正文，也可能是场景模板临时换的那一型
+    # （见 core/styles.py）。管称呼、分寸、禁忌、长度，别的规则照旧
     if scene.strip():
-        user += "\n\n这次的场景（只管称呼、语气、分寸，别的规则照旧）：\n" + scene.strip()
+        user += "\n\n这次说话的口气（只管称呼、语气、分寸，别的规则照旧）：\n" + scene.strip()
     if reply_to:
         user += (f"\n\n这是群聊。你接着要搭话的是「{reply_to}」，三条候选都对 TA 说，不要@别人。"
                  if opener else
@@ -334,8 +335,8 @@ def draft_candidates(messages: list, relationship: str, provider: str = "deepsee
     只看最近 keep 条。返回最多 3 条中文候选（过滤后可能是 0 条，调用方要处理）。
 
     reply_to: 群聊里指定回复给谁；None = 正常回复。
-    scene: 这次要追加的场景正文（设置里选的场景模板 + 用户改过的版本，由 core/styles 归一），
-    管这个关系里怎么称呼、语气、分寸；空 = 不加。
+    scene: 这次说话的口气那段正文（这个会话那种关系的正文，或场景模板临时换的那一型；
+    由 core/styles 归一），管怎么称呼、语气、分寸；空 = 不加。
     thinking: 思考模式，默认关（慢且贵）；开了模型会先想再写。设置里的开关。
     guidance: Jev 的判断小抄（core.questions.guidance_text），空就是盲起草。
     thinking_style: 只对第三方中转有意义——思考开关带哪个字段各家中转不一样，

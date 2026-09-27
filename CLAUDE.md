@@ -34,9 +34,14 @@ Windows 上挂在微信（4.x，`Weixin.exe`）旁边的回复助手：截自己
    静默窗口（见下），连着发的几条攒成一次问。**唯一的例外是默认关着的「冷场开场白」**
    （`opener`）：开着才多一个触发点——最后一句是自己说的、对方一直没回，等够 `opener_minutes()`
    起草一次开场白。关着的时候这条一字不变，别把它当成默认行为。
-8. **AI 记录（`history.db`）是全项目唯一把聊天原文写进磁盘的地方**，默认开、可以关
-   （`history`）、可以在记录窗里清空。加任何新的写盘口子之前先想清楚这条边界——
-   截图仍然一律不落盘（见 3），记录库记的是文字，且只在本机。
+8. **把聊天原文写进磁盘的口子只有两个，都是本机 SQLite、都能关、都能清空**：
+   - `history.db`（`core/trace.py`）——**AI 调用**记录，给流程审计用。默认开（`history`），
+     在「AI 记录」窗里清空。
+   - `chatlog.db`（`core/chatlog.py`）——**聊天记录**本身，界面那串气泡 + 喂模型的上下文。
+     默认**源码跑开、打包版关**（`chatlog`），在「系统设置」里拨、在同一个页签里清空。
+   两个库分开是故意的：开关、清空入口、生命周期各管各的，别合并。
+   加**第三个**写盘口子之前先想清楚这条边界——截图仍然一律不落盘（见 3），
+   两个库记的都是文字，都只在本机，写之前每个字符串都过 `redact_secrets()`。
 
 ## 常用命令
 
@@ -47,8 +52,11 @@ python main.py
 # 内置自测（就这几处，跑完打印 ok）
 python core/draft.py        # 候选解析器 + 防注入过滤的断言 + 开场白那根管道
 python core/engine.py       # 判断挂了不丢候选、开场白不过 Jev、trace 留痕
-python core/styles.py       # 场景模板：每段 ≤200 字、键/名字不重、拼接顺序
+python core/relations.py    # 关系：每段正文 ≤200 字、键/名字不重、自建关系的键怎么编
+python core/styles.py       # 场景模板：选项顺序、挑了用挑的那型、没挑退回关系那型
+python app/settings.py      # 关系模型：老配置迁移、存盘不丢别的键、按会话读回（写临时目录，不碰本机配置）
 python core/trace.py        # AI 记录库：写读回填清空、类型转换、脱敏、没配库时不建文件
+python core/chatlog.py      # 聊天记录库：写读正序、并语音、90 天留存、脱敏、关掉后不写也不建文件
 python -m app.update        # 版本号比较，monkeypatch urlopen，不联网
 python app/ocr.py           # 语音消息过滤正则（纯正则，不加载 OCR 引擎）
 python app/capture.py       # 消息区定位：输入框顶那根细横线（合成帧，不截图）
@@ -59,10 +67,14 @@ set PYTHONPATH=. && python tools/demo.py
 # 界面预览：合成数据，不采集、不联网、不碰微信；可出 README 那几张截图
 python tools/preview_ui.py --state ready
 python tools/preview_ui.py --state ready --screenshot docs/ui_home.png
+python tools/preview_ui.py --state settings --screenshot docs/ui_settings.png
+python tools/preview_ui.py --state settings --tab style --screenshot docs/ui_style.png
 # 可用的 --state：ready / waiting / loading / error / degraded / setup / settings / paused /
 #   debug / ime / ime-thinking / pet / pet-menu / bar / voice / log /
 #   opener / opener-bar / opener-loading / opener-blank / history / pinned
-# （history 会往临时目录写一个演示库，不碰本机那份 history.db）
+# 可用的 --tab：preference / models / style / system（配合 --state settings）
+# （history 会往临时目录写一个演示库，不碰本机那份 history.db；预览里 core.chatlog
+#   整个被 patch 成假的，不会碰本机那份 chatlog.db）
 
 # 打包（onedir，产物 dist\jev-chat\ 整个文件夹才是成品）
 build.bat
@@ -178,6 +190,29 @@ join 出来的碎片反而难读；加字段就往 `_COLUMNS` 里加一条，**�
 窗口是独立小窗（跟 debugwin 一个路子）：左边一轮一行、右边铺开那一轮的全程。刷新靠比较
 `latest_id()`——只在新记录出现时重建列表，重建时**停在原来那一轮**上（每 3 秒一次重画，
 别把正在看的那条顶掉）。加字段时 `app/historywin.py` 的 `_lines()` 记得一起改，不然记了看不见。
+
+**聊天记录**（`core/chatlog.py`）：**一份存储两处用**——界面上那串气泡（`Overlay.feeds`）和喂模型的
+`chats[会话名]["history"]`（deque maxlen=60）本来都只在内存里，重启一起没。现在都从这张表重建。
+它跟 `trace` 是**两个库**（`chatlog.db` / `history.db`）、两个开关（`chatlog` / `history`）、
+两个清空入口，别合并：一个记「AI 调用」给审计，一个记「聊天本身」给界面和上下文。
+
+四条规矩，改这块先看这四条：
+1. **写只有两个口子，都在 `Overlay` 里**：`log_message()` 末尾 `chatlog.append(...)`、
+   `_merge_voice()` 命中时 `chatlog.merge_voice(...)`。**别把落库挪到 `main.drain()`**——语音转写
+   并回占位那一步发生在界面内部，`main` 不知道并没并上，挪过去就会多记一条
+   （而且将来在别处调 `log_message` 也会漏记）。
+2. **回填走 `Overlay.restore()`，那条路只填内存、一个字都不写库**。走 `log_message` 会再插一遍，
+   重启几次记录就翻几倍。回填在 `main.restore_log()` 里，**必须在子进程起来之前、也在 `set_pin`
+   之前**调（`set_pin` 会 `_switch_to` → 重画记录，那会儿 feeds 还是空的就白画了）。
+3. **开关关着就一个字都不写，但已经存下的一条都不动**。`chatlog.configure("")` / `close()` 只是
+   停写；删数据只有 `clear()` 一条路（设置页那个「清空聊天记录」，带确认框）。同理
+   **关着的时候不读**——`count()` / `chats()` / `recent()` 都由 `_ON` 挡着：读一下 sqlite 就会把
+   库文件建出来，那就违背「关着连文件都不建」了（`size()` 例外，它只 `getsize`，不连库）。
+4. **清空只清库、不动内存**。清了 `feeds` / `history` 反而会让 `_already_read` 放行，
+   屏幕上那几屏被当新消息重读一遍、又写回库里，等于没清干净。
+
+默认值是 `not sys.frozen`（**源码跑开、打包版关**）——本地调试不想丢记录，装出去的不默认往磁盘
+写聊天原文。留存 `RETENTION_DAYS = 90`，在 `configure()` 里顺手清一次，不另起定时器。
 
 **转文字出来的字不是「新消息」**（`drain()` 里那个 `said`），它只是把屏幕上那条语音气泡的内容
 补进记录（界面按时长并回「🔊 语音消息 N"」）。分两种：**对方那条**语音转出来的算他「说了句话」，
@@ -317,18 +352,37 @@ scrollbar 的 `maximum()` 还是旧值，跟底得 `QTimer.singleShot(0, ...)`�
   （比如开场白那个分钟数跟着开关灰）得在 `_load_settings()` 里手动补调一次。
   `save()` 是**把 config.json 整份重写**：加新键的同时，别把不归它管的键漏掉（`pet_pos` 就是这么
   丢过一次的——点一次「保存设置」，宠物下次就跳回默认角落），照 `keep` / `_load_all()` 的写法带过去。
-  设置页是**三个页签**（回复偏好 / 模型设置 / 个人风格）：那一排按钮在 `_build_settings()` 的
-  `tabButtons` 循环里、卡片显隐在 `_switch_tab()` 里，加一页要两处一起加。第三页「个人风格」
-  是场景模板 + 自定义口吻，截图用 `tools/preview_ui.py --state settings --tab style`。
-- **场景模板**：内置正文只有一份，在 `core/styles.py` 的 `PRESETS` 里；**加一型**只要往那儿加一条，
-  设置页的下拉（`app/overlay.py` 的 `_PRESET_CHOICES` 按它拼）和 `resolve()` 就都认了。
-  每段 **≤200 字**（`LIMIT`，自测卡着），超了会盖过对话本身、模型开始照着说明造句。
-  存两个键：`style_preset`（选了哪一型，`""` = 不用）和 `style_texts`（**只存跟内置原文不一样的**
-  那几型，按类型分开）——这样以后改内置文案，没动过手的用户能跟着更新，动过手的那型保留他改的。
-  设置页那个大框就是**会拼进 prompt 的原文**，可以直接改；换类型时 `_preset_stash()` 先把框里的字
-  收进内存再换，不然正在改的东西一切就没了。只喂起草（`draft_candidates(scene=...)` 收的是
-  **归一好的正文**，不是键），不喂判断——Jev 判的是意图和紧张度，跟措辞无关。
-  老配置里那句自由文本 `style` 会被当成「自定义」读出来，保存一次之后就没了。
+  设置页是**四个页签**（回复偏好 / 模型设置 / 个人风格 / 系统设置）：那一排按钮在
+  `_build_settings()` 的 `tabButtons` 循环里、卡片显隐在 `_switch_tab()` 里，加一页要两处一起加。
+  第三页「个人风格」整页都是关系，截图 `--state settings --tab style`；第四页「系统设置」是
+  聊天会话存储 / 记录 AI 调用 / 启动时检查更新 / 调试视图 / 桌面宠物，`--tab system`。
+  挪开关的时候记得 `_load_settings()` 里那几个 `blockSignals` 也要跟着搬——拨一下立刻生效的那几个
+  （调试视图、桌面宠物、聊天会话存储）在加载时会真的去开窗/配库。
+- **关系**（`core/relations.py`）：这个会话里的人是谁，外加**按这个关系该怎么说话**。六型内置
+  （朋友 / 恋人 / 暧昧 / 同事 / 职场 / 家人），出厂正文在 `PRESETS` 里，**加一型**只要往那儿加一条，
+  `settings.relation_choices()` 和两个下拉就都认了。每段 **≤200 字**（`LIMIT`，自测卡着）。
+  喂给模型两处：起草提示里的 `relationship: 朋友` 那一句（喂的是**中文名**，不是键），
+  以及 `scene` 那一段正文（走 `styles.resolve`）。
+  存一个键 `relations`：`{default, texts, customs, chats}`——`texts` **只存跟出厂原文不一样的**
+  那几型（以后改内置文案，没动过手的用户能跟着更新）；`customs` 是用户自建的
+  `[{key, name, text}]`，**键自动编（r1、r2……）编好就不再变**，改名字不改键，指向它的会话才不会丢；
+  `chats` 是 `{会话名: 键}`。`_clean_relations()` 是**唯一**的校验口（读的时候清脏数据、把指向已删
+  关系的会话退回默认），`save_chat_relation` 写完也过一遍。
+- **关系是按会话走的**，跟「固定/跟随」那条线正交，别混：面板上「当前会话」右边那个下拉改的是
+  `relations.chats[会话名]`，`settings.relation_of(title)` 是唯一判据（自己挑过的优先，没挑过用
+  `relations.default`）。`main.set_relation()` 拨一下**只写盘、不重跑**——手上那三条候选是上一个
+  关系写出来的，改这个不该让它们作废；下次生成（`analyze_bg` / `opener_bg`）现读设置就有了。
+  跑之前看这三条：① 起草和判断**都**要现读（`relation_name(relation_of(title))`），别在启动时
+  缓存一份——那样拨了下拉得重启才生效；② 会话名是键，改名/别名（`_alias`）之后是**另一个键**，
+  关系跟着丢回默认，这是已知的代价，别去猜；③ 自建关系删掉之后，用它的会话退回默认
+  （`_clean_relations` 干的），别让界面上留一个没名字的下拉。
+- **场景模板**（`core/styles.py`）退成了**覆盖层**：正文只有一份、在 `relations` 里，它只回答
+  「这次用哪一型的」。挑了某一型就用那一型的正文（「对一个客户用同事那套口气」），没挑就退回
+  这个会话自己那种关系。存 `chat_scenes`（`{会话名: 键}`，空串/缺 = 跟随关系）。
+  **所以别再加第二个正文编辑器**——原来设置页有一个，跟关系那套改的是同样的字，已经删了。
+  老配置的 `style_preset` / `style_texts` / `style` 由 `settings._migrate_relations()` 接过来
+  （老的场景模板全局一份、真正在管措辞，所以它认得出某一型就以它为准当默认关系），
+  保存一次之后 config.json 里就只剩新形状了。
 - **候选的「显示位置」和「原始下标」是两回事**，别混。候选条和面板都按推荐顺序重排过
   （`_ordered` 里存的就是「位置 → (原始下标, 概率, 是否推荐)」），界面上看到的「1/2/3」是位置，
   只有推荐那条本来就排第一时才跟 `cands` 的下标重合。所以：`_fill()` / `_copy()` 收的、

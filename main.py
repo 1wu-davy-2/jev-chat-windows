@@ -24,7 +24,7 @@ from app.fill import fill
 from app.ocr import similar
 from app.overlay import Overlay
 from app.version import VERSION
-from core import trace
+from core import chatlog, trace
 from core.engine import analyze, analyze_opener
 
 # {会话名: {history, result, rev, target, senders}}：每个会话各自的上下文、上次结果和版本号，互不串味
@@ -48,6 +48,11 @@ _HISTORY_DUP = 24  # 判重时往回看这么多条（一屏大概也就十来�
 _QUIET_MIN = 5.0
 _QUIET_JITTER = 5.0
 _QUIET_MAX = 30.0
+# 开机从聊天记录库往回填多少：气泡最多 300（跟界面那份 _LOG_LINES 一个量级），
+# 喂模型的 history 是 deque(maxlen=60)，多喂的也会被挤掉，所以按 60 截一下就行
+_RESTORE_LINES = 300
+_RESTORE_HISTORY = 60
+_RESTORE_CHATS = 40  # 下拉框最多接回这么多个会话，免得历史一大堆时那个框长得没法用
 results = queue.Queue()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
 
@@ -196,6 +201,31 @@ def set_pin(name):
             pass
 
 
+def set_relation(title, key):
+    """用户给某个会话挑了关系（面板上「当前会话」右边那个下拉）。
+
+    **只写盘，不重跑**：手上那三条候选是上一个关系写出来的，改这个不该让它们作废——人家可能
+    就是看着候选顺眼才顺手改的，一改就重跑既费钱又把手上的东西弄没了。下次生成（新消息、
+    「换一批」、开场白）读到的就是新关系（analyze_bg / opener_bg 都是现读设置）。
+
+    跟 set_pin 一个道理：拨一下就写盘，走 save_chat_relation（只改这一格），不用整份 save()。"""
+    try:
+        settings.save_chat_relation(title, key)
+    except Exception:  # 存不下也不该把下拉点崩（config.json 只读之类）
+        return
+    ov.set_status(f"「{title}」按「{settings.relation_name(key)}」来写，下次生成生效。", "idle")
+
+
+def set_scene(title, key):
+    """用户给某个会话挑了场景模板（用另一型关系的正文说话，空串 = 跟随关系）。同上：只写盘。"""
+    try:
+        settings.save_chat_scene(title, key)
+    except Exception:
+        return
+    note = f"「{settings.relation_name(key)}」那套口气" if key else "跟着「关系」走"
+    ov.set_status(f"「{title}」的口吻改成{note}，下次生成生效。", "idle")
+
+
 def target_of(title):
     """这个会话现在的回复对象：用户挑过且人还在就用它，否则用最近说话的那个；单聊没有发言人 → None。"""
     chat = chat_of(title)
@@ -292,6 +322,42 @@ def open_history():
     hist.show()
     hist.raise_()
     hist.activateWindow()
+
+
+def restore_log():
+    """开机把上次存的聊天记录接回来：界面的气泡 + 喂模型的 history 一起。
+
+    **得在子进程起来之前、也在 set_pin 之前调**——set_pin 那一步会 _switch_to → 重画记录，
+    这会儿 feeds 还是空的就白画了。接回来之后屏幕上还留着的那几屏会被 `_already_read` 当成
+    旧消息挡掉：本来就读过，不该再记一遍（这正是以前没有库时的一个毛病）。
+
+    **只回填内存、不写库**：库里本来就有，走 log_message 那条路会再插一遍，重启几次就翻几倍。"""
+    if not settings.chatlog():
+        return
+    chatlog.configure(settings.chatlog_db())
+    for title, _n in chatlog.chats(_RESTORE_CHATS):
+        rows = chatlog.recent(title, _RESTORE_LINES)
+        if not rows:
+            continue
+        chat = chat_of(title)
+        for who, text, name, _stamp, _voice in rows[-_RESTORE_HISTORY:]:
+            chat["history"].append((who, text, name or None))
+        ov.restore(title, rows)
+
+
+def set_chatlog(on):
+    """「聊天会话存储」开关。拨一下**立刻生效**（跟调试视图、桌面宠物一个路子），顺手落盘。
+
+    关掉只是不再往库里写，**已经存下的一条都不动**——要删去设置页点「清空聊天记录」。
+    两件事分开：拨一下开关就把人家攒的记录抹了，那才叫坑。"""
+    if on:
+        chatlog.configure(settings.chatlog_db())
+    else:
+        chatlog.close()
+    try:
+        settings.save(chatlog_on=bool(on))
+    except Exception:  # 存不下也不该把开关拨不动
+        pass
 
 
 def record_run(title, kind, trigger, result=None, exc=None):
@@ -396,12 +462,15 @@ def analyze_bg(msgs, title, revision, reply_to=None, trigger="对方来新消息
         # 起草和判断都可能是中转，那边地址只有一个（设置里共用），谁选中转就把它传给它
         provider, jev_provider = settings.draft_provider(), settings.jev_provider()
         relay_base = settings.relay_base_url()
-        r = analyze(msgs, settings.relationship(), context=settings.context(),
+        # 关系和口吻都**按会话现读**：面板上拨一下只写盘，下一轮生成（就是这儿）才用上。
+        # 喂给模型的是关系的中文名（「朋友」「前女友」），判断那一步也看它。
+        r = analyze(msgs, settings.relation_name(settings.relation_of(title)),
+                    context=settings.context(),
                     model=settings.draft_model() or None,
                     provider=provider,
                     base_url=(relay_base if "relay" in (provider, jev_provider)
                               else settings.draft_base_url()) or None,
-                    reply_to=reply_to, scene=settings.scene_text(),
+                    reply_to=reply_to, scene=settings.scene_text(title),
                     thinking=settings.thinking(),
                     thinking_style=settings.relay_thinking_style(),
                     judge_path=settings.relay_judge_path(),
@@ -424,11 +493,12 @@ def opener_bg(msgs, title, revision, waited, reply_to=None, trigger="冷场到�
     try:
         provider, jev_provider = settings.draft_provider(), settings.jev_provider()
         relay_base = settings.relay_base_url()
-        r = analyze_opener(msgs, settings.relationship(), context=settings.context(),
+        r = analyze_opener(msgs, settings.relation_name(settings.relation_of(title)),
+                           context=settings.context(),
                            model=settings.draft_model() or None, provider=provider,
                            base_url=(relay_base if "relay" in (provider, jev_provider)
                                      else settings.draft_base_url()) or None,
-                           reply_to=reply_to, scene=settings.scene_text(),
+                           reply_to=reply_to, scene=settings.scene_text(title),
                            thinking=settings.thinking(),
                            thinking_style=settings.relay_thinking_style())
         r["waited"] = waited
@@ -757,7 +827,10 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
                  on_voice_convert=convert_voice, on_opener_again=opener_again,
                  on_settings_saved=on_settings_saved, on_open_history=open_history,
                  on_use=mark_used, on_pin_change=set_pin,
+                 on_relation_change=set_relation, on_scene_change=set_scene,
+                 on_toggle_chatlog=set_chatlog,
                  result_of=lambda t: chats.get(t, {}).get("result"))
+    restore_log()  # 先把上次的记录接回来，再摆固定会话、再开采集（顺序有讲究，见函数里）
     if state["pin"]:
         ov.set_pin(state["pin"])  # 面板先摆到固定那个会话上，等子进程读到微信开着谁再各归各位
     child = dbg = hist = None

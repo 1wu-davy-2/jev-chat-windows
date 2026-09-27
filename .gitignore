@@ -12,6 +12,10 @@ config.json
 history.db
 history.db-wal
 history.db-shm
+# 聊天记录库：同上，都是本机自己的聊天原文
+chatlog.db
+chatlog.db-wal
+chatlog.db-shm
 # 根目录下的临时截图（docs/ 里的照常提交）
 /*.png
 wechat_probe.png

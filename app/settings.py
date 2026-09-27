@@ -12,6 +12,7 @@ import json
 import os
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
 
+from core import relations as rel
 from core import styles
 from core.providers import CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, LEGACY, LLM_ENV
 from core.relay import DEFAULT_JUDGE_PATH, DEFAULT_THINKING_STYLE, THINKING_STYLES
@@ -20,8 +21,12 @@ _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CONFIG = os.path.join(_ROOT, "config.json")
 _HISTORY_DB = os.path.join(_ROOT, "history.db")  # AI 调用记录，见 core/trace.py（已进 .gitignore）
-_DEFAULT_RELATIONSHIP = "romantic partners"
+_CHATLOG_DB = os.path.join(_ROOT, "chatlog.db")  # 聊天记录，见 core/chatlog.py（已进 .gitignore）
 _DEFAULT_CONTEXT = 10
+# 老配置里 relationship 存的是这几个英文（安卓原版传下来的），迁移时折回内置的键
+_LEGACY_RELATION_KEYS = {"romantic partners": "romance", "friends": "friend",
+                         "colleagues": "colleague", "family": "family"}
+_LEGACY_CUSTOM = "custom"  # 老「场景模板」里那一型自定义的键
 _DEFAULT_JEV = "openrouter"
 _DEFAULT_DRAFT = "deepseek"
 _DEFAULT_OPENER_MINUTES = 30
@@ -36,8 +41,99 @@ def _read(name: str, default=None):
         return default
     return default if value is None else value
 
-def relationship() -> str:
-    return str(_read("relationship") or _DEFAULT_RELATIONSHIP)
+def _clean_relations(raw) -> dict:
+    """把存下来的那份关系模型收拾成能用的形状：脏数据、认不出的键一律丢掉；
+    指到一个已经删掉的关系上的会话退回默认（不然面板上是个没有名字的下拉）。"""
+    raw = raw if isinstance(raw, dict) else {}
+    customs = []
+    for c in raw.get("customs") or ():
+        if isinstance(c, dict) and c.get("key"):
+            customs.append({"key": str(c["key"]), "name": str(c.get("name") or "").strip(),
+                            "text": str(c.get("text") or "").strip()})
+    known = set(rel.KEYS) | {c["key"] for c in customs}
+    texts = {str(k): str(v).strip() for k, v in (raw.get("texts") or {}).items()
+             if str(k) in known}
+    default = str(raw.get("default") or "")
+    return {"default": default if default in known else rel.DEFAULT,
+            "texts": texts, "customs": customs,
+            "chats": {str(k): str(v) for k, v in (raw.get("chats") or {}).items()
+                      if str(v) in known}}
+
+
+def _migrate_relations() -> dict:
+    """老配置接过来，形状换成上面那个 dict。三处源头：
+
+    - `style_texts`：老「场景模板」里用户改过的正文。它的键跟 core/relations 故意取成一样，
+      认得出的那几型直接搬过来当关系的正文——老配置里那段字本来就是每轮都拼进 prompt 的，
+      接到关系上行为一点不变。
+    - `style_preset` + `relationship`：老的场景模板是全局一份、真正在管措辞的那个，认得出
+      某一型就以它为准当默认关系；认不出再看 relationship，那是用户自己填的一句话，
+      接成一条自建关系（名字就是那句话）。
+    - 更老的 `style` / `style_texts["custom"]`：一句自由文本，同样接成一条自建关系。"""
+    old = _read("style_texts")
+    texts = {str(k): str(v).strip() for k, v in (old if isinstance(old, dict) else {}).items()
+             if k in rel.KEYS and str(v).strip() != rel.default_text(k)}
+    spare = str((old or {}).get(_LEGACY_CUSTOM) or "").strip() if isinstance(old, dict) else ""
+    spare = spare or style().strip()
+
+    customs: list = []
+    free = str(_read("relationship") or "").strip()
+    key = _LEGACY_RELATION_KEYS.get(free)
+    if not key and free and free not in rel.NAMES.values():
+        key = rel.new_key([c["key"] for c in customs])
+        customs.append({"key": key, "name": free, "text": spare})
+        spare = ""  # 已经用掉了，别再建一条
+    preset = str(_read("style_preset") or "").strip()
+    if preset in rel.KEYS:
+        key = preset
+    elif preset == _LEGACY_CUSTOM and spare:
+        key = rel.new_key([c["key"] for c in customs])
+        customs.append({"key": key, "name": "自定义", "text": spare})
+        spare = ""
+    if spare:
+        # 那段字现在没在用（用户换过型）也是他自己写的，留成一条自建关系，别在迁移里弄丢
+        customs.append({"key": rel.new_key([c["key"] for c in customs]),
+                        "name": "自定义", "text": spare})
+    return {"default": key or rel.DEFAULT, "texts": texts, "customs": customs, "chats": {}}
+
+
+def relations_dict() -> dict:
+    """整个关系模型 {default, texts, customs, chats}。老配置在这儿一次性接过来，
+    保存一次之后 config.json 里就只剩新形状了——跟原来 style_preset 接老 style 是一个套路。"""
+    raw = _read("relations")
+    return _clean_relations(raw) if isinstance(raw, dict) else _migrate_relations()
+
+def relation_default() -> str:
+    """新会话、还没指定过关系的聊天用哪一型。设置页里那个「默认关系」管它。"""
+    return relations_dict()["default"]
+
+def relation_customs() -> list:
+    """用户自己加的关系 [{"key","name","text"}]，按添加顺序。"""
+    return relations_dict()["customs"]
+
+def relation_choices() -> tuple:
+    """下拉框的选项 [(键, 名字)]：内置那几型（朋友在最前）+ 用户自建的。"""
+    customs = relation_customs()
+    return ((*((k, rel.NAMES[k]) for k in rel.KEYS),
+             *((c["key"], rel.label(c["key"], customs)) for c in customs)))
+
+def relation_of(chat: str) -> str:
+    """这个会话用哪一型关系：自己挑过的优先，没挑过用默认那个。"""
+    return relations_dict()["chats"].get(str(chat or "")) or relation_default()
+
+def relation_name(key: str) -> str:
+    """键 → 界面上显示的名字。"""
+    return rel.label(key, relation_customs())
+
+def relation_text(key: str) -> str:
+    """某一型关系的正文（改过的优先，没改过用内置的）。"""
+    d = relations_dict()
+    return rel.resolve(key, d["texts"], d["customs"])
+
+def scene_of(chat: str) -> str:
+    """这个会话的场景模板：挑的是哪一型，空串 = 跟随关系（用这个会话自己那一型的正文）。"""
+    v = _read("chat_scenes")
+    return str((v or {}).get(str(chat or "")) or "") if isinstance(v, dict) else ""
 
 def context() -> int:
     """参考上下文条数：起草和判断各看最近多少条消息。3~30，缺失/脏数据一律退默认值。"""
@@ -48,29 +144,21 @@ def context() -> int:
     return max(3, min(30, n))
 
 def style() -> str:
-    """老字段：一句自由文本口吻。已被「场景模板」取代（见 style_preset / style_texts），
-    这里只留着读升级前的配置做迁移，保存一次之后 config.json 里就没有它了。"""
+    """老字段：一句自由文本口吻。它是「场景模板」之前那一版的东西，现在只在迁移里用得上
+    （接成一条自建关系，见 _migrate_relations），保存一次之后 config.json 里就没有它了。"""
     return str(_read("style") or "")
 
-def style_preset() -> str:
-    """选中的场景模板：core/styles 的键、"custom"（自定义），或空串（不用 = 什么都不追加）。"""
-    v = str(_read("style_preset") or "").strip()
-    if v in styles.KEYS or v == styles.CUSTOM:
-        return v
-    # 老配置里没有这一项：那句自由文本就当「自定义」接过来，没写就是不用
-    return styles.CUSTOM if style().strip() else ""
+def scene_label(chat: str) -> str:
+    """这个会话的场景模板在界面上该显示成什么（没挑就是「跟随关系」）。"""
+    key = scene_of(chat)
+    return rel.label(key, relation_customs()) if key else styles.FOLLOW_NAME
 
-def style_texts() -> dict:
-    """用户改过的模板正文 {类型: 正文}，只存跟内置不一样的（见 save）。认不出的键、非字符串的值丢掉。
-    老配置里那句自由文本（style）当「自定义」接过来——升级前只有那一个地方能写字。"""
-    v = _read("style_texts")
-    if isinstance(v, dict):
-        return {k: str(t).strip() for k, t in v.items() if k in styles.KEYS or k == styles.CUSTOM}
-    return {styles.CUSTOM: style().strip()} if style().strip() else {}
-
-def scene_text() -> str:
-    """这次要追加到起草 prompt 的正文（选中的类型 + 用户改过的版本）。空 = 不追加。"""
-    return styles.resolve(style_preset(), style_texts())
+def scene_text(chat: str = "") -> str:
+    """这次要追加到起草 prompt 的正文。挑了场景就用那一型的，没挑就用这个会话自己关系的。
+    空 = 不追加（自建的关系还没写正文时就是这样）。"""
+    d = relations_dict()
+    return styles.resolve(scene_of(chat), relation=relation_of(chat),
+                          relation_texts=d["texts"], customs=d["customs"])
 
 def jev_provider() -> str:
     """判断模型走哪家：openrouter（默认）、typesafe 直连，或 relay 第三方中转。"""
@@ -144,6 +232,17 @@ def history() -> bool:
 def history_db() -> str:
     """记录库的路径：跟 config.json 并排。路径的算法只在这儿一处（core/trace 不认识 app）。"""
     return _HISTORY_DB
+
+def chatlog() -> bool:
+    """聊天记录存不存本地（界面那串气泡 + 喂模型的上下文，见 core/chatlog.py）。
+
+    **默认源码跑开着、打包版关着**：本地调试时不想丢记录，而装出去的默认不往磁盘写聊天原文，
+    要存自己去设置里开。判断依据是 `sys.frozen`（打包后为真），不用额外配置。"""
+    return bool(_read("chatlog", not getattr(sys, "frozen", False)))
+
+def chatlog_db() -> str:
+    """聊天记录库的路径。跟 history.db 分开：两个开关、两个清空入口，各管各的。"""
+    return _CHATLOG_DB
 
 def opener_minutes() -> int:
     """等多少分钟算冷场。1~720，缺失/脏数据一律退默认值。"""
@@ -244,19 +343,19 @@ def has_llm_key() -> bool:
 
 has_key = has_jev_key  # 旧名字：界面上「配没配好」问的就是判断模型这把 key
 
-def save(relationship_text: str | None = None, context_n: int | None = None, *,
+def save(context_n: int | None = None, *,
          jev_provider_text: str | None = None, jev_key_text: str | None = None,
          jev_model_text: str | None = None, draft_provider_text: str | None = None,
          llm_key_text: str | None = None, draft_model_text: str | None = None,
          draft_base_url_text: str | None = None, reply_target_on: bool | None = None,
-         style_preset_text: str | None = None, style_texts_dict: dict | None = None,
+         relation_model: dict | None = None,
          thinking_on: bool | None = None,
          check_update_on: bool | None = None, debug_view_on: bool | None = None,
          relay_base_url_text: str | None = None, relay_judge_path_text: str | None = None,
          relay_thinking_style_text: str | None = None,
          pet_enabled_on: bool | None = None, opener_on: bool | None = None,
          opener_minutes_n: int | None = None, history_on: bool | None = None,
-         chat_pin_text: str | None = None) -> None:
+         chatlog_on: bool | None = None, chat_pin_text: str | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -275,21 +374,20 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
     # 空串 = 清掉，None = 原样留着（读原始字段，别读补过默认值的那个）
     keep = lambda new, name: str(_read(name) or "") if new is None else str(new).strip()
     flag = lambda new, now: now() if new is None else bool(new)
-    # 场景模板：None = 原样留着。正文只存跟内置原文**不一样**的那些——这样以后改 core/styles.py
-    # 的文案，没动过手的人能跟着更新，动过手的那一型则原样保留他改的版本
-    preset = style_preset() if style_preset_text is None else str(style_preset_text).strip()
-    if preset not in styles.KEYS and preset != styles.CUSTOM:
-        preset = ""  # 认不出的类型按「不用」处理，别写个坏值进去
-    texts = style_texts() if style_texts_dict is None else {
-        str(k): str(v).strip() for k, v in dict(style_texts_dict).items()
-        if k in styles.KEYS or k == styles.CUSTOM}
-    texts = {k: t for k, t in texts.items() if t != styles.default_text(k)}
+    # 关系模型：None = 原样留着。正文只存跟内置原文**不一样**的那些——这样以后改
+    # core/relations.py 的文案，没动过手的人能跟着更新，动过手的那一型则原样保留他改的版本。
+    # 自建的关系（customs）没有内置原文，正文在它自己那条里，不走 texts。
+    model = _clean_relations(relation_model) if relation_model is not None else relations_dict()
+    model["texts"] = {k: t for k, t in model["texts"].items()
+                      if t != rel.default_text(k) and rel.is_builtin(k)}
+    scenes = _read("chat_scenes")
     # 整个 dict 必须在 open(..., "w") **之前**拼好：open 一上来就把文件截断，
     # 之后再 _read() 读到的是空文件，None 那几项就不是「保留」而是被清空了。
     data = {
-        # 关系为空 = 只改别的开关（调试视图那种单项保存），别把它写没了
-        "relationship": relationship_text or relationship(), "context": n,
-        "style_preset": preset, "style_texts": texts,
+        "context": n, "relations": model,
+        # 每个会话挑了哪一型场景模板也不归这儿管（面板上拨一下走 save_chat_scene），
+        # 但同样**必须带过去**：整份重写，漏了就等于把它删了。
+        "chat_scenes": dict(scenes) if isinstance(scenes, dict) else {},
         "jev_provider": jev, "jev_model": keep(jev_model_text, "jev_model"),
         "draft_provider": draft, "draft_model": keep(draft_model_text, "draft_model"),
         "draft_base_url": keep(draft_base_url_text, "draft_base_url"),
@@ -299,6 +397,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "reply_target": flag(reply_target_on, reply_target),
         "opener": flag(opener_on, opener), "opener_minutes": opener_n,
         "history": flag(history_on, history),
+        "chatlog": flag(chatlog_on, chatlog),
         "thinking": flag(thinking_on, thinking),
         "check_update": flag(check_update_on, check_update),
         "debug_view": flag(debug_view_on, debug_view),
@@ -336,6 +435,40 @@ def save_chat_pin(name: str) -> None:
         json.dump(data, f, ensure_ascii=False)
 
 
+def _save_spot(key: str, name: str, value: str) -> None:
+    """往 config.json 的一张 {会话名: 值} 表里改一格，别的字段原样带过去。
+    空值 = 把这一格删掉（回到默认），不留一个没用的空条目。"""
+    data = _load_all()
+    spot = data.get(key)
+    spot = dict(spot) if isinstance(spot, dict) else {}
+    if value:
+        spot[str(name)] = str(value)
+    else:
+        spot.pop(str(name), None)
+    data[key] = spot
+    with open(_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def save_chat_relation(name: str, relation: str) -> None:
+    """只更新「这个会话是哪一型关系」，别的字段原样带过去。面板上拨一下就得写盘——
+    走 save() 的话每次都要把两把 key 重写一遍注册表、再广播一次 WM_SETTINGCHANGE。"""
+    data = _load_all()
+    model = _clean_relations(data.get("relations"))
+    if relation:
+        model["chats"][str(name)] = str(relation)
+    else:
+        model["chats"].pop(str(name), None)
+    data["relations"] = _clean_relations(model)  # 认不出的键（那型刚被删了）当场清掉，别落盘
+    with open(_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def save_chat_scene(name: str, scene: str) -> None:
+    """只更新「这个会话挑了哪一型场景模板」（空串 = 跟随关系），别的字段原样带过去。"""
+    _save_spot("chat_scenes", name, scene)
+
+
 def save_pet_pos(x: int, y: int) -> None:
     """只更新宠物位置，别的字段原样带过去。
 
@@ -345,3 +478,87 @@ def save_pet_pos(x: int, y: int) -> None:
     data["pet_pos"] = [int(x), int(y)]
     with open(_CONFIG, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
+
+
+if __name__ == "__main__":
+    # 关系模型的迁移 + 存盘：python app/settings.py
+    # 全程写在一个临时目录里，不碰本机那份 config.json，也不碰注册表里的 key。
+    import tempfile
+
+    def _dump(data: dict) -> None:
+        with open(_CONFIG, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+    _CONFIG = os.path.join(tempfile.mkdtemp(prefix="jev-settings-"), "config.json")
+    _set_key = lambda *a: None       # 别把真实 key 重写进注册表
+    _notify_env = lambda: None       # 也别为一次自测广播 WM_SETTINGCHANGE
+
+    # 全新安装：默认朋友，其余空的；没指定过的会话直接拿到朋友的正文
+    _dump({})
+    assert relations_dict() == {"default": "friend", "texts": {}, "customs": [], "chats": {}}
+    assert relation_of("谁") == "friend" and scene_of("谁") == ""
+    assert scene_text("谁") == rel.TEXTS["friend"] and relation_name("friend") == "朋友"
+
+    # 老配置（全局一份关系 + 一份场景模板）——场景模板才是真正在管措辞的那个，以它为准；
+    # 改过的正文按型接过来；那段没人用的自由正文留成一条自建关系，不能在迁移里弄丢
+    _dump({"relationship": "family", "style_preset": "flirty",
+           "style_texts": {"romance": "我改的", "custom": "哥哥视角"}})
+    m = relations_dict()
+    assert m["default"] == "flirty", "老的场景模板该盖过 relationship"
+    assert m["texts"] == {"romance": "我改的"}
+    assert [c["text"] for c in m["customs"]] == ["哥哥视角"]
+    assert scene_text("谁") == rel.TEXTS["flirty"], "改过的是恋爱那型，跟暧昧无关"
+
+    # relationship 是自己填的一句话：接成一条自建关系，名字就是那句话，并且当默认
+    _dump({"relationship": "刚认识的朋友，正在慢慢熟悉", "style": "别太热情"})
+    m = relations_dict()
+    assert m["default"] == m["customs"][0]["key"] and m["customs"][0]["key"] == "r1"
+    assert m["customs"][0]["name"] == "刚认识的朋友，正在慢慢熟悉"
+    assert m["customs"][0]["text"] == "别太热情"
+    assert scene_text("谁") == "别太热情"
+
+    # 场景模板选的是「自定义」：那段正文接成默认关系，而不是退回朋友
+    _dump({"style_preset": "custom", "style_texts": {"custom": "哥哥视角"}})
+    m = relations_dict()
+    assert m["default"] == "r1" and m["customs"][0]["text"] == "哥哥视角"
+
+    # 存一次：新形状落盘、老键没了、不归这次保存管的键（宠物位置）原样带过去
+    _dump({"relationship": "friends", "pet_pos": [11, 22], "style": "老掉牙的"})
+    save(12)
+    saved = _load_all()
+    assert "relationship" not in saved and "style" not in saved and "style_texts" not in saved
+    assert saved["context"] == 12 and saved["pet_pos"] == [11, 22]
+    assert saved["relations"]["default"] == "friend" and saved["chat_scenes"] == {}
+
+    # 面板上拨下拉：只改这一格，别的字段一个都不能少
+    save_chat_relation("张三", "workplace")
+    save_chat_relation("李四", "r9")  # 不存在的键：当场清掉，等于没设过
+    save_chat_scene("张三", "friend")
+    assert relation_of("张三") == "workplace" and scene_of("张三") == "friend"
+    assert scene_text("张三") == rel.TEXTS["friend"], "挑了场景就用那一型的正文"
+    assert relation_of("李四") == "friend", "认不出的键要退回默认，不能是个没名字的型"
+    assert relation_of("王五") == "friend" and scene_of("王五") == ""
+    assert _load_all()["pet_pos"] == [11, 22]
+    save_chat_scene("张三", "")  # 空串 = 回到「跟随关系」
+    assert scene_of("张三") == "" and scene_text("张三") == rel.TEXTS["workplace"]
+    save_chat_relation("张三", "")
+    assert relation_of("张三") == "friend"
+
+    # 设置页整份提交：自建关系的名字/正文、默认关系、每个会话的选择都得在
+    save_chat_relation("张三", "r1")
+    save(10, relation_model={"default": "r1", "texts": {"friend": "我改的朋友"},
+                             "customs": [{"key": "r1", "name": "前女友", "text": "别提复合"}],
+                             "chats": _load_all()["relations"]["chats"]})
+    assert relation_of("张三") == "r1" and relation_name("r1") == "前女友"
+    assert scene_text("张三") == "别提复合"
+    assert relation_of("李四") == "r1", "默认关系换了，没指定过的会话跟着换"
+    assert relation_text("friend") == "我改的朋友"
+
+    # 聊天记录开关：源码跑默认开、打包版默认关；拨过之后按存的来
+    assert chatlog() is True, "自测是源码跑，默认该是开的"
+    save(10, chatlog_on=False)
+    assert chatlog() is False and _load_all()["chatlog"] is False
+    save(10, chatlog_on=True)
+    assert chatlog() is True
+    assert chatlog_db().endswith("chatlog.db") and chatlog_db() != history_db(), "两个库别用同一个文件"
+    print("settings ok")

@@ -39,8 +39,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     judge_path: 判断走第三方中转时，那个口在中转上的路径（各家叫法不同，见 core/relay.py）。
     thinking_style: 中转认哪种思考开关（thinking / reasoning / none），只影响起草。
     reply_to: 群聊里指定回复给谁；None = 正常回复。
-    scene: 这次要追加的场景正文（设置里选的场景模板，或用户改过的版本），只影响起草——
-    Jev 判的是意图和紧张度，跟措辞无关。
+    scene: 这次说话的口气那段正文（这个会话那种关系的，或场景模板临时换的那一型），只影响
+    起草——Jev 判的是意图和紧张度，跟措辞无关。
     thinking: 起草时是否开思考模式，只影响起草，默认关。
     model / jev_model = None 用该来源的默认模型。
 
