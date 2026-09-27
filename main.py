@@ -466,9 +466,12 @@ def start_analyze(title, msgs, trigger="对方来新消息"):
 
 
 def start_opener(title, manual=False):
-    """起草一批开场白（tick 到点自动点火，或者用户点了「换一批」）。
+    """起草一批开场白（tick 到点自动点火，或者用户点了「换一批」/宠物菜单里的「生成开场白」）。
 
-    跟 start_analyze 分开是因为它会问的东西不一样：只起草、不问 Jev，所以只要起草那把 key。"""
+    跟 start_analyze 分开是因为它会问的东西不一样：只起草、不问 Jev，所以只要起草那把 key。
+
+    上下文为空也照起草（刚加上的好友、对方只发过表情/图片，屏幕上一条文字都没有）：那会儿
+    没有「上次」可接，要的就是一句先开口的招呼。waited 给 0，界面据此不摆「对方 N 分钟没回」。"""
     if not manual and not settings.opener():
         return
     if state["busy"]:
@@ -479,12 +482,11 @@ def start_opener(title, manual=False):
         return
     chat = chat_of(title)
     msgs = list(chat["history"])
-    if not msgs:
-        ov.set_status("这个会话还没读到可用的上下文，等它再读几帧", "warning")
-        return
-    # 「对方 N 分钟没回」按计时起算那会儿算；没计过时（手动换一批）就用设置里那个数
-    waited = (max(1, int(round((time.monotonic() - chat["nudge_at"]) / 60))) if chat["nudge_at"]
-              else settings.opener_minutes())
+    # 「对方 N 分钟没回」按计时起算那会儿算；没计过时（手动换一批）就用设置里那个数。
+    # 空会话给 0：这个会话压根没聊过，说「对方几分钟没回」是编的
+    waited = 0 if not msgs else (
+        max(1, int(round((time.monotonic() - chat["nudge_at"]) / 60))) if chat["nudge_at"]
+        else settings.opener_minutes())
     chat["nudged"] = True  # 这个冷场的一次机会用掉了
     chat["nudge"] = None
     state["busy"] = True

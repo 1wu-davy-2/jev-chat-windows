@@ -61,7 +61,7 @@ python tools/preview_ui.py --state ready
 python tools/preview_ui.py --state ready --screenshot docs/ui_home.png
 # 可用的 --state：ready / waiting / loading / error / degraded / setup / settings / paused /
 #   debug / ime / ime-thinking / pet / pet-menu / bar / voice / log /
-#   opener / opener-bar / opener-loading / history / pinned
+#   opener / opener-bar / opener-loading / opener-blank / history / pinned
 # （history 会往临时目录写一个演示库，不碰本机那份 history.db）
 
 # 打包（onedir，产物 dist\jev-chat\ 整个文件夹才是成品）
@@ -140,8 +140,20 @@ main.py（父进程，只管界面和网络）
 「对方还没回 + 距你上一条 N 分钟」、角标从「判断/候选」改成「开场白」、生成中那句换成「正在给你
 想一句开场白…」（`_busy_opener`，开场白没有 Jev 判断那一步）、面板洞察卡不摆意图和紧张度、
 多一个「换一批」（`opener_again()` → `start_opener(title, manual=True)`，人在看别的会话时不给换）。
-哪些会话现在摆的是开场白记在 `Overlay._opener`（会话名 → 等了多久），`invalidate_replies()` 里
-要一起清掉，否则新消息来了那个「换一批」还赖着不走。
+哪些会话现在摆的是开场白记在 `Overlay._opener`（会话名 → **(等了多久, 是不是空会话)**），
+`invalidate_replies()` 里要一起清掉，否则新消息来了那个「换一批」还赖着不走。
+
+**空会话的开场白**（`blank`）：刚加的好友、或者对方只发过一个表情/图片——屏幕上一条文字都没有，
+`chat["history"]` 是空的。这种会话**只能手动点**（宠物右键菜单的「生成开场白」，走的就是
+`opener_again()` 那条路）：自动那条得有「我上一条」才起算，空会话连一句话都没有，没有计时起点。
+`start_opener()` 因此**不再**因为 `msgs` 为空而拒绝，改成照起草，只是 `waited` 给 0。
+上下传三处：`engine.analyze_opener()` 返回 `blank = not messages` → 界面读它换说法。为什么要换：
+空会话里「对方 N 分钟没回」是编的（没人被晾着），「接着上次的话」也是编的（没有上次）。
+所以 `draft.draft_openers()` 见 `messages` 为空就换成 `OPENER_BLANK_SYSTEM`（先开口打个招呼，
+别提前面不存在的东西），提示里那三句也跟着换；界面上候选条头上写「还没聊过」、下面写
+「先开口打个招呼」，面板洞察卡写「开场白 · 还没聊过」/「还没聊过，先开口打个招呼」。
+**别把这两套提示合并**：冷场那套的前提是「聊过、我说了最后一句、他没回」，照搬到空会话上，
+模型会去接一段不存在的话（真写出过「上次说的那家店」）。
 
 **AI 记录**（`core/trace.py` + `app/historywin.py`）：每一轮 AI 调用落一行，给流程审计用。
 库是 stdlib `sqlite3` 的**一张宽表** `runs`——不拆表不关联，审计要的是「一眼看完这一轮」，
@@ -191,11 +203,20 @@ join 出来的碎片反而难读；加字段就往 `_COLUMNS` 里加一条，**�
 | 候选条 | `app/overlay.py:_CandidateBar` | 280px，贴宠物上方（放不下翻下方） |
 | 面板 | `app/overlay.py:_MainWindow` | 就是原来那个悬浮窗，默认收起 |
 
-宠物右键菜单（`Overlay._build_pet_menu()`，三项：暂停采集 / 全屏（主页）/ 设置）里，「暂停采集」
-**不是**直接调 `on_toggle_capture`，而是 `captureSwitch.setChecked(...)` 让信号走一遍
-`checkedChanged → _capture_toggled`——直接调回调的话开关自己还停在旧状态，两边就各说各话了。
+宠物右键菜单（`Overlay._build_pet_menu()`，五项：暂停采集 / 全屏（主页）/ 会话模式 / 生成开场白 /
+设置）里，「暂停采集」**不是**直接调 `on_toggle_capture`，而是 `captureSwitch.setChecked(...)`
+让信号走一遍 `checkedChanged → _capture_toggled`——直接调回调的话开关自己还停在旧状态，
+两边就各说各话了。
+
+另两项都只是既有入口的快捷方式，不新增数据流：**会话模式**跟面板里那个按钮是同一个出口
+（`_toggle_pin` → 父进程 `set_pin`），文字也跟它同一个口径——写的是**现在是什么模式**
+（跟随/固定），不是「点完会怎样」，两个界面别写两套说法；**生成开场白**走 `_opener_again`
+（= 面板上那个「换一批」），灰着的时候把原因写在菜单文字里（设置里没开 / 采集已暂停）——
+菜单项不支持 tooltip 那种「悬停才知道为什么」的写法，用户只会看到一条点不动的项。
+
 菜单内容拆在 `_build_pet_menu()` 里而不是塞进 `contextMenuEvent`，是为了 `tools/preview_ui.py
---state pet-menu` 能摆出来截图（`exec()` 是嵌套事件循环，截图回调进不去）。
+--state pet-menu` 能摆出来截图（`exec()` 是嵌套事件循环，截图回调进不去）。菜单每次右键现建，
+所以那两项的亮/灰和文字都是当下的状态。
 
 `phase`（idle/scanning/notify/thinking/ready）是**派生**出来的，不是事件流水账：
 `main.py:phase_now()` 是纯函数，`refresh_phase()` 是唯一写者、唯一调用点是 `tick()` 的出口。

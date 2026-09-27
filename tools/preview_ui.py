@@ -20,7 +20,7 @@ from core import styles
 
 _STATES = ("ready", "waiting", "loading", "error", "degraded", "setup", "settings", "paused",
            "debug", "ime", "ime-thinking", "pet", "pet-menu", "bar", "voice", "log",
-           "opener", "opener-bar", "opener-loading", "history", "pinned")
+           "opener", "opener-bar", "opener-loading", "opener-blank", "history", "pinned")
 
 # 调试视图预览用的真微信截图（只读进内存，不改不存）；没有就退一张空画面
 _FRAME = Path("/private/tmp/claude-501/-Users-lpitiless-Documents-project-wechatjev"
@@ -124,6 +124,12 @@ _OPENER = {
     "judged": False, "ranked": False, "trouble": "",
     "opener": True, "waited": 32,
 }
+# 空会话那批：刚加的好友、对方只发过一个表情，一条文字都没读过。waited=0（没人被晾着）、
+# blank=True（界面说「还没聊过」而不是「对方 N 分钟没回」）
+_OPENER_BLANK = {**_OPENER, "blank": True, "waited": 0,
+                 "candidates": ["嗨，在忙啥呢", "好久没联系了", "最近怎么样"],
+                 "best_reply": "嗨，在忙啥呢"}
+_BLANK_CHAT = "新朋友"  # 演示里那个「一句话都没说过」的会话
 
 # 「AI 记录」页预览用的两条：一条走完全程的回复、一条起草就挂掉的开场白。
 # 形状跟 main.record_run 写进库的一模一样，dict/list 由 core.trace 自己转 JSON。
@@ -204,7 +210,8 @@ def main() -> int:
                      "draft_model": "deepseek-flash",
                      "draft_base_url": "", "reply_target": True,
                      # 冷场开场白：默认关。开着才看得到那一组控件是亮着的
-                     "opener": args.state in ("opener", "opener-bar", "opener-loading", "settings"),
+                     "opener": args.state in ("opener", "opener-bar", "opener-loading",
+                                              "settings", "pet-menu"),
                      "opener_minutes": 30,
                      "history": True,
                      # 「个人风格」页签：选一型、并且有一型是改过的，两种状态都看得到
@@ -321,6 +328,7 @@ def main() -> int:
         elif args.state == "pet-menu":
             # 宠物右键菜单。不能走 _pet_menu()：exec() 是嵌套事件循环，截图回调永远轮不到。
             # 这里只把菜单摆出来（popup 不阻塞），grab 的就是菜单自己。
+            ov.set_chat(_CHAT)  # 有会话「会话模式」那一项才是亮着的
             shot = ov._build_pet_menu()
             shot.popup(ov.pet.mapToGlobal(QPoint(ov.pet.width() // 2, ov.pet.height() // 2)))
         elif args.state == "history":
@@ -400,6 +408,11 @@ def main() -> int:
                 ov.show(_OPENER)
                 ov.set_phase("ready")
                 shot = ov.bar if args.state == "opener-bar" else ov.win
+            elif args.state == "opener-blank":
+                # 空会话的开场白：换到一个没记录过任何消息的会话再摆（刚加的好友那种）
+                ov.set_chat(_BLANK_CHAT)
+                ov.show(_OPENER_BLANK)
+                ov.set_phase("ready")
             elif args.state == "opener-loading":
                 # 正在起草开场白的那几秒：没有候选，但头上那句说的是「对方还没回 N 分钟」，
                 # 不是对方上一条消息（那个自相矛盾过，见 _sync_bar 里的 phase 判断）

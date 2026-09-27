@@ -172,6 +172,9 @@ def analyze_opener(messages: list, relationship: str, model: str | None = None,
     返回值形状跟 analyze() 一样，多一个 opener=True 让界面换一套说法（「对方刚说」→「对方还没回」，
     洞察卡不摆意图和紧张度）。参数含义同 analyze()，只是没有 jev_* 那几项——用不上。
     trace 里也只有起草那半边（没有判断和排序），见 analyze()。
+
+    messages 为空也是合法的（刚加的好友、只发过表情/图片）：这批就是「先开口打个招呼」，
+    返回的 blank=True 让界面别摆「对方 N 分钟没回」——那会儿根本没人被晾着。
     """
     trace: dict = {"messages": list(messages), "relationship": relationship, "context_n": context,
                    "scene": scene, "reply_to": reply_to, "draft_provider": provider,
@@ -203,6 +206,7 @@ def analyze_opener(messages: list, relationship: str, model: str | None = None,
         "ranked": False,
         "trouble": "",
         "opener": True,
+        "blank": not messages,  # 空会话（没有可接的上下文）：界面据此说「还没聊过」而不是「对方没回」
         "trace": trace,
     }
 
@@ -295,4 +299,14 @@ if __name__ == "__main__":
     with patch("__main__.draft_openers", return_value=["在忙吗", "睡了吗"]):
         op = analyze_opener([("me", "刚忙完")], "friends")
     assert "draft_provider" in op["trace"] and "judge_ms" not in op["trace"]
+    assert op["blank"] is False, "有上下文就不是空会话"
+
+    # 空会话的开场白（刚加的好友、只发过表情/图片）：messages 为空也照起草，
+    # blank=True 让界面说「还没聊过」而不是「对方 N 分钟没回」——那会儿没人被晾着
+    with patch("__main__.draft_openers", return_value=["嗨", "在忙啥呢", "好久不见"]) as fake:
+        op = analyze_opener([], "friends")
+    assert fake.call_args[0][0] == [], "空列表原样传下去，别在这儿替换成别的"
+    assert op["blank"] is True and op["candidates"] == ["嗨", "在忙啥呢", "好久不见"]
+    assert op["opener"] is True and op["judged"] is False and op["ranked"] is False
+    assert op["trace"]["messages"] == []
     print("engine ok")

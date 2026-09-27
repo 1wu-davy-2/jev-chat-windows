@@ -477,7 +477,8 @@ class _CandidateBar(QWidget):
                 f"border-radius: {RADIUS_SM}px; padding: 1px 6px; }}"
             )
 
-    def set_items(self, items, suggest, phase, heard="", voice="", opener=False, blocked=False):
+    def set_items(self, items, suggest, phase, heard="", voice="", opener=False, blocked=False,
+                  blank=False):
         """items: [(候选原始下标, 序号, 正文, 百分比或 None, 是否推荐)]；voice 非空 = 这条会话
         有语音消息，这时把「转文字」那一块顶上来，候选行让位。
 
@@ -490,10 +491,13 @@ class _CandidateBar(QWidget):
         blocked 非空 = 候选摆着但填不了（固定着、微信开在别的会话）：底下那句提示不能再说
         「按 Ctrl+1/2/3 填入」，那是句反话。
 
+        blank 非空 = 这批开场白是**空会话**那种（刚加的好友、只有表情）：头上那句不能写
+        「对方还没回」——一句话都没说过，没人被晾着。
+
         候选行、忙碌文案、建议行三者按 phase 互斥（跟设计稿的 CandidateIme 一个口径）：
         只有 ready 才摆候选，其余阶段只显示一句进度说明。这样即便上层忘了清候选，
         也不会出现「一边说正在判断、一边把旧候选摆在那儿」的错乱。"""
-        self.headTitle.setText("对方还没回" if opener else "对方刚说")
+        self.headTitle.setText("还没聊过" if blank else ("对方还没回" if opener else "对方刚说"))
         self.heard.setText(heard or "…")
         self._set_pill(phase, opener)
         ready = phase == "ready" and bool(items)
@@ -1944,14 +1948,17 @@ class Overlay:
         opener = self._phase in ("thinking", "ready") and (self._busy_opener
                                                            or self._shown in self._opener)
         frozen = bool(self._pinned) and self._shown != self._chat  # 固定着，但微信开在别人那儿
+        blank = bool(self._opener.get(self._shown, (0, False))[1])  # 这批开场白是空会话那种
         if frozen:
             # 这一行改成说清楚为什么点不动。「对方刚说 XX」那会儿也不该摆——固定这个会话
             # 这会儿根本没在被读，那句话早就不新鲜了。摆在这儿是因为面板可能收着（宠物形态），
             # 点一下没反应会以为程序卡了；条子只有 280px，这句已经占满了，
             # 全话在面板状态栏里（_offline_note）
             heard = "固定中，切回微信才能填"
+        elif blank:
+            heard = "先开口打个招呼"  # 这个会话一句都还没说过，没有「上一条」可报
         elif self._shown in self._opener:
-            heard = f"距你上一条 {self._opener[self._shown]} 分钟"
+            heard = f"距你上一条 {self._opener[self._shown][0]} 分钟"
         elif self._busy_opener and self._opener_wait:
             heard = f"距你上一条 {self._opener_wait} 分钟"
         else:
@@ -1959,7 +1966,7 @@ class Overlay:
             # 那是别人的话，摆在「对方刚说」的位置上就张冠李戴了
             heard = self.hers.get(self._shown) or ("" if self._pinned else self.hers.get(self._chat)) or ""
         self.bar.set_items(items, self._suggest_text() if items else "", self._phase, heard,
-                           self._voice_text(), opener=opener, blocked=frozen)
+                           self._voice_text(), opener=opener, blocked=frozen, blank=blank)
 
     def set_phase(self, phase):
         """main.py 派生出来的流水线状态。同态重复调用是空操作，否则每 50ms 重放一次会闪。"""
@@ -2011,10 +2018,17 @@ class Overlay:
         self.win.hide()
 
     def _build_pet_menu(self):
-        """宠物右键菜单的内容：暂停采集 / 全屏（主页）/ 设置。
+        """宠物右键菜单的内容：暂停采集 / 全屏（主页）/ 会话模式 / 生成开场白 / 设置。
 
-        三项都只是既有入口的快捷方式，不新增数据流。单独拆成一个方法是为了
-        tools/preview_ui.py 能直接摆出来截图——exec() 是嵌套事件循环，截图回调进不去。"""
+        五项都只是既有入口的快捷方式，不新增数据流。单独拆成一个方法是为了
+        tools/preview_ui.py 能直接摆出来截图——exec() 是嵌套事件循环，截图回调进不去。
+
+        「会话模式」跟面板里那个按钮一个口径：**写的是现在是什么模式**（跟随/固定），点一下换一种，
+        走的是同一个出口（_toggle_pin → 父进程 set_pin）。为什么不在菜单上写「固定会话」这种
+        动词版：那样得先分辨「这是现在的状态还是点完的结果」，两个界面写两套说法更容易乱。
+
+        「生成开场白」按父进程那套前提先灰着：设置里没开冷场开场白、或者采集停着，点了也白花钱
+        （start_opener 里也是这么拦的）。灰着的时候把原因写在菜单上，不然用户只看到一条点不动的项。"""
         menu = RoundMenu(parent=self.pet)
         capturing = self.captureSwitch.isChecked()
         toggle = Action(FIF.PAUSE if capturing else FIF.PLAY,
@@ -2026,6 +2040,21 @@ class Overlay:
         home = Action(FIF.HOME, "全屏（主页）", menu)
         home.triggered.connect(self._show_home)
         menu.addAction(home)
+        mode = Action(FIF.UNPIN if self._pinned else FIF.PIN,
+                      "会话模式：固定" if self._pinned else "会话模式：跟随", menu)
+        mode.setEnabled(bool(self._pinned or self._shown))  # 还没认到会话时没什么可固定的
+        mode.triggered.connect(self._toggle_pin)
+        menu.addAction(mode)
+        if not settings.opener():
+            why = "（设置里没开）"  # 第一件事就是去设置里把那个开关打开，先说这个
+        elif not capturing:
+            why = "（采集已暂停）"
+        else:
+            why = ""
+        hello = Action(FIF.CHAT, "生成开场白" + why, menu)
+        hello.setEnabled(not why)
+        hello.triggered.connect(self._opener_again)
+        menu.addAction(hello)
         prefs = Action(FIF.SETTING, "设置", menu)
         prefs.triggered.connect(self.open_settings)
         menu.addAction(prefs)
@@ -2384,11 +2413,13 @@ class Overlay:
         self._answers = answers
         self._ordered = [(index, scores[index], index == best) for index in order]
         waited = result.get("waited") or 0
+        blank = bool(result.get("blank"))  # 空会话的开场白（刚加的好友、只有表情/图片）
         if opener:
-            self._opener[self._shown] = waited
-            self.contextTitle.setText("上次聊到")  # 摆的是上次那几句，不是刚收到的
-            self.insightTitle.setText(f"开场白 · 对方 {waited} 分钟没回" if waited else "开场白")
-            self.summary.setText("接着上次的话，主动起个头")
+            self._opener[self._shown] = (waited, blank)
+            self.contextTitle.setText("这个会话还没聊过" if blank else "上次聊到")
+            self.insightTitle.setText("开场白 · 还没聊过" if blank else
+                                      (f"开场白 · 对方 {waited} 分钟没回" if waited else "开场白"))
+            self.summary.setText("还没聊过，先开口打个招呼" if blank else "接着上次的话，主动起个头")
             self.intent.hide()  # 七道题一道都没问，这两行没有内容可摆
             self.tension.hide()
             self.againButton.show()
@@ -2419,8 +2450,9 @@ class Overlay:
             self.set_status("判断服务没应答，这三条是按对话直接起草的；点「查看详情」看原因。",
                             "warning")
         elif self.cands and opener:
-            self.set_status(f"对方 {waited} 分钟没回，给你起了个头，挑一句发过去"
-                            if waited else "给你起了个头，挑一句发过去", "success")
+            self.set_status("还没聊过，给你起了个头，挑一句发过去" if blank else
+                            (f"对方 {waited} 分钟没回，给你起了个头，挑一句发过去"
+                             if waited else "给你起了个头，挑一句发过去"), "success")
         elif self.cands:
             self.set_status("建议已更新，选一句适合你的回复", "success")
         else:
