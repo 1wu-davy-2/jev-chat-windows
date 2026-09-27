@@ -314,7 +314,7 @@ class _CandidateBar(QWidget):
     所以背景画在 frame 上、阴影也挂在 frame 上。"""
     _PILL = {"scanning": "OCR", "notify": "提醒", "thinking": "判断", "ready": "候选"}
     _BUSY = {"scanning": "正在截取聊天窗口并 OCR…",
-             "notify": "读到新消息，开始判断",
+             "notify": "读到新消息，等他发完再判断",
              "thinking": "Jev 判断中，正在起草三条回复"}
     _ROWS = 3
 
@@ -993,7 +993,8 @@ class Overlay:
         tabs = QHBoxLayout()
         tabs.setSpacing(GAP_SM)
         self.tabButtons = {}
-        for key, text in (("preference", "回复偏好"), ("models", "模型设置")):
+        for key, text in (("preference", "回复偏好"), ("models", "模型设置"),
+                          ("style", "个人风格")):
             button = QPushButton(text)
             button.setCheckable(True)
             button.setCursor(Qt.PointingHandCursor)
@@ -1095,6 +1096,21 @@ class Overlay:
         ))
         self.preferenceCard = preference
         body.addWidget(preference)
+
+        # 第三页签「个人风格」：里面放什么还没定，先占个位。页签这一排一起摆出来，
+        # 免得后加的时候又得动这一行和 _switch_tab
+        style = _Surface()
+        box = QVBoxLayout(style)
+        box.setContentsMargins(GAP_LG, GAP_LG, GAP_LG, GAP_LG)
+        box.setSpacing(GAP_MD)
+        # 这段说明用 _label 不用 _hint：它是这张卡唯一的内容，而 _hint 在紧凑模式下会被
+        # 整批藏掉，那样就剩一张空卡片，看着像坏了
+        box.addWidget(_label(
+            "这一页先占个位：之后往这儿放你自己的说话习惯——口头禅、常挂嘴边的词、"
+            "怎么称呼对方、标点怎么用。比「回复偏好」里那句「说话风格」更细，只影响起草出来的候选。",
+            FONT_MD, _MUTED))
+        self.styleCard = style
+        body.addWidget(style)
 
         models = _Surface()
         box = QVBoxLayout(models)
@@ -1476,13 +1492,14 @@ class Overlay:
         (self.relationshipBox if configured else self.jev.keyEdit).setFocus()
 
     def _switch_tab(self, key):
-        """设置页的两页签：只切显隐，控件不重建——重建会把用户填了一半的内容弄丢。"""
+        """设置页的页签：只切显隐，控件不重建——重建会把用户填了一半的内容弄丢。"""
         for name, button in self.tabButtons.items():
             active = name == key
             button.setChecked(active)
             button.setStyleSheet(_tab_qss(active))
         self.preferenceCard.setVisible(key == "preference")
         self.modelsCard.setVisible(key == "models")
+        self.styleCard.setVisible(key == "style")
 
     def _back_home(self):
         self.jev.keyEdit.clear()
@@ -1575,6 +1592,17 @@ class Overlay:
         for card in self.cards:
             card.set_available(self._current and not busy)
         self._sync_bar()
+
+    def set_waiting(self):
+        """对方还在发消息（静默窗口里等）：把空态说清楚。
+
+        这会儿既没候选也没在跑分析，空态默认是「等待对方的新消息」——刚收到消息还这么说，
+        看着像没反应。等到真开始判断（set_busy）或者他发完了，文案自然会被换掉。"""
+        if self.cands or self._busy:
+            return
+        self.emptyTitle.setText("对方还在发消息")
+        self.emptyHint.setText("等他不说了再给建议，免得你回到半句上。")
+        self.setupButton.hide()
 
     def _empty_text(self):
         """空态卡片的默认文案，配好没配好两套说法。"""

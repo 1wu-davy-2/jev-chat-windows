@@ -27,7 +27,8 @@ Windows 上挂在微信（4.x，`Weixin.exe`）旁边的回复助手：截自己
 6. **API key 只进环境变量**（`OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `RELAY_API_KEY`，落
    `HKCU\Environment`），任何文件里不出现 key，也绝不进日志——报错文本一律过
    `core/jev_client.py:redact_secrets()`（加新 key 记得把它加进那个元组）。
-7. 静默期零调用：只有对方来了新消息（或群里换了回复对象）才调模型。
+7. 静默期零调用：只有对方来了新消息（或群里换了回复对象）才调模型；而且消息来了还要先过
+   静默窗口（见下），连着发的几条攒成一次问。
 
 ## 常用命令
 
@@ -35,10 +36,11 @@ Windows 上挂在微信（4.x，`Weixin.exe`）旁边的回复助手：截自己
 # 源码运行（首次会弹设置页填 key）
 python main.py
 
-# 内置自测（就这三处，跑完打印 ok）
+# 内置自测（就这四处，跑完打印 ok）
 python core/draft.py        # 候选解析器 + 防注入过滤的断言
 python -m app.update        # 版本号比较，monkeypatch urlopen，不联网
 python app/ocr.py           # 语音消息过滤正则（纯正则，不加载 OCR 引擎）
+python app/capture.py       # 消息区定位：输入框顶那根细横线（合成帧，不截图）
 
 # 端到端冒烟：写死的一段对话跑完整链，需 key + 联网
 set PYTHONPATH=. && python tools/demo.py
@@ -81,6 +83,16 @@ main.py（父进程，只管界面和网络）
 7 道判断题 + 一道「哪条候选最合适」，概率就是卡片上的百分比。`questions.py` 里是固定题目口径，
 跟安卓原版一致。`core/` 里两个模块有 `try: from .x import / except ImportError: from x import`
 的双导入写法，为了既能当包也能当脚本直接跑。
+
+**攒一波再问**（`main.schedule_analyze()`）：对方来消息**不立刻**调模型，而是把静默窗口推到
+`now + 5 + rand(1~5)` 秒之后；窗口到期由 `tick()` 点火——那是唯一动界面的地方。这期间来的消息
+照常记进 `chats[title]["history"]`，到期时现取一次全喂进去，所以连着发的几条是**一次**调用、
+上下文也完整（以前是每条都触发，或者边跑边 `rerun` 再补一次）。语音（`voice`）和表情包/图片
+（`noise`）读不出正文、不进上下文，但同样算「还在说」，有等着的那次就把窗口往后推；没有待办时
+它们不新开一次判断——光一张图没得判断。自己回了话（最新一条是 me）就把待办取消。从第一条消息
+起最多等 `_QUIET_MAX`（30 秒），免得对方一直发就一直不问。等待期间 `notify_until` 一起推到期
+时刻，所以 phase 停在 notify：宠物角标留着、候选条上写着「读到新消息，等他发完再判断」，
+面板空态走 `Overlay.set_waiting()` 那两句（别摆「等待对方的新消息」）。
 
 **两个出网口子都可以改走第三方中转**（`provider="custom"` + `base_url`，地址归一在 `core/relay.py`）：
 起草走 `{root}/v1/chat/completions`（标准口，中转一般都转）；判断走的不是标准口——OpenRouter 官方是
@@ -152,6 +164,7 @@ scrollbar 的 `maximum()` 还是旧值，跟底得 `QTimer.singleShot(0, ...)`�
 | `chat` | `title` | 微信切了会话 |
 | `lines` | `title, [(who, name, text, 语音时长或 "")], rect` | 这一帧新出现的消息；末位只给界面用（并/标「🔊 语音消息 N"」），喂模型的 `history` 里不带它 |
 | `voice` | `title, [(x0,y0,x1,y1,时长,谁)]` | 这一帧认出来的语音气泡，坐标给「转文字」用；谁 = 气泡底色分出来的 me/her |
+| `noise` | `title` | 画面变了却没认出新文字（多半是表情包/图片）：只用来把静默窗口往后推，不进上下文 |
 | `status` / `dead` | `文本` | 单帧失败提示 / 采集彻底停了 |
 | `paused` / `resumed` | — | 子进程确认采集开关状态 |
 
@@ -160,6 +173,9 @@ scrollbar 的 `maximum()` 还是旧值，跟底得 `QTimer.singleShot(0, ...)`�
 - **加/改一个设置项**要同时动四处：`app/settings.py`（读函数 + `save()` 签名 + `config.json` 的键）、
   `app/overlay.py`（`_build_settings()` 建控件、`_load_settings()` 回填、`_save()` 提交）、
   `tools/preview_ui.py` 的 `patch.multiple(...)` 列表（漏了预览就炸）、README 的设置说明表。
+  设置页是**三个页签**（回复偏好 / 模型设置 / 个人风格）：那一排按钮在 `_build_settings()` 的
+  `tabButtons` 循环里、卡片显隐在 `_switch_tab()` 里，加一页要两处一起加。第三页「个人风格」
+  现在只是一张占位卡（里面放什么还没定），截图用 `tools/preview_ui.py --state settings --tab style`。
 - **候选的「显示位置」和「原始下标」是两回事**，别混。候选条和面板都按推荐顺序重排过
   （`_ordered` 里存的就是「位置 → (原始下标, 概率, 是否推荐)」），界面上看到的「1/2/3」是位置，
   只有推荐那条本来就排第一时才跟 `cands` 的下标重合。所以：`_fill()` / `_copy()` 收的、
@@ -240,7 +256,14 @@ scrollbar 的 `maximum()` 还是旧值，跟底得 `QTimer.singleShot(0, ...)`�
   `_bubble_extent()` 扫出来的**整个气泡**范围。实测 her：药丸中心在气泡右边 +48px、纵向和气泡中心
   齐平（me 镜像到左边）。`_bubble_extent` 横向必须扫**文字框上方**那一行——扫文字框正中会被字本身
   打断，量出来只有 11px 宽（正好是数字那一小截），这个坑踩过。
-- **`chat_area()` 靠「面板 45% 高度以下第一根分隔线」找输入框顶**：输入框拉高超过面板一半会认错。
+- **`chat_area()` 找输入框顶靠的是「细横线」，不是「整行同色」**（`capture._thin_lines()`：
+  整行非底色 >75% + 非底色像素基本同色 + 厚度 ≤4px）。微信 4.x 的输入框画的是**圆角框**，
+  左右两头留着面板底色，整行是混色的 → 老判据（`std < 4`）漏判，`y_in` 一路退到面板底，
+  裁剪把输入框连底下那条工具栏一起吃了进去。工具栏最左那个笑脸图标 OCR 出来正好是「?」
+  （众数占比 0.41，离「当图片丢掉」的 0.45 就差一点），于是被当成对方发来的消息，
+  白触发一次判断——真机上报上来的就是这条「对方刚说 ?」。输入框非空时还会多报一条绿色的
+  「发送」（绿底 → 分类成 me，进 history）。改判据先跑 `python app/capture.py`（合成帧，不用截图）。
+- **输入框拉高超过面板一半会认错**：上面那条 45% 的线。
 - **PyInstaller 用 onedir**（`jev.spec`）：onefile 有 ~150MB 每次启动都要解压。
   `console=False`，所以 exe 里的 `print` 是看不到的，状态都走界面。
 - `app/settings.py` 读 key 时先看进程环境、没有再读注册表：IDE 启动时把环境快照拿走了，

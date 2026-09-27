@@ -114,6 +114,8 @@ def main() -> int:
     )
     parser.add_argument("--state", choices=_STATES, default="ready", help="预览界面状态")
     parser.add_argument("--screenshot", metavar="PATH", help="将演示界面保存为 PNG 后退出（合成数据，不含微信内容）")
+    parser.add_argument("--tab", choices=("preference", "models", "style"),
+                        help="设置页停在哪个页签（配合 --state settings）")
     parser.add_argument("--relay", action="store_true",
                         help="演示第三方中转那组字段（地址 / 判断接口路径 / 思考开关的传法）")
     args = parser.parse_args()
@@ -259,6 +261,8 @@ def main() -> int:
                 ov.set_status("演示模式：分析失败，请检查网络和密钥，等待下一条消息后重试。", kind="error")
             elif args.state == "settings":
                 ov.open_settings()
+                if args.tab:
+                    ov._switch_tab(args.tab)
             elif args.state == "paused":
                 ov.set_capture(False)
             elif args.state == "log":

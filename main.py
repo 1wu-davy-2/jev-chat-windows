@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """父进程：只管界面。截图 + OCR 在 app/worker.py 的子进程里跑，队列里收新消息 →
-冒出新的对方消息才调 engine → 悬浮窗给 3 条候选 → 人点「填入」。发送永远手动。静默期零调用。
+对方来了消息、且安静 5+1~5 秒没再发，才调一次 engine → 悬浮窗给 3 条候选 → 人点「填入」。
+发送永远手动。静默期零调用。
 上下文、结果、聊天记录都按会话名（子进程 OCR 头部标题得来）分开存，切会话不串味。
 
     pip install rapidocr-onnxruntime numpy windows-capture PySide6-Fluent-Widgets
@@ -9,6 +10,7 @@
 import ctypes
 import multiprocessing
 import queue
+import random
 import re
 import threading
 import time
@@ -31,10 +33,16 @@ chats = {}
 # phase 是派生出来的流水线状态（宠物换姿势、候选条显隐都看它），notify_until 是「刚来新消息」
 # 那一下的截止时刻——用时间戳而不是布尔量，省得还要找地方把它清掉
 state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "",
-         "phase": "idle", "notify_until": 0.0, "voice": None}
+         "phase": "idle", "notify_until": 0.0, "voice": None, "pending": None}
 _NOTIFY_HOLD = 0.9  # 新消息到了先闪这么久「提醒」，再进判断
 _VOICE_WINDOW = 20.0  # 点了「转文字」之后，子进程认「语音气泡下面的新文字」的窗口（秒）
 _HISTORY_DUP = 24  # 判重时往回看这么多条（一屏大概也就十来条）
+# 静默窗口：对方最后一条消息之后再等 5 + rand(1~5) 秒才问模型。连着发的几条（还有表情包、
+# 语音这种读不出正文的）都算「还在说」，把窗口往后推；攒够一次问完，不然每条问一次既费钱，
+# 判断看到的还是半句话。从第一条消息起最多等 _QUIET_MAX，免得对方一直发就一直不问。
+_QUIET_MIN = 5.0
+_QUIET_JITTER = 5.0
+_QUIET_MAX = 30.0
 results = queue.Queue()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
 
@@ -59,6 +67,21 @@ def _voice_label(dur):
     界面上别照搬，并语音那条也要靠这个字串对上号。认不出数字就原样返回。"""
     digits = re.sub(r"\D", "", dur or "")
     return f'{digits}"' if digits else (dur or "")
+
+
+def schedule_analyze(title):
+    """对方来了消息：先别问，把静默窗口往后推，等他不说了再问。
+
+    等多久是随机的（5 + rand(1~5) 秒）：固定间隔会让「对方发完」和「我们开口」卡在同一个
+    节拍上，看着像抢话。窗口到期由 tick() 去点火——那是唯一会动界面的地方。
+    notify_until 一起推到那个时刻，这样等着的这几秒宠物保持「有新消息」的样子（角标在），
+    而不是先闪一下再回到静息态。"""
+    now = time.monotonic()
+    pending = state["pending"]
+    first = pending[2] if pending and pending[0] == title else now
+    deadline = min(now + _QUIET_MIN + random.uniform(1.0, _QUIET_JITTER), first + _QUIET_MAX)
+    state["pending"] = (title, deadline, first)
+    state["notify_until"] = deadline
 
 
 def target_of(title):
@@ -203,6 +226,7 @@ def on_target_change(title, name):
     """用户挑了回复对象：记下来，这个会话里有对方的话就照新对象重跑一次。"""
     chat = chat_of(title)
     chat["target"] = name
+    state["pending"] = None  # 用户自己点的重跑，立刻跑，不等静默窗口
     msgs = list(chat["history"])
     if not any(m[0] == "her" for m in msgs):
         return
@@ -247,7 +271,18 @@ def drain():
                 # 不进喂模型的那份 history——「🔊 语音消息 3"」对模型是噪音）。
                 # 谁发的按气泡底色走：自己发的语音别挂到对方头上
                 ov.log_message(items[-1][5], f"🔊 语音消息 {_voice_label(items[-1][4])}", chat=title)
-                state["notify_until"] = time.monotonic() + _NOTIFY_HOLD
+                # 语音也是「对方还在说」：有等着的那次就把静默窗口往后推。没有就不新开一次
+                # 判断——光一条语音没正文，问了也没得判断，等他自己转文字或者接着说
+                if state["pending"] and state["pending"][0] == title:
+                    schedule_analyze(title)
+                else:
+                    state["notify_until"] = time.monotonic() + _NOTIFY_HOLD
+            continue
+        if kind == "noise":  # 画面变了、却没认出新文字：多半是对方发了表情包/图片
+            # 图片读不出正文，进不了上下文（对模型是噪音，也不该喂），但它说明对方还在发。
+            # 有等着的那次就把窗口往后推，别在他还在发图的时候插嘴
+            if state["pending"] and state["pending"][0] == msg[1]:
+                schedule_analyze(msg[1])
             continue
         if kind == "paused":  # 子进程确认已暂停
             ov.set_capture(False)
@@ -259,7 +294,8 @@ def drain():
             state["area"] = None
             for c in chats.values():  # 在跑的分析作废，回来的结果不再往界面上贴
                 c["rev"] += 1
-            state["rerun"] = None
+            state["rerun"] = state["pending"] = None
+            state["notify_until"] = 0.0
             ov.invalidate_replies()
             ov.set_busy(False)
             ov.set_capture(False, msg[1])
@@ -292,14 +328,12 @@ def drain():
         if not newest:
             continue  # 补记的是中间那条，流水线按屏幕最底下那条走，别动它
         if new[-1][0] == "her":  # 只有对方最新说话才值得分析
-            state["notify_until"] = time.monotonic() + _NOTIFY_HOLD  # 宠物先换个姿势提醒一下
-            msgs = list(chat["history"])
-            if state["busy"]:
-                state["rerun"] = (title, msgs)
-                ov.set_busy(True)
-            else:
-                start_analyze(title, msgs)
+            schedule_analyze(title)  # 不立刻问：等他不说了再问（见 schedule_analyze）
+            ov.set_status("对方刚发来消息，等他发完再给建议", "busy")
+            ov.set_waiting()
         else:
+            state["pending"] = None  # 自己回了话，等着的那次就不用问了
+            state["notify_until"] = 0.0  # 提醒一起收掉：自己回的话，不用再「有新消息」的样子
             state["rerun"] = None
             ov.set_busy(False)
             ov.set_status("你已回复，等待对方的新消息")
@@ -341,7 +375,7 @@ def tick():
         while not results.empty():
             kind, r, title, revision = results.get()
             state["busy"] = False
-            if state["rerun"]:  # 分析期间又来了新消息，接着跑最新的
+            if state["rerun"]:  # 分析期间用户又挑了回复对象，接着跑他挑的那份
                 (t, msgs), state["rerun"] = state["rerun"], None
                 start_analyze(t, msgs)
                 continue
@@ -358,6 +392,12 @@ def tick():
                 ov.set_busy(False)
                 ov.set_status("生成失败，请检查网络和服务设置；新消息到来后会重试。", "error")
                 ov.log(r)
+        # 静默窗口到了才真去问。这期间攒下的消息早就在 history 里了（drain 一收到就记），
+        # 所以这里现取一次，连着发的几条一起喂进去
+        pending = state["pending"]
+        if pending and not state["busy"] and time.monotonic() >= pending[1]:
+            state["pending"] = None
+            start_analyze(pending[0], list(chat_of(pending[0])["history"]))
         refresh_phase()
     except Exception:
         traceback.print_exc()  # 一帧出错不退出

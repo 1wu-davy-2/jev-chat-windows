@@ -52,12 +52,41 @@ def unminimize(hwnd):
     return True
 
 
+def _thin_lines(full, bg, x0, x1, y0, y1):
+    """面板里那几根**细横线**的 y 坐标（头部下面一根、输入框顶一根）。
+
+    判据：整行几乎都不是底色（<25%）+ 非底色像素基本同一种颜色 + 厚度 ≤4px。
+    不能要求「整行同色」——微信 4.x 的输入框画的是个圆角框，左右两头留出面板底色，
+    混进来整行的 std 就上去了。真机上就是这么漏判的：y_in 一路退到面板底，裁剪把
+    输入框连底下那条工具栏一起吃了进去，工具栏最左那个笑脸图标被 OCR 读成「?」、
+    还当成对方发来的消息，白触发一次判断（输入框非空时还会多报一条绿色的「发送」）。
+    厚度那道是给窗口底边/阴影那种厚块用的：线是细的，厚块不是。"""
+    band = full[y0:y1, x0:x1].astype(int)
+    ink = np.abs(band - bg).sum(-1) > 6  # 这一行里哪些像素不是底色
+    cnt = ink.sum(1)
+    mean = (band * ink[..., None]).sum(1) / np.maximum(cnt, 1)[:, None]  # 非底色像素的均值色
+    near = ((np.abs(band - mean[:, None, :]).max(-1) <= 12) | ~ink).sum(1) / np.maximum(cnt, 1)
+    thin = (cnt > 0) & (1.0 - cnt / max(1, x1 - x0) < 0.25) & (near > 0.9)
+    lines, i = [], 0
+    while i < len(thin):
+        if not thin[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(thin) and thin[j + 1]:
+            j += 1
+        if j - i + 1 <= 4:
+            lines.append(y0 + i)
+        i = j + 1
+    return lines
+
+
 def chat_area(full, header_h=60):
     """消息列表区 (x0, y_top, x1, y_in, 面板底色, y_pane)，全靠像素锚点，不写死坐标，深浅主题通用：
     - 面板底色 = 右半边最常见的颜色（抽样算，全量 np.unique 在 2560 宽的图上要半秒）
     - 面板左/右边界 = 第一/最后一根「底色占比 > 30%」的列（联系人列表是另一种底色，占比 0）
     - y_pane = 面板第一行；会话名就印在 y_pane~y_top 这条头部里（公告条也在里面）
-    - 横向分隔线 = 整行单色且非底色；输入框顶 y_in = 面板 45% 高度以下第一根；
+    - 横向分隔线 = 细横线（见 _thin_lines）；输入框顶 y_in = 面板 45% 高度以下第一根；
       公告条下面那根（有的话）= 消息区顶 y_top，没有就用 header_h
     认不出（窗口太小 / 拖到一半布局没铺好）返回 None。
     ponytail: 输入框拉高超过面板一半会认错；header_h 按 100% DPI 给的，缩放了按比例调。"""
@@ -72,9 +101,7 @@ def chat_area(full, header_h=60):
     row = isbg[:, x0:x1].mean(1)
     y0 = int(np.argmax(row > 0.9))
     y1 = H - int(np.argmax(row[::-1] > 0.9))
-    band = full[y0:y1, x0:x1].astype(int)
-    seps = y0 + np.where((band.std(axis=(1, 2)) < 4) & (row[y0:y1] < 0.1))[0]
-    seps = [int(s) for i, s in enumerate(seps) if i == 0 or s - seps[i - 1] > 3]
+    seps = _thin_lines(full, bg, x0, x1, y0, y1)
     below = [s for s in seps if s > y0 + 0.45 * (y1 - y0)]
     y_in = below[0] if below else y1
     above = [s for s in seps if y0 + header_h < s < y_in - 50]
@@ -141,3 +168,20 @@ class Capture:
 
     def wait(self):
         self.ctl.wait()  # 采集线程若是报错死的，这里把错误抛出来
+
+
+if __name__ == "__main__":
+    # 合成一帧试 chat_area：面板底色 250，头部下面一根分隔线，一条消息气泡，
+    # 输入框顶画成**圆角框的横边**（两头各留 20px 底色，跟微信 4.x 一样）。
+    # 老判据「整行同色」在这儿认不出它，y_in 会退到面板底（400），裁剪把底下那条
+    # 工具栏一起吃进去——真机上就是这么冒出一条「?」的假消息的。
+    frame = np.full((400, 300, 3), 250, np.uint8)
+    frame[70, :] = 200            # 头部下面那根分隔线
+    frame[120:150, 30:180] = 232  # 一条消息气泡（横不满一行，不算分隔线）
+    frame[300, 20:280] = 200      # 输入框顶
+    frame[330:350, 30:60] = 90    # 工具栏图标（真机上会被 OCR 读成「?」）
+    area = chat_area(frame)
+    assert area is not None, "这帧不该认不出来"
+    assert area[3] == 300, f"输入框顶该是 300，认成了 {area[3]}"
+    assert area[1] == 70, f"消息区顶该是 70，认成了 {area[1]}"
+    print("capture.chat_area ok")

@@ -11,6 +11,9 @@ import numpy as np
 from app.capture import Capture, chat_area, unminimize
 from app.ocr import Reader, read_title, similar
 
+_TAIL_H = 150  # 「画面变了却没认出新文字」看的是消息区最底下这么高一条
+_TAIL_DIFF = 0.08  # 变了这么多才算对方发了东西，鼠标划过高亮那点变化不算
+
 
 def _err(q):
     """异常压成一行发给父进程，子进程的 stderr 一般没人看得见。"""
@@ -45,6 +48,7 @@ def run(q, hwnd, enabled, debug_on, voice_until=None):
     last_area = None  # 上次发给父进程的 4 元组，变了才再发一次
     last_voice = None  # 上次发过去的语音气泡，变了才再发（拖动/滚动时位置一直在变，别每帧刷）
     warned = False  # 消息区识别失败是否已经报过，拖窗口时别每帧刷一条
+    tail = None  # 上一帧消息区最底下那条，用来认「画面变了却没认出新文字」
     while True:
         if not enabled.is_set():
             if cap is not None:
@@ -91,14 +95,25 @@ def run(q, hwnd, enabled, debug_on, voice_until=None):
                         name = name or title or "当前会话"
                         if name != title:
                             title = name
+                            tail = None  # 换了会话，底下那条没有可比性了
                             q.put(("chat", title))
                     reader = readers.setdefault(title, Reader())
                     lines = reader.read(full[y0:y1, x0:x1], bg)
+                    # 帧是「画面变了」才交上来的，可变完却没认出新文字——多半是对方发了
+                    # 表情包/图片（OCR 读不出正文），也可能是鼠标划过高亮。父进程拿它把静默
+                    # 窗口往后推：对方还在发，这会儿问出来的是半句话。只看最底下那一条、
+                    # 还要变化够大，鼠标悬停那点小高亮推不动它。比完就更新，跟认没认出新文字无关
+                    bottom = full[max(y0, y1 - _TAIL_H):y1, x0:x1]
+                    moved = (tail is not None and tail.shape == bottom.shape
+                             and (bottom != tail).mean() > _TAIL_DIFF)
+                    tail = bottom.copy()
                     # 只有刚点过「转文字」那一小会儿，才认插在语音气泡下面的新文字
                     converting = voice_until is not None and time.monotonic() < voice_until.value
                     new = reader.new_lines(lines, under_voice=converting)
                     if new:
                         q.put(("lines", title, new, rect))
+                    elif moved:
+                        q.put(("noise", title))
                     # 语音气泡：Reader 那边按坐标裁剪过，这里加回裁剪原点，父进程才好换算成屏幕坐标。
                     # 只发**还没转过文字**的（last_voice_open）——转过的就别再提示「转文字」了
                     voice = tuple((x0 + a, y0 + b, x0 + c, y0 + d, t, k)
