@@ -340,9 +340,12 @@ class _CandidateBar(QWidget):
     顶层窗口开了透明之后 QSS 背景不会被绘制（跟 _MainWindow 是同一个坑），
     所以背景画在 frame 上、阴影也挂在 frame 上。"""
     _PILL = {"scanning": "OCR", "notify": "提醒", "thinking": "判断", "ready": "候选"}
+    # 开场白那一套：没有「对方刚说」，也没有 Jev 判断那一步，说辞得跟着换
+    _OPENER_PILL = {"thinking": "开场白", "ready": "开场白"}
     _BUSY = {"scanning": "正在截取聊天窗口并 OCR…",
              "notify": "读到新消息，等他发完再判断",
              "thinking": "Jev 判断中，正在起草三条回复"}
+    _OPENER_BUSY = "正在给你想一句开场白…"
     _ROWS = 3
 
     def __init__(self, owner, parent=None):
@@ -383,7 +386,9 @@ class _CandidateBar(QWidget):
         head_col = QVBoxLayout()
         head_col.setContentsMargins(0, 0, 0, 0)
         head_col.setSpacing(1)
-        head_col.addWidget(_label("对方刚说", FONT_XS, _MUTED))
+        # 开场白时这句得改成「对方还没回」，见 set_items——摆「对方刚说」就张冠李戴了
+        self.headTitle = _label("对方刚说", FONT_XS, _MUTED)
+        head_col.addWidget(self.headTitle)
         self.heard = _label("…", FONT_MD, theme.INK, True)
         self.heard.setWordWrap(False)
         head_col.addWidget(self.heard)
@@ -432,6 +437,16 @@ class _CandidateBar(QWidget):
         foot_row = QHBoxLayout(self.foot)
         foot_row.setContentsMargins(GAP_XS, GAP_XS, GAP_XS, 0)
         foot_row.addWidget(_label("按 Ctrl+1/2/3 填入", FONT_XS, _MUTED), 1)
+        self.againButton = QPushButton("换一批")
+        self.againButton.setFlat(True)
+        self.againButton.setCursor(Qt.PointingHandCursor)
+        self.againButton.setToolTip("对这次冷场重新起草三条开场白")
+        self.againButton.setStyleSheet(
+            f"QPushButton {{ color: {theme.SAGE}; background: transparent; border: none; }}"
+        )
+        self.againButton.clicked.connect(owner._opener_again)
+        self.againButton.hide()
+        foot_row.addWidget(self.againButton, 0, Qt.AlignRight)
         expand = QPushButton("展开面板")
         expand.setFlat(True)
         expand.setCursor(Qt.PointingHandCursor)
@@ -451,8 +466,8 @@ class _CandidateBar(QWidget):
         self.owner._schedule_bar_hide()
         super().leaveEvent(event)
 
-    def _set_pill(self, phase):
-        text = self._PILL.get(phase, "")
+    def _set_pill(self, phase, opener=False):
+        text = (self._OPENER_PILL if opener else self._PILL).get(phase) or self._PILL.get(phase, "")
         self.pill.setText(text)
         self.pill.setVisible(bool(text))
         if text:
@@ -461,17 +476,22 @@ class _CandidateBar(QWidget):
                 f"border-radius: {RADIUS_SM}px; padding: 1px 6px; }}"
             )
 
-    def set_items(self, items, suggest, phase, heard="", voice=""):
+    def set_items(self, items, suggest, phase, heard="", voice="", opener=False):
         """items: [(候选原始下标, 序号, 正文, 百分比或 None, 是否推荐)]；voice 非空 = 这条会话
         有语音消息，这时把「转文字」那一块顶上来，候选行让位。
 
         下标要带着走：行是按显示位置摆的，但点下去填的必须是那条候选本身。
 
+        opener 非空 = 现在摆的是冷场开场白（正在起草或已经摆出来）：标题那句从「对方刚说」改成
+        「对方还没回」、角标改成「开场白」、生成中那句话也不用「Jev 判断中」（根本没那一步）、
+        底下多一个「换一批」。
+
         候选行、忙碌文案、建议行三者按 phase 互斥（跟设计稿的 CandidateIme 一个口径）：
         只有 ready 才摆候选，其余阶段只显示一句进度说明。这样即便上层忘了清候选，
         也不会出现「一边说正在判断、一边把旧候选摆在那儿」的错乱。"""
+        self.headTitle.setText("对方还没回" if opener else "对方刚说")
         self.heard.setText(heard or "…")
-        self._set_pill(phase)
+        self._set_pill(phase, opener)
         ready = phase == "ready" and bool(items)
         self.voiceLabel.setText(voice)
         self.voice.setVisible(bool(voice))
@@ -486,12 +506,13 @@ class _CandidateBar(QWidget):
                 row.hide()
             self.adjustSize()
             return
-        busy = self._BUSY.get(phase)
+        busy = self._OPENER_BUSY if opener else self._BUSY.get(phase)
         self.hint.setText(busy or "")
         self.hint.setVisible(bool(busy) and not ready)
         self.suggest.setText(suggest or "")
         self.suggest.setVisible(ready and bool(suggest))
         self.foot.setVisible(ready)
+        self.againButton.setVisible(ready and opener)
         for i, row in enumerate(self.rows):
             if ready and i < len(items):
                 index, number, text, score, recommended = items[i]
@@ -704,11 +725,14 @@ class _ChatLog(QWidget):
 
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
-                 on_toggle_debug=None, on_voice_convert=None):
+                 on_toggle_debug=None, on_voice_convert=None, on_opener_again=None,
+                 on_settings_saved=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。
-        on_voice_convert() → 用户点了「转文字」，返回 "" 或一句给用户看的失败原因。"""
+        on_voice_convert() → 用户点了「转文字」，返回 "" 或一句给用户看的失败原因。
+        on_opener_again() → 用户点了「换一批」，要重新起草一批开场白。
+        on_settings_saved() → 设置存盘了，父进程有些「按新设置现算一次」的事要做。"""
         self.app = QApplication.instance() or QApplication([])
         self.app.setWindowIcon(_app_icon())
         setTheme(Theme.LIGHT)
@@ -718,11 +742,16 @@ class Overlay:
         self.on_target_change = on_target_change
         self.on_toggle_debug = on_toggle_debug
         self.on_voice_convert = on_voice_convert
+        self.on_opener_again = on_opener_again
+        self.on_settings_saved = on_settings_saved
         self.result_of = result_of
         self._voices = {}  # {会话名: [(x0,y0,x1,y1,时长)]}，语音气泡的位置，转文字要右键它
+        self._opener = {}  # {会话名: 对方多少分钟没回}，现在摆的是开场白（不是回复）的会话
         self.cands = []
         self.cards = []
         self._busy = False
+        self._busy_opener = False  # 正在跑的那次是开场白：生成中那句话别照抄「Jev 判断中」
+        self._opener_wait = 0  # 上面那次等了多久（生成期间头上的时间靠它）
         self._current = False
         self._compact = None  # 断点模式：None 保证 _relayout 第一次调用必定生效
         self._pageLayouts = []
@@ -949,7 +978,9 @@ class Overlay:
         context_box = QVBoxLayout(self.context)
         context_box.setContentsMargins(0, 0, 0, 0)
         context_box.setSpacing(GAP_XS)
-        context_box.addWidget(_label("对方最近说", FONT_XS, _MUTED))
+        # 开场白下这里摆的是「上次聊到哪儿」而不是刚收到的话，见 show()
+        self.contextTitle = _label("对方最近说", FONT_XS, _MUTED)
+        context_box.addWidget(self.contextTitle)
         self.latest = _label("", FONT_MD, theme.INK)
         self.latest.setTextInteractionFlags(Qt.TextSelectableByMouse)
         context_box.addWidget(self.latest)
@@ -971,6 +1002,16 @@ class Overlay:
         insight_box.addWidget(self.summary)
         self.intent = _label("", FONT_XS, _MUTED)
         insight_box.addWidget(self.intent)
+        # 开场白才有的「换一批」（三条都不满意时重新起草）。跟面板底部那个「保存设置」不是一回事，
+        # 所以只在摆开场白时露出来——那时候洞察卡里既没有意图也没有紧张度可看。
+        again_row = QHBoxLayout()
+        again_row.addStretch(1)
+        self.againButton = PushButton("换一批")
+        self.againButton.setToolTip("对这次冷场重新起草三条开场白")
+        self.againButton.clicked.connect(self._opener_again)
+        self.againButton.hide()
+        again_row.addWidget(self.againButton)
+        insight_box.addLayout(again_row)
         self.insight.setToolTip("根据当前聊天片段推测，可能理解有偏差。紧张度为 0–9 的参考评分。")
         self.insight.hide()
         body.addWidget(self.insight)
@@ -1086,6 +1127,29 @@ class Overlay:
         box.addLayout(target_row)
         box.addWidget(self._hint(
             "开了以后群聊里可以选回复给谁，候选会针对 TA 写，填入时可带 @。关了就正常回复。"
+        ))
+        opener_row = QHBoxLayout()
+        opener_row.addWidget(_label("冷场时起草开场白", FONT_MD), 1)
+        self.openerSwitch = SwitchButton()
+        self.openerSwitch.setOnText("开")
+        self.openerSwitch.setOffText("关")
+        self.openerSwitch.setAccessibleName("冷场时起草开场白")
+        self.openerSwitch.checkedChanged.connect(self._opener_toggled)
+        opener_row.addWidget(self.openerSwitch)
+        box.addLayout(opener_row)
+        wait_row = QHBoxLayout()
+        wait_row.addWidget(_label("等多久算冷场", FONT_MD), 1)
+        self.openerBox = SpinBox()
+        self.openerBox.setRange(1, 720)
+        self.openerBox.setSuffix(" 分钟")
+        self.openerBox.setLocale(QLocale.c())  # 同「参考上下文」：不钉 C locale 会显示成杭州码子
+        self.openerBox.setAccessibleName("等多少分钟算冷场")
+        wait_row.addWidget(self.openerBox)
+        box.addLayout(wait_row)
+        box.addWidget(self._hint(
+            "最后一句是你说的、对方一直没回：等这么久就起草 3 条开场白接上话，"
+            "没什么可接的就现编一个由头。每个冷场只自动出一次，对方回了话才算下一个冷场；"
+            "不满意可以点「换一批」。关着就完全不管，一次都不调模型。"
         ))
         update_row = QHBoxLayout()
         update_row.addWidget(_label("启动时检查更新", FONT_MD), 1)
@@ -1430,6 +1494,9 @@ class Overlay:
         self._preset_type_changed()  # 索引没变时上面不发信号，框得自己刷一次
         self.contextBox.setValue(settings.context())
         self.targetSwitch.setChecked(settings.reply_target())
+        self.openerBox.setValue(settings.opener_minutes())
+        self.openerSwitch.setChecked(settings.opener())
+        self._opener_toggled(self.openerSwitch.isChecked())  # 值没变时上面不发信号，灰显自己补一次
         self._set_group(self.jev, settings.jev_provider(), settings.jev_model())
         self._set_group(self.draft, settings.draft_provider(), settings.draft_model())
         self.baseEdit.setText(settings.draft_base_url())
@@ -1494,6 +1561,8 @@ class Overlay:
                           relay_thinking_style_text=_THINK_STYLE_ORDER[
                               max(0, self.thinkStyleBox.currentIndex())],
                           reply_target_on=self.targetSwitch.isChecked(),
+                          opener_on=self.openerSwitch.isChecked(),
+                          opener_minutes_n=self.openerBox.value(),
                           style_preset_text=self._preset_key(),
                           style_texts_dict=self._preset_dirty(),
                           thinking_on=self.thinkingSwitch.isChecked(),
@@ -1506,6 +1575,8 @@ class Overlay:
         self._render_targets()  # 开关刚改过，回到首页时这一行该显该藏得重算一次
         self._settings_feedback("设置已保存，将用于下一次回复。")
         self.setupButton.hide()
+        if self.on_settings_saved:
+            self.on_settings_saved()  # 有些设置要拿眼前的聊天记录现算一次（见 main.on_settings_saved）
         if not self.cands and not self._busy:
             self._empty_text()
             self.set_status("设置已就绪，等待新消息", "idle")
@@ -1546,6 +1617,11 @@ class Overlay:
         n = len(self.presetEdit.toPlainText().strip())
         self.presetCount.setText(f"{n} 字" + (f"，超过 {styles.LIMIT} 了，会盖过对话本身"
                                               if n > styles.LIMIT else ""))
+
+    def _opener_toggled(self, on):
+        """只灰掉/点亮那个分钟数。落盘还是走「保存设置」——跟调试视图那种拨一下立刻生效的
+        开关不一样，冷场开场白是下一次生成才用得上的偏好。"""
+        self.openerBox.setEnabled(bool(on))
 
     def _debug_toggled(self, on):
         """调试视图独立于「保存设置」：拨一下就开窗/收窗，顺手落盘，重启还在。"""
@@ -1674,8 +1750,13 @@ class Overlay:
         else:
             self._empty_text()
 
-    def set_busy(self, busy):
+    def set_busy(self, busy, opener=False, waited=0):
+        """opener=True：这次跑的是开场白，生成中那句话和角标都得跟着换（见 _sync_bar）。
+        waited 是「对方多少分钟没回」——生成期间候选还没摆出来，头上的时间得靠它，
+        不然那几秒会退回去显示对方上一条消息，跟「对方还没回」这个标题自相矛盾。"""
         self._busy = busy
+        self._busy_opener = bool(busy) and opener
+        self._opener_wait = waited if self._busy_opener else 0
         self.progress.setVisible(busy)
         if busy:
             self.invalidate_replies()
@@ -1720,6 +1801,7 @@ class Overlay:
             card.set_available(False)
         # 候选条跟着清空：新消息一来，旧候选就不该再摆在宠物旁边了
         self._ordered = []
+        self._opener.pop(self._shown, None)  # 这批开场白不算数了，「换一批」跟着收掉
         self._sync_bar()
 
     def has_reply(self):
@@ -1727,7 +1809,10 @@ class Overlay:
         return self._current
 
     def _suggest_text(self):
-        """候选条底部那行「建议：xxx · 紧张度 N/9」，口径跟面板的洞察卡一致。"""
+        """候选条底部那行「建议：xxx · 紧张度 N/9」，口径跟面板的洞察卡一致。
+        开场白没跑 Jev 判断，这行没有内容可说，返回空串（不然会摆一句「建议：暂未判断」）。"""
+        if self._shown in self._opener:
+            return ""
         action = _choice(self._answers, "best_action")
         score = (self._answers.get("danger_level") or {}).get("score")
         valid = isinstance(score, (int, float)) and isfinite(score) and 0 <= score <= 9
@@ -1750,6 +1835,11 @@ class Overlay:
         items = self._voices.get(self._shown) or []
         return f"语音消息 {items[-1][4]}" if items else ""
 
+    def _opener_again(self):
+        """「换一批」：三条开场白都不满意，重新起草一批（走父进程，跟自动那批同一条路）。"""
+        if self.on_opener_again:
+            self.on_opener_again()
+
     def _convert_voice(self):
         """候选条上的「转文字」：交给父进程去右键那条语音、点菜单第一项。
 
@@ -1770,9 +1860,19 @@ class Overlay:
         """把紧凑候选条刷成和面板一致。两边共用 self.cands / self._ordered，不新增数据流。"""
         items = [(index, position + 1, self.cands[index], score, recommended)
                  for position, (index, score, recommended) in enumerate(self._ordered)]
-        heard = self.hers.get(self._shown) or self.hers.get(self._chat) or ""
+        # 开场白：头上那句不能再用「对方刚说 X」（那挂的是上一条对方的文字消息，摆在这儿
+        # 像是刚收到的），改成「对方还没回 + 隔了多久」。生成中那次也算——见 set_busy。
+        # 只在 thinking/ready 两态这么摆：notify 是「对方刚来消息」，那会儿说「还没回」就是撒谎。
+        opener = self._phase in ("thinking", "ready") and (self._busy_opener
+                                                           or self._shown in self._opener)
+        if self._shown in self._opener:
+            heard = f"距你上一条 {self._opener[self._shown]} 分钟"
+        elif self._busy_opener and self._opener_wait:
+            heard = f"距你上一条 {self._opener_wait} 分钟"
+        else:
+            heard = self.hers.get(self._shown) or self.hers.get(self._chat) or ""
         self.bar.set_items(items, self._suggest_text() if items else "", self._phase, heard,
-                           self._voice_text())
+                           self._voice_text(), opener=opener)
 
     def set_phase(self, phase):
         """main.py 派生出来的流水线状态。同态重复调用是空操作，否则每 50ms 重放一次会闪。"""
@@ -2089,14 +2189,19 @@ class Overlay:
             self.referenceNote.hide()
             self.empty.show()
             self.updated.setText("")
+            self._opener.pop(self._shown, None)
             self._empty_text()
         if self._shown != self._chat:
             self.invalidate_replies()
             self.set_status(f"正在浏览「{self._shown}」，只看不填；切回这个会话才能用。")
 
     def show(self, result):
-        """按推荐顺序展示，按钮始终绑定 candidates 的原始索引。"""
+        """按推荐顺序展示，按钮始终绑定 candidates 的原始索引。
+
+        结果里 opener=True 的是冷场开场白：没跑过 Jev，answers/scores 都是空的，
+        所以洞察卡换成开场白那套说法（不摆意图和紧张度，给个「换一批」），状态栏也换一句。"""
         self.cands = result["candidates"]
+        opener = bool(result.get("opener"))
         self.set_busy(False)
         self._current = bool(self.cands)
         self._clear_cards()
@@ -2120,21 +2225,36 @@ class Overlay:
             self.replyBox.addWidget(card)
             self.cards.append(card)
         reply_to = result.get("reply_to")
-        self.insightTitle.setText(f"对话参考 · 回复给 {reply_to}" if reply_to else "对话参考")
         answers = result.get("answers") or {}
         self._answers = answers
         self._ordered = [(index, scores[index], index == best) for index in order]
-        self.summary.setText("建议：" + _choice(answers, "best_action"))
-        self.intent.setText("可能意图 · " + _choice(answers, "true_intent") +
-                            "\n可能需要 · " + _choice(answers, "she_needs"))
-        score = (answers.get("danger_level") or {}).get("score")
-        valid_score = isinstance(score, (int, float)) and isfinite(score) and 0 <= score <= 9
-        self.tension.setText(f"紧张度 {score:.0f}/9" if valid_score else "紧张度待判断")
-        color = theme.WARN if valid_score and score >= 3 else _MUTED
-        if valid_score and score >= 6:
-            color = theme.DANGER
-        qss = f"BodyLabel {{ color: {color}; background: transparent; }}"
-        setCustomStyleSheet(self.tension, qss, qss)
+        waited = result.get("waited") or 0
+        if opener:
+            self._opener[self._shown] = waited
+            self.contextTitle.setText("上次聊到")  # 摆的是上次那几句，不是刚收到的
+            self.insightTitle.setText(f"开场白 · 对方 {waited} 分钟没回" if waited else "开场白")
+            self.summary.setText("接着上次的话，主动起个头")
+            self.intent.hide()  # 七道题一道都没问，这两行没有内容可摆
+            self.tension.hide()
+            self.againButton.show()
+        else:
+            self._opener.pop(self._shown, None)
+            self.contextTitle.setText("对方最近说")
+            self.insightTitle.setText(f"对话参考 · 回复给 {reply_to}" if reply_to else "对话参考")
+            self.summary.setText("建议：" + _choice(answers, "best_action"))
+            self.intent.setText("可能意图 · " + _choice(answers, "true_intent") +
+                                "\n可能需要 · " + _choice(answers, "she_needs"))
+            self.intent.show()
+            self.againButton.hide()
+            score = (answers.get("danger_level") or {}).get("score")
+            valid_score = isinstance(score, (int, float)) and isfinite(score) and 0 <= score <= 9
+            self.tension.setText(f"紧张度 {score:.0f}/9" if valid_score else "紧张度待判断")
+            color = theme.WARN if valid_score and score >= 3 else _MUTED
+            if valid_score and score >= 6:
+                color = theme.DANGER
+            qss = f"BodyLabel {{ color: {color}; background: transparent; }}"
+            setCustomStyleSheet(self.tension, qss, qss)
+            self.tension.show()
         self.empty.setVisible(not self.cands)
         self.insight.setVisible(bool(self.cands))
         self.referenceNote.setVisible(bool(self.cands) and not self._compact)
@@ -2143,6 +2263,9 @@ class Overlay:
             # 候选是好的、只是判断/排序那一步挂了：照样能用，但要说清楚为什么没有概率和推荐
             self.set_status("判断服务没应答，这三条是按对话直接起草的；点「查看详情」看原因。",
                             "warning")
+        elif self.cands and opener:
+            self.set_status(f"对方 {waited} 分钟没回，给你起了个头，挑一句发过去"
+                            if waited else "给你起了个头，挑一句发过去", "success")
         elif self.cands:
             self.set_status("建议已更新，选一句适合你的回复", "success")
         else:

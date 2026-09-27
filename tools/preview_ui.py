@@ -18,7 +18,8 @@ from core import styles
 
 
 _STATES = ("ready", "waiting", "loading", "error", "degraded", "setup", "settings", "paused",
-           "debug", "ime", "ime-thinking", "pet", "pet-menu", "bar", "voice", "log")
+           "debug", "ime", "ime-thinking", "pet", "pet-menu", "bar", "voice", "log",
+           "opener", "opener-bar", "opener-loading")
 
 # 调试视图预览用的真微信截图（只读进内存，不改不存）；没有就退一张空画面
 _FRAME = Path("/private/tmp/claude-501/-Users-lpitiless-Documents-project-wechatjev"
@@ -109,6 +110,20 @@ _RESULT = {
     "judged": True, "ranked": True, "trouble": "",
 }
 
+# 冷场开场白：最后一句是 me 说的、对方 32 分钟没回。没跑过 Jev，所以 answers 空、scores 全 0、
+# judged/ranked 全假（界面据此不标「推荐」，也不摆意图和紧张度，改摆「换一批」）
+_OPENER = {
+    "candidates": ["在忙吗", "上次说的那家店还去吗", "睡了吗"],
+    "best_index": 0,
+    "best_reply": "在忙吗",
+    "scores": [0.0, 0.0, 0.0],
+    "answers": {},
+    "usage": {},
+    "reply_to": None,
+    "judged": False, "ranked": False, "trouble": "",
+    "opener": True, "waited": 32,
+}
+
 # 判断那一路挂了（比如中转把令牌停用）：三条候选照样摆出来，只是没概率、没推荐，带一句原因
 _TROUBLE = ("Jev HTTP 401: 该令牌因内容违规已被停用，可在令牌管理页重新启用；"
             "详情请查收违规通知邮件 (request id: 01M3GV641MS0X5EV6K8GPH5DYC)")
@@ -140,13 +155,17 @@ def main() -> int:
                      "draft_provider": "relay" if args.relay else "deepseek",
                      "draft_model": "deepseek-flash",
                      "draft_base_url": "", "reply_target": True,
+                     # 冷场开场白：默认关。开着才看得到那一组控件是亮着的
+                     "opener": args.state in ("opener", "opener-bar", "opener-loading", "settings"),
+                     "opener_minutes": 30,
                      # 「个人风格」页签：选一型、并且有一型是改过的，两种状态都看得到
                      "style_preset": "friend", "style_texts": {"romance": "哥哥视角：她是你妹妹。"},
                      "thinking": False,
                      "check_update": True, "debug_view": args.state == "debug",
                      # 只有宠物相关的状态才开宠物形态；其余状态保持「面板直接可见」，
                      # 不然面板从没 show 过，grab 出来是空的
-                     "pet_enabled": args.state in ("pet", "pet-menu", "bar", "voice"),
+                     "pet_enabled": args.state in ("pet", "pet-menu", "bar", "voice",
+                                                   "opener-bar", "opener-loading"),
                      "pet_pos": None,
                      "relay_base_url": "https://中转站.example" if args.relay else "",
                      "relay_judge_path": "/v1/systemone",
@@ -158,11 +177,14 @@ def main() -> int:
                            reply_target_on=None, style_preset_text=None, style_texts_dict=None,
                            thinking_on=None, check_update_on=None, debug_view_on=None,
                            relay_base_url_text=None, relay_judge_path_text=None,
-                           relay_thinking_style_text=None, pet_enabled_on=None):
+                           relay_thinking_style_text=None, pet_enabled_on=None,
+                           opener_on=None, opener_minutes_n=None):
         if relationship_text:
             demo_settings["relationship"] = relationship_text
         if context_n is not None:
             demo_settings["context"] = context_n
+        if opener_minutes_n is not None:
+            demo_settings["opener_minutes"] = opener_minutes_n
         if style_preset_text is not None:
             demo_settings["style_preset"] = style_preset_text
         if style_texts_dict is not None:
@@ -180,7 +202,7 @@ def main() -> int:
                 demo_settings[name] = key
         for name, value in (("reply_target", reply_target_on), ("thinking", thinking_on),
                             ("check_update", check_update_on), ("debug_view", debug_view_on),
-                            ("pet_enabled", pet_enabled_on)):
+                            ("pet_enabled", pet_enabled_on), ("opener", opener_on)):
             if value is not None:
                 demo_settings[name] = bool(value)
 
@@ -214,6 +236,8 @@ def main() -> int:
         relay_judge_path=lambda: demo_settings["relay_judge_path"],
         relay_thinking_style=lambda: demo_settings["relay_thinking_style"],
         reply_target=lambda: demo_settings["reply_target"],
+        opener=lambda: demo_settings["opener"],
+        opener_minutes=lambda: demo_settings["opener_minutes"],
         style_preset=lambda: demo_settings["style_preset"],
         style_texts=lambda: demo_settings["style_texts"],
         scene_text=lambda: styles.resolve(
@@ -299,6 +323,20 @@ def main() -> int:
                 ov.set_chat(_CHAT)
                 ov.set_voice(_CHAT, [(0, 0, 100, 30, '8"')])
                 ov.set_phase("notify")
+                shot = ov.bar
+            elif args.state in ("opener", "opener-bar"):
+                # 冷场开场白：面板摆开场白那套说法（没有意图/紧张度，多一个「换一批」）；
+                # opener-bar 换成宠物旁那条紧凑候选条（那个状态宠物是开的）。
+                # 补一句 me 说的收尾，不然记录里最后一条还是对方的，跟「对方还没回」对不上
+                ov.log_message("me", "那我先订个位，六点见", timestamp="18:45", chat=_CHAT)
+                ov.show(_OPENER)
+                ov.set_phase("ready")
+                shot = ov.bar if args.state == "opener-bar" else ov.win
+            elif args.state == "opener-loading":
+                # 正在起草开场白的那几秒：没有候选，但头上那句说的是「对方还没回 N 分钟」，
+                # 不是对方上一条消息（那个自相矛盾过，见 _sync_bar 里的 phase 判断）
+                ov.set_busy(True, opener=True, waited=32)
+                ov.set_phase("thinking")
                 shot = ov.bar
             elif args.state in ("ime", "ime-thinking"):
                 # 宠物旁的紧凑候选条。得先 show()，没显示过的窗口 grab 出来是空的

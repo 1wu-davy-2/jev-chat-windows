@@ -6,11 +6,11 @@
 from __future__ import annotations
 
 try:
-    from .draft import draft_candidates
+    from .draft import draft_candidates, draft_openers
     from .jev_client import JevError, ask
     from .questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 except ImportError:
-    from draft import draft_candidates
+    from draft import draft_candidates, draft_openers
     from jev_client import JevError, ask
     from questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 
@@ -118,6 +118,40 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     }
 
 
+def analyze_opener(messages: list, relationship: str, model: str | None = None,
+                   timeout: float = 30, context: int = 10, provider: str = "deepseek",
+                   base_url: str | None = None, reply_to: str | None = None, scene: str = "",
+                   thinking: bool = False, thinking_style: str = "") -> dict:
+    """冷场时的一批开场白（最后一句是 me 说的、对方一直没回）：只起草，**不过 Jev**。
+
+    七道判断题问的全是「对方最新那条什么意思」，而这里的场景恰恰是对方没有新话——问不出东西，
+    问了也是白花钱。所以 judged / ranked 都是 False（界面据此不标「推荐」，那张卡片上的百分比
+    也不会出现），best_index 只是退回第一条。
+
+    返回值形状跟 analyze() 一样，多一个 opener=True 让界面换一套说法（「对方刚说」→「对方还没回」，
+    洞察卡不摆意图和紧张度）。参数含义同 analyze()，只是没有 jev_* 那几项——用不上。
+    """
+    candidates = draft_openers(messages, relationship, provider=provider, model=model,
+                               base_url=base_url, timeout=timeout, keep=context,
+                               reply_to=reply_to, scene=scene, thinking=thinking,
+                               thinking_style=thinking_style)
+    if not candidates:  # 注入过滤可以把起草结果全扔掉；接着取 [0] 会 IndexError
+        raise JevError("起草结果没有可用候选")
+    return {
+        "candidates": candidates,
+        "best_index": 0,
+        "best_reply": candidates[0],
+        "scores": [0.0] * len(candidates),
+        "answers": {},
+        "usage": {},
+        "reply_to": reply_to,
+        "judged": False,
+        "ranked": False,
+        "trouble": "",
+        "opener": True,
+    }
+
+
 if __name__ == "__main__":
     # 候选被过滤光时要抛 JevError，不能在取第一条时 IndexError。
     from unittest.mock import patch
@@ -157,4 +191,21 @@ if __name__ == "__main__":
         r = analyze([("her", "hello")], "friends")
     assert r["judged"] and r["ranked"] and r["trouble"] == ""
     assert r["best_index"] == 1 and r["scores"][1] == 0.8
+
+    # 开场白：只起草，一次都不问 Jev——那七道题问的是「对方最新那条什么意思」，这儿对方没说话。
+    # judged/ranked 全假、scores 全 0，界面据此不标「推荐」。
+    with patch("__main__.ask", side_effect=AssertionError("开场白不该调 Jev")), \
+         patch("__main__.draft_openers", return_value=["在忙吗", "那家店还去吗", "睡了吗"]):
+        r = analyze_opener([("her", "在忙吗"), ("me", "刚忙完")], "friends")
+    assert r["opener"] is True and r["candidates"] == ["在忙吗", "那家店还去吗", "睡了吗"]
+    assert r["judged"] is False and r["ranked"] is False and r["trouble"] == ""
+    assert r["scores"] == [0.0, 0.0, 0.0] and r["answers"] == {} and r["best_index"] == 0
+
+    # 候选被过滤光时跟 analyze 一样抛，别在取第一条时 IndexError
+    with patch("__main__.draft_openers", return_value=[]):
+        try:
+            analyze_opener([("me", "在忙吗")], "friends")
+            raise SystemExit("应当抛错")
+        except JevError as e:
+            assert "没有可用候选" in str(e)
     print("engine ok")

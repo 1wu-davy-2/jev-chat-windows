@@ -23,6 +23,7 @@ _DEFAULT_RELATIONSHIP = "romantic partners"
 _DEFAULT_CONTEXT = 10
 _DEFAULT_JEV = "openrouter"
 _DEFAULT_DRAFT = "deepseek"
+_DEFAULT_OPENER_MINUTES = 30
 
 
 def _read(name: str, default=None):
@@ -129,6 +130,19 @@ def reply_target() -> bool:
     """群聊指定回复对象：开了才在界面上选回复给谁、才把对象喂给模型。默认关。"""
     return bool(_read("reply_target", False))
 
+def opener() -> bool:
+    """冷场开场白：最后一句是自己说的、对方一直没有回复，等够 opener_minutes() 就起草一批
+    开场白让人挑。默认关——关着的时候调模型的条件还是「只有对方来了新消息」。"""
+    return bool(_read("opener", False))
+
+def opener_minutes() -> int:
+    """等多少分钟算冷场。1~720，缺失/脏数据一律退默认值。"""
+    try:
+        n = int(_read("opener_minutes", _DEFAULT_OPENER_MINUTES))
+    except (TypeError, ValueError):
+        return _DEFAULT_OPENER_MINUTES
+    return max(1, min(720, n))
+
 def thinking() -> bool:
     """起草时是否开思考模式：慢且贵，默认关。只有 DeepSeek / OpenRouter / Anthropic / Gemini 吃它。"""
     return bool(_read("thinking", False))
@@ -225,7 +239,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          check_update_on: bool | None = None, debug_view_on: bool | None = None,
          relay_base_url_text: str | None = None, relay_judge_path_text: str | None = None,
          relay_thinking_style_text: str | None = None,
-         pet_enabled_on: bool | None = None) -> None:
+         pet_enabled_on: bool | None = None, opener_on: bool | None = None,
+         opener_minutes_n: int | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -239,6 +254,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
     if wrote_key:
         _notify_env()
     n = context() if context_n is None else max(3, min(30, int(context_n)))
+    opener_n = (opener_minutes() if opener_minutes_n is None
+                else max(1, min(720, int(opener_minutes_n))))
     # 空串 = 清掉，None = 原样留着（读原始字段，别读补过默认值的那个）
     keep = lambda new, name: str(_read(name) or "") if new is None else str(new).strip()
     flag = lambda new, now: now() if new is None else bool(new)
@@ -264,10 +281,15 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "relay_judge_path": keep(relay_judge_path_text, "relay_judge_path"),
         "relay_thinking_style": keep(relay_thinking_style_text, "relay_thinking_style"),
         "reply_target": flag(reply_target_on, reply_target),
+        "opener": flag(opener_on, opener), "opener_minutes": opener_n,
         "thinking": flag(thinking_on, thinking),
         "check_update": flag(check_update_on, check_update),
         "debug_view": flag(debug_view_on, debug_view),
         "pet_enabled": flag(pet_enabled_on, pet_enabled),
+        # 宠物位置不归这儿管（save_pet_pos 单独写），但**必须原样带过去**：这里是把整份
+        # 配置重写一遍，漏了哪个键就等于把它删了——以前漏了 pet_pos，点一次「保存设置」
+        # 宠物下次就跳回默认角落。
+        "pet_pos": _load_all().get("pet_pos"),
     }
     with open(_CONFIG, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)

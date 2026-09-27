@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """父进程：只管界面。截图 + OCR 在 app/worker.py 的子进程里跑，队列里收新消息 →
 对方来了消息、且安静 5+1~5 秒没再发，才调一次 engine → 悬浮窗给 3 条候选 → 人点「填入」。
-发送永远手动。静默期零调用。
+发送永远手动。静默期零调用——设置里开了「冷场开场白」才多一个触发点：最后一句是自己说的、
+对方一直没回，等够时间起草一批开场白（见 arm_opener / start_opener，默认关）。
 上下文、结果、聊天记录都按会话名（子进程 OCR 头部标题得来）分开存，切会话不串味。
 
     pip install rapidocr-onnxruntime numpy windows-capture PySide6-Fluent-Widgets
@@ -23,7 +24,7 @@ from app.fill import fill
 from app.ocr import similar
 from app.overlay import Overlay
 from app.version import VERSION
-from core.engine import analyze
+from core.engine import analyze, analyze_opener
 
 # {会话名: {history, result, rev, target, senders}}：每个会话各自的上下文、上次结果和版本号，互不串味
 # history 里是 [(who, text, name)]，engine 只认 her/me，name 是群里的发言人（单聊/自己说的是 None）；
@@ -48,8 +49,13 @@ update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, 
 
 
 def chat_of(title):
+    # nudge：冷场计时（到期时刻，None = 没在计时），nudge_at 是起算时刻（界面上说「对方 N 分钟没回」
+    # 用它算），nudge_len 是起算时 history 记到哪儿了（到点只查这之后有没有对方的话），
+    # nudged：这个冷场已经自动出过一批开场白了吗——对方回了话才清掉（见 schedule_analyze）
     return chats.setdefault(title, {"history": deque(maxlen=60), "result": None, "rev": 0,
-                                    "target": None, "senders": []})
+                                    "target": None, "senders": [],
+                                    "nudge": None, "nudge_at": 0.0, "nudge_len": 0,
+                                    "nudged": False})
 
 
 def _already_read(chat, item):
@@ -77,6 +83,9 @@ def schedule_analyze(title):
     notify_until 一起推到那个时刻，这样等着的这几秒宠物保持「有新消息」的样子（角标在），
     而不是先闪一下再回到静息态。"""
     now = time.monotonic()
+    chat = chat_of(title)
+    chat["nudged"] = False  # 对方开口了 = 这个冷场结束，下一次冷场重新有一次机会
+    chat["nudge"] = None
     pending = state["pending"]
     first = pending[2] if pending and pending[0] == title else now
     deadline = min(now + _QUIET_MIN + random.uniform(1.0, _QUIET_JITTER), first + _QUIET_MAX)
@@ -84,15 +93,37 @@ def schedule_analyze(title):
     state["notify_until"] = deadline
 
 
-def mark_replied():
+def arm_opener(title):
+    """冷场计时：最后一句是我说的，等 opener_minutes() 分钟对方还没回，就起草一批开场白。
+
+    每个冷场只自动出一次（chat["nudged"]），对方回了话才算下一个冷场——不然每来一条新消息
+    都会重新点着一轮，等于没完没了地替他找话题。开关关着、采集停着、这个冷场已经出过，
+    都什么都不做，返回 False（界面据此换一句状态栏文案）。"""
+    if not title or not settings.opener() or not capture_on.is_set():
+        return False
+    chat = chat_of(title)
+    if chat["nudged"]:
+        return False
+    now = time.monotonic()
+    chat["nudge"] = now + settings.opener_minutes() * 60
+    chat["nudge_at"] = now
+    chat["nudge_len"] = len(chat["history"])  # 起算时记到哪儿了，到点只查这之后新记进来的
+    return True
+
+
+def mark_replied(title=None):
     """最新那条是自己说的（文字或语音）：等着的那次判断取消，提醒也一起收掉。
 
     对方那句已经答过了，再问一次模型既费钱又打扰人，结论还必然是「你已经回过了」。
-    **自己发的语音也算**——语音读不出正文，但「我发过东西」这件事屏幕上看得见。"""
+    **自己发的语音也算**——语音读不出正文，但「我发过东西」这件事屏幕上看得见。
+    顺手把冷场计时起上（设置里开了开场白的话），到期由 tick() 点火。"""
     state["pending"] = None
     state["notify_until"] = 0.0
     state["rerun"] = None
     ov.set_busy(False)
+    if arm_opener(title):
+        ov.set_status(f"你已回复，对方 {settings.opener_minutes()} 分钟没动静就给你起个头")
+        return
     ov.set_status("你已回复，等待对方的新消息")
 
 
@@ -178,6 +209,8 @@ def on_toggle_capture(on):
     global child
     if not on:
         capture_on.clear()
+        for c in chats.values():  # 暂停期间不替你起头（暂停就是个「先别管我」的信号）
+            c["nudge"] = None
         return
     if child is None:
         try:
@@ -214,6 +247,30 @@ def analyze_bg(msgs, title, revision, reply_to=None):
         results.put(("err", str(e), title, revision))
 
 
+def opener_bg(msgs, title, revision, waited, reply_to=None):
+    """起草一批开场白。跟 analyze_bg 一个套路：网络调用在线程里，结果丢队列，UI 只在 tick 里动。
+
+    只打起草那个口——开场白不问 Jev（七道题问的都是「对方最新那条什么意思」，这儿对方没说话），
+    所以只要起草那把 key，jev_* 那几项一概不传。waited 是「对方多少分钟没回」，界面拿它说人话。"""
+    try:
+        provider, jev_provider = settings.draft_provider(), settings.jev_provider()
+        relay_base = settings.relay_base_url()
+        r = analyze_opener(msgs, settings.relationship(), context=settings.context(),
+                           model=settings.draft_model() or None, provider=provider,
+                           base_url=(relay_base if "relay" in (provider, jev_provider)
+                                     else settings.draft_base_url()) or None,
+                           reply_to=reply_to, scene=settings.scene_text(),
+                           thinking=settings.thinking(),
+                           thinking_style=settings.relay_thinking_style())
+        r["waited"] = waited
+        # 队列形状跟 analyze_bg 一样（kind, 结果, 会话名, 版本号）——是不是开场白看 r["opener"]，
+        # tick 照它交给界面，不用再多一个槽位
+        results.put(("ok", r, title, revision))
+    except Exception as e:
+        # 原文照发，别在这儿包一层套话：界面那条状态栏会截短显示，点「查看详情」看全文
+        results.put(("err", str(e), title, revision))
+
+
 def check_update_bg():
     """启动时后台查一次新版本，跟 analyze_bg 一个套路：网络调用在线程里，UI 只在 tick() 里动。"""
     r = update.check_latest(VERSION)
@@ -233,6 +290,62 @@ def start_analyze(title, msgs):
     reply_to = target_of(title) if settings.reply_target() else None  # 开关关着就是今天的行为
     threading.Thread(target=analyze_bg, args=(msgs, title, chat_of(title)["rev"], reply_to),
                      daemon=True).start()
+
+
+def start_opener(title, manual=False):
+    """起草一批开场白（tick 到点自动点火，或者用户点了「换一批」）。
+
+    跟 start_analyze 分开是因为它会问的东西不一样：只起草、不问 Jev，所以只要起草那把 key。"""
+    if not manual and not settings.opener():
+        return
+    if state["busy"]:
+        ov.set_status("正在生成，稍等一下再换", "busy")
+        return
+    if not settings.has_llm_key():
+        ov.set_status(f"起草来源 {settings.draft_provider_name()} 没填密钥，去设置里补上", "warning")
+        return
+    chat = chat_of(title)
+    msgs = list(chat["history"])
+    if not msgs:
+        ov.set_status("这个会话还没读到可用的上下文，等它再读几帧", "warning")
+        return
+    # 「对方 N 分钟没回」按计时起算那会儿算；没计过时（手动换一批）就用设置里那个数
+    waited = (max(1, int(round((time.monotonic() - chat["nudge_at"]) / 60))) if chat["nudge_at"]
+              else settings.opener_minutes())
+    chat["nudged"] = True  # 这个冷场的一次机会用掉了
+    chat["nudge"] = None
+    state["busy"] = True
+    ov.set_busy(True, opener=True, waited=waited)
+    ov.set_status("正在给你想一句开场白…", "busy")  # set_busy 里那句是给正常流程写的
+    reply_to = target_of(title) if settings.reply_target() else None
+    threading.Thread(target=opener_bg, args=(msgs, title, chat["rev"], waited, reply_to),
+                     daemon=True).start()
+
+
+def on_settings_saved():
+    """设置保存后补一次冷场计时。
+
+    用户可能就是**为了**这个开关才进的设置页，而屏幕上最后一句早就是他说过的了——那之后
+    没有任何新消息，mark_replied 不会再被调一次，计时就永远起不来，看着像没生效。
+    这里现看一眼记录：最后一条是我的话就把计时补上（存完设置才关掉开关的，arm_opener 会拦）。"""
+    title = state["chat"]
+    chat = chats.get(title)
+    if not title or not chat or chat["nudge"] or chat["nudged"]:
+        return
+    if chat["history"] and chat["history"][-1][0] == "me":
+        arm_opener(title)
+
+
+def opener_again():
+    """界面上的「换一批」。人在看别的会话时不给换：候选是那个会话的，填进去会串会话。"""
+    title = state["chat"]
+    if not title:
+        ov.set_status("还没识别到会话，稍等一下再试", "warning")
+        return
+    if title != ov.current_chat():
+        ov.set_status(f"微信现在开着的不是「{ov.current_chat()}」，切回去再换一批", "warning")
+        return
+    start_opener(title, manual=True)
 
 
 def on_target_change(title, name):
@@ -286,7 +399,7 @@ def drain():
                 # 谁发的按气泡底色走：自己发的语音别挂到对方头上
                 ov.log_message(v[5], f"🔊 语音消息 {_voice_label(v[4])}", chat=title)
             if fresh and latest == "me":
-                mark_replied()  # 最新那条是我发的语音 = 我已经回了，跟回了句文字一样
+                mark_replied(title)  # 最新那条是我发的语音 = 我已经回了，跟回了句文字一样
             elif fresh:
                 # 语音也是「对方还在说」：有等着的那次就把静默窗口往后推。没有就不新开一次
                 # 判断——光一条语音没正文，问了也没得判断，等他自己转文字或者接着说
@@ -311,6 +424,7 @@ def drain():
             state["area"] = None
             for c in chats.values():  # 在跑的分析作废，回来的结果不再往界面上贴
                 c["rev"] += 1
+                c["nudge"] = None  # 窗口都没了，冷场计时也就没意义（nudged 留着，别重开采集又出一次）
             state["rerun"] = state["pending"] = None
             state["notify_until"] = 0.0
             ov.invalidate_replies()
@@ -356,7 +470,7 @@ def drain():
             ov.set_status("对方刚发来消息，等他发完再给建议", "busy")
             ov.set_waiting()
         else:
-            mark_replied()
+            mark_replied(title)
 
 
 def phase_now():
@@ -417,6 +531,21 @@ def tick():
         if pending and not state["busy"] and time.monotonic() >= pending[1]:
             state["pending"] = None
             start_analyze(pending[0], list(chat_of(pending[0])["history"]))
+        # 冷场开场白到点了（见 arm_opener）。这会儿得三条都成立才开口：开关还开着、人正开着
+        # 这个会话、采集没停；而且**起算之后对方一句话都没说**——说了（哪怕因为去重没接住）
+        # 就不是冷场了，硬起头会张冠李戴。只看起算之后新记进来的那几行，不回头翻历史：
+        # 我自己用语音回的最后一句不进 history，回头翻会把它当成「对方后来发了话」而白作废。
+        # 不成立就把这次作废，别留着下个 tick 再问一遍。
+        for title, chat in list(chats.items()):
+            if not chat["nudge"] or state["busy"] or time.monotonic() < chat["nudge"]:
+                continue
+            since = list(chat["history"])[chat["nudge_len"]:]
+            if (settings.opener() and title == state["chat"] and capture_on.is_set()
+                    and not any(who == "her" for who, _, _ in since)):
+                start_opener(title)
+            else:
+                chat["nudge"] = None
+            break
         refresh_phase()
     except Exception:
         traceback.print_exc()  # 一帧出错不退出
@@ -434,7 +563,8 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     voice_until = multiprocessing.Value("d", 0.0)
     ov = Overlay(on_fill=fill_reply, on_toggle_capture=on_toggle_capture,
                  on_target_change=on_target_change, on_toggle_debug=set_debug,
-                 on_voice_convert=convert_voice,
+                 on_voice_convert=convert_voice, on_opener_again=opener_again,
+                 on_settings_saved=on_settings_saved,
                  result_of=lambda t: chats.get(t, {}).get("result"))
     child = dbg = None
     try:
