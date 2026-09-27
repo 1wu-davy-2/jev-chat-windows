@@ -133,6 +133,42 @@ def merge_voice(chat: str, mark: str, who: str, text: str, dur: str) -> bool:
         return False
 
 
+def rewrite_tail(chat: str, rows, drop: int) -> bool:
+    """把某个会话**最后 drop 条**换成 rows（rows 是界面那个五元组，时间正序，比 drop 多的
+    就是新补进来的那几条）。
+
+    给「重新识别」补漏用（见 main.apply_reread）。为什么不能像平时那样 append 一条：漏掉的
+    消息往往要插在**中间**（真机上被吃掉的「?」「嗯」就是夹在别的消息之间的），而这张表是按
+    自增 id 排的——append 只能往末尾加，重启之后顺序就乱了，喂给模型的上下文也跟着乱。
+    所以把这一段尾巴整段删掉、按界面那份重插。
+
+    drop 由调用方给而不是取 len(rows)：界面那份里还有「🔊 语音消息 N"」这种不进 history 的
+    占位行，两边的条数对不上，自己猜会删多或删少。
+
+    代价是这一段的 id 会换成新的（`ts` 也刷新成这会儿）。顺序、正文、时间、语音标记都以 rows
+    为准，跟界面一模一样；id 变了对谁都没影响——它只是个排序用的自增号。"""
+    rows = [tuple(r) for r in (rows or ())]
+    drop = max(0, int(drop))
+    if not _ON or not chat or not rows or not drop:
+        return False
+    try:
+        with _LOCK, closing(_connect()) as c:
+            ids = [r[0] for r in c.execute(
+                "select id from messages where chat=? order by id desc limit ?",
+                (_s(chat), drop)).fetchall()]
+            if not ids:
+                return False
+            c.execute("delete from messages where id in (%s)" % ",".join("?" * len(ids)), ids)
+            c.executemany("insert into messages (chat, who, text, name, stamp, voice, ts)"
+                          " values (?, ?, ?, ?, ?, ?, ?)",
+                          [(_s(chat), _s(w), _s(t), _s(n), _s(st), _s(v), int(time.time()))
+                           for w, t, n, st, v in rows])
+            c.commit()
+            return True
+    except Exception:
+        return False
+
+
 def recent(chat: str, limit: int = 300) -> list[tuple]:
     """某个会话最近的若干条，**按时间正序**（最老的在前，最新的在最后）——跟 feeds 一个方向。
     读不出来返回空表，界面照常开。"""
@@ -235,6 +271,21 @@ if __name__ == "__main__":
     assert rows[2][3] == "18:41", "并了要沿用语音那条的时间，不是转文字那会儿的时间"
     assert rows[2][4] == '3"' and count() == 4
     assert merge_voice("白金搬砖小分队", "根本没有这句", "her", "x", '1"') is False
+
+    # 整段尾巴重写（重新识别补漏：漏掉的那条要插在中间，append 只能往末尾加）。
+    # drop=2 = 换掉最后两条，rows 给三条 = 多出来的那条就是补进来的
+    tail = recent("白金搬砖小分队")[-2:]
+    assert rewrite_tail("白金搬砖小分队", [("her", "补在中间的", "", "18:41", "")] + tail, 2)
+    rows = recent("白金搬砖小分队")
+    assert [r[1] for r in rows] == ["在吗", "补在中间的", "在", "我三分钟后到"], rows
+    assert rows[1][3] == "18:41" and len(rows) == 4, "重写不该多出或少掉这个会话的条数"
+    # 同条数替换（只把某条读花的字改回来）也照做；空 rows / drop=0 / 没这个会话都不动手
+    assert rewrite_tail("白金搬砖小分队",
+                        [("her", "在吗？", "", "18:40", "")] + rows[1:], len(rows))
+    assert [r[1] for r in recent("白金搬砖小分队")] == ["在吗？", "补在中间的", "在", "我三分钟后到"]
+    assert rewrite_tail("白金搬砖小分队", [], 2) is False
+    assert rewrite_tail("白金搬砖小分队", tail, 0) is False
+    assert rewrite_tail("没这个会话", tail, 2) is False
 
     # 字符串一律脱敏：环境里那把 key 绝不许落到库里
     os.environ["JEV_API_KEY"] = "sk-secret-123456"

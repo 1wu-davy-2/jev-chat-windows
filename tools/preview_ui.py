@@ -46,6 +46,24 @@ _BOXES = [
 _LINES = [("her", "Asterlion", "难绷"), ("her", "Asterlion", "怎么识别到仲夏夜之梦的（"),
           ("me", None, "好像识别头像了"), ("me", None, "笑死我了"),
           ("her", "Asterlion", "还真是"), ("her", "Asterlion", "哈哈哈")]
+# 「复制框数据」导出的那一串（每个框的底色/众数占比/墨高/分类）。跟 _BOXES 一一对应，
+# 数字是编的，但形状和真跑出来的一样——那个按钮出问题时是唯一的证据来源
+_METRICS = [
+    {"rect": (83, 99, 156, 122), "kind": "gray", "final": "name", "text": "Asterlion",
+     "flat": 0.71, "ink": 11, "bg": (245, 245, 245)},
+    {"rect": (26, 131, 70, 146), "kind": "", "final": "image", "text": "借仲夏夜之梦",
+     "flat": 0.22, "ink": 0, "bg": (96, 88, 121)},
+    {"rect": (99, 136, 143, 162), "kind": "her", "final": "her", "text": "难绷",
+     "flat": 0.68, "ink": 15, "bg": (255, 255, 255)},
+    {"rect": (101, 233, 315, 256), "kind": "her", "final": "her", "text": "怎么识别到仲夏夜之梦的（",
+     "flat": 0.74, "ink": 16, "bg": (255, 255, 255)},
+    {"rect": (612, 30, 700, 44), "kind": "gray", "final": "gray", "text": "链接卡片的灰字",
+     "flat": 0.66, "ink": 12, "bg": (238, 238, 238)},
+    {"rect": (612, 50, 690, 62), "kind": "her", "final": "tiny", "text": "表情包里的小字",
+     "flat": 0.61, "ink": 7, "bg": (250, 250, 250)},
+    {"rect": (633, 298, 760, 328), "kind": "me", "final": "me", "text": "好像识别头像了",
+     "flat": 0.79, "ink": 16, "bg": (149, 236, 105)},
+]
 
 
 def _debug_packet():
@@ -62,8 +80,8 @@ def _debug_packet():
     w, h = img.width(), img.height()
     rgb = b"".join(bytes(img.constScanLine(y))[:w * 3] for y in range(h))
     return {"w": w, "h": h, "rgb": rgb, "scale": 1, "area": _AREA, "pane_top": 40,
-            "title": "白金搬砖小分队", "boxes": _BOXES, "lines": _LINES,
-            "ocr_ms": 261, "ts": time.time()}
+            "title": "白金搬砖小分队", "boxes": _BOXES, "lines": _LINES, "metrics": _METRICS,
+            "lh": 16.0, "pane_bg": (243, 243, 243), "ocr_ms": 261, "ts": time.time()}
 
 _CHAT = "白金搬砖小分队"  # 演示里「微信当前开着的」会话：用群聊，回复对象那一行才看得见
 # (会话, 谁, 内容, 群里的发言人, 时间[, 语音时长])：两个会话，下拉框里都能看到。
@@ -229,6 +247,8 @@ def main() -> int:
                      "chatlog": True,
                      "thinking": False,
                      "check_update": True, "debug_view": args.state == "debug",
+                     # 自动发送：默认关（开了会真发消息）。预览里只摆开关的样子，不发任何东西
+                     "auto_send": False,
                      # 只有宠物相关的状态才开宠物形态；其余状态保持「面板直接可见」，
                      # 不然面板从没 show 过，grab 出来是空的
                      "pet_enabled": args.state in ("pet", "pet-menu", "bar", "voice",
@@ -259,7 +279,7 @@ def main() -> int:
                            relay_base_url_text=None, relay_judge_path_text=None,
                            relay_thinking_style_text=None, pet_enabled_on=None,
                            opener_on=None, opener_minutes_n=None, history_on=None,
-                           chatlog_on=None):
+                           chatlog_on=None, auto_send_on=None):
         if context_n is not None:
             demo_settings["context"] = context_n
         if opener_minutes_n is not None:
@@ -281,7 +301,8 @@ def main() -> int:
         for name, value in (("reply_target", reply_target_on), ("thinking", thinking_on),
                             ("check_update", check_update_on), ("debug_view", debug_view_on),
                             ("pet_enabled", pet_enabled_on), ("opener", opener_on),
-                            ("history", history_on), ("chatlog", chatlog_on)):
+                            ("history", history_on), ("chatlog", chatlog_on),
+                            ("auto_send", auto_send_on)):
             if value is not None:
                 demo_settings[name] = bool(value)
 
@@ -340,6 +361,7 @@ def main() -> int:
         check_update=lambda: demo_settings["check_update"],
         debug_view=lambda: demo_settings["debug_view"],
         pet_enabled=lambda: demo_settings["pet_enabled"],
+        auto_send=lambda: demo_settings["auto_send"],
         history=lambda: demo_settings["history"],
         pet_pos=lambda: demo_settings["pet_pos"],
         save_pet_pos=lambda x, y: demo_settings.update(pet_pos=(x, y)),
@@ -347,7 +369,7 @@ def main() -> int:
     ), patch.multiple(chatlog, count=lambda: len(_MESSAGES), size=lambda: 1_254_000,
                       configure=lambda path: None, close=lambda: None,
                       append=lambda *a, **k: True, merge_voice=lambda *a, **k: False,
-                      clear=lambda: True):
+                      rewrite_tail=lambda *a, **k: True, clear=lambda: True):
         from PySide6.QtCore import QPoint, QTimer
         from app.overlay import Overlay
 

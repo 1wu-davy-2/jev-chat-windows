@@ -273,6 +273,14 @@ def pet_enabled() -> bool:
     """宠物优先形态：平时桌面上只有宠物，有消息才在它旁边弹候选条，点宠物展开完整面板。默认开。"""
     return bool(_read("pet_enabled", True))
 
+def auto_send() -> bool:
+    """**调试用**：模型排过序（ranked）时自动把匹配度最高的候选填入输入框并回车发出。
+
+    这是「绝不自动发送」那条硬约束唯一的例外，所以**默认关**，而且要用户自己在设置里拨开、
+    再点一次「保存设置」才生效（跟「桌面宠物」那种拨一下就生效的不一样）。判定在
+    main.auto_send_reply()，别在别处读这个开关去发消息。"""
+    return bool(_read("auto_send", False))
+
 def pet_pos():
     """宠物上次停在屏幕哪儿，返回 (x, y)；没存过或数据脏就返回 None，由界面放默认角落。
     这里不判断「还在不在屏幕里」——那要问 Qt，交给界面层。"""
@@ -355,7 +363,8 @@ def save(context_n: int | None = None, *,
          relay_thinking_style_text: str | None = None,
          pet_enabled_on: bool | None = None, opener_on: bool | None = None,
          opener_minutes_n: int | None = None, history_on: bool | None = None,
-         chatlog_on: bool | None = None, chat_pin_text: str | None = None) -> None:
+         chatlog_on: bool | None = None, auto_send_on: bool | None = None,
+         chat_pin_text: str | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -402,6 +411,8 @@ def save(context_n: int | None = None, *,
         "check_update": flag(check_update_on, check_update),
         "debug_view": flag(debug_view_on, debug_view),
         "pet_enabled": flag(pet_enabled_on, pet_enabled),
+        # 「绝不自动发送」那条硬约束唯一的例外（默认关）。见 auto_send() 的说明
+        "auto_send": flag(auto_send_on, auto_send),
         # 「固定盯着哪个会话」也不归这儿管（界面上那个小按钮走 save_chat_pin），但同样**必须
         # 带过去**：这里是把整份配置重写一遍，漏了哪个键就等于把它删了。
         "chat_pin": keep(chat_pin_text, "chat_pin"),
@@ -561,4 +572,13 @@ if __name__ == "__main__":
     save(10, chatlog_on=True)
     assert chatlog() is True
     assert chatlog_db().endswith("chatlog.db") and chatlog_db() != history_db(), "两个库别用同一个文件"
+
+    # 自动发送（「绝不自动发送」唯一的例外）：必须默认关，而且别的键写一遍不能把它带开
+    assert auto_send() is False, "这个是调试开关，默认必须是关的"
+    save(8)
+    assert auto_send() is False, "save 整份重写，没提到它就得原样留着（默认仍是关）"
+    save(10, auto_send_on=True)
+    assert auto_send() is True and _load_all()["auto_send"] is True
+    save(10, pet_enabled_on=False)
+    assert auto_send() is True, "改别的开关不能顺手把它关掉"
     print("settings ok")

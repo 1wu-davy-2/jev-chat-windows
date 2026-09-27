@@ -4,6 +4,7 @@ import difflib
 import re
 import time
 
+import cv2  # rapidocr 本来就带着它；「重新识别」放大消息区用（见 read 的 thorough）
 import numpy as np
 from rapidocr_onnxruntime import RapidOCR
 
@@ -100,11 +101,41 @@ def _has_icon(chat, box, kind, h):
 
 def _engine():
     """OCR 引擎全进程共用：一个实例 ~40MB，每个会话一个 Reader，不能各带一个。
-    det_limit_type 默认 'min' 会把小图放大到短边 736，裁小反而更慢；必须 'max'。"""
+    det_limit_type 默认 'min' 会把小图放大到短边 736，裁小反而更慢；必须 'max'。
+
+    **别再随手调检测阈值**：`det_box_thresh` 试过 0.5 → 0.3，真机上一帧的框集合**一个没变**
+    （10 个框，还是漏那两个）。限住短消息的是更上游的 `Det.thresh`（像素级二值化），
+    要动它得先想清楚怎么验——详见 CLAUDE.md「技术坑」里那条未解决的。"""
     global _ENGINE
     if _ENGINE is None:
         _ENGINE = RapidOCR(intra_op_num_threads=4, det_limit_type="max", det_limit_side_len=4000)
     return _ENGINE
+
+
+# TODO（未解决）：窗口字高小的时候（真机量到 lh = 12px），短消息会被整条漏掉——
+# 「?」检测器一个框都没有、「嗯」只检出一个 13×13、墨高 0 的歪框（框里一个深色像素都没有，
+# 说明框没落在字上）。两个都不是被 read() 那三道关过滤的，是**检测阶段就没框住**。
+# read(thorough=True) 的放大重读是照这条路试的补丁，但**还没在真机上验出效果**（调试窗每来一帧
+# 就刷新，用户很难抓到放大那一帧；现在的做法是让「重新识别」自己把框数报进聊天记录）。
+# 证据、试过什么、下一步试什么，全在 CLAUDE.md 的「技术坑 → 未解决」那一条里。
+_THOROUGH_SCALE = 2  # 「重新识别」把消息区放大这么多倍再 OCR，见 read(thorough=True)
+
+
+def engine_params() -> dict:
+    """引擎当前实际生效的几个参数。调试窗把它一起导出去——「改了参数没生效」和「改了没用」
+    从结果上看一模一样，把参数写在数据里才分得清（这个坑踩过：同一串数字贴了两遍）。"""
+    if _ENGINE is None:
+        return {}
+    return {"box_thresh": float(_ENGINE.text_det.postprocess_op.box_thresh),
+            "text_score": float(_ENGINE.text_score),
+            "thorough_scale": _THOROUGH_SCALE}
+
+
+def _upscale(img, k):
+    """把消息区放大 k 倍（双三次）。放大之后小字的笔画才够粗，检测器和识别器都稳得多。"""
+    if k <= 1:
+        return img
+    return cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_CUBIC)
 
 
 def read_title(header):
@@ -121,31 +152,35 @@ def read_title(header):
 
 
 def who_said(chat, box):
-    """按 OCR 框里的颜色分类，不看 x 坐标。返回 (谁, 底色, 墨高)：
+    """按 OCR 框里的颜色分类，不看 x 坐标。返回 (谁, 底色, 墨高, 众数占比)：
     先看底色平不平：框里众数颜色占比 <45% 就是图片（头像/照片/表情包）里的字 → None 丢掉。
     绿底 → me；非绿且文字对底色对比度 ≥150 → her；其余（引用块、群里的发言人名、时间戳、系统提示、
     链接卡片描述——都是灰字，对比度 80~95）→ "gray"。
     实测：气泡正文对比度 178~208，me 绿泡 142~150，灰字 ≤ 93。深浅主题都靠这套。
-    墨高 = 框里最长一段连续有字的行数（OCR 框对小字有固定 padding、还会蹭到上下行，不能拿框高比大小）。"""
+    墨高 = 框里最长一段连续有字的行数（OCR 框对小字有固定 padding、还会蹭到上下行，不能拿框高比大小）。
+
+    第 4 个返回值（众数占比）**只有调试窗要**——见 read() 里的 last_metrics。判定的三条线全是照真机
+    量出来的，出了「短消息被整条吃掉」这种问题，光看结果猜不出是哪条线卡的，得把数字摊开。"""
     xs, ys = [p[0] for p in box], [p[1] for p in box]
     reg = chat[int(min(ys)):int(max(ys)), int(min(xs)):int(max(xs))].astype(int)
     if reg.size == 0:
-        return None, None, 0
+        return None, None, 0, 0.0
     vals, cnt = np.unique(reg.reshape(-1, 3), axis=0, return_counts=True)
     bg = vals[cnt.argmax()]
-    if cnt.max() / reg.shape[0] / reg.shape[1] < 0.45:
+    flat = float(cnt.max()) / reg.shape[0] / reg.shape[1]  # 众数颜色占这块框的比例
+    if flat < 0.45:
         # 文字必须落在平底色上：WGC 帧是精确像素，气泡/面板里众数颜色占 0.56~0.82，
         # 头像/照片/表情包里只有 0.1~0.3——那是图片里的字（头像上的「借仲夏夜之梦」之类），不是消息。
         # ponytail: 只对精确像素的帧成立；缩放/压缩过的截图（比如拿预览窗再截一次的图）底色会糊成几百种颜色，全会被当图片。
-        return None, bg, 0
+        return None, bg, 0, flat
     diff = np.abs(reg @ [0.299, 0.587, 0.114] - bg @ [0.299, 0.587, 0.114])
     ink_h = best = 0
     for r in (diff > 60).any(axis=1):
         best = best + 1 if r else 0
         ink_h = max(ink_h, best)
     if bg[1] > bg[0] + 40 and bg[1] > bg[2] + 40:
-        return "me", bg, ink_h
-    return ("her" if diff.max() >= 150 else "gray"), bg, ink_h
+        return "me", bg, ink_h, flat
+    return ("her" if diff.max() >= 150 else "gray"), bg, ink_h, flat
 
 
 def bottom_speaker(lines, voices):
@@ -184,14 +219,26 @@ class Reader:
         self.last_voice_open = []  # 上面那些里**还没转过文字**的，给候选条决定要不要提示「转文字」
         self.seen_voice = []  # 已经报给父进程的语音 [(谁, 时长)]，按出现顺序攒着，new_voices 要用
         self.last_ms = 0  # 上一帧 OCR 耗时
+        self.last_metrics = []  # 调试窗「列出每个框的数据」用，见 read()
 
-    def read(self, chat, pane_bg):
+    def read(self, chat, pane_bg, thorough=False):
         """→ [(who, name, text, y)]，同一气泡的多行已合并。who ∈ me/her；name 群聊里是发言人，单聊 None。
-        顺带把每个框的分类记进 self.last_boxes（调试视图画框用，几十个 tuple，不开也不亏）。"""
+        顺带把每个框的分类记进 self.last_boxes（调试视图画框用，几十个 tuple，不开也不亏），
+        以及每个框的判定依据 last_metrics（弹出问题时要看数字，光看结论猜不出是哪条线卡的）。
+
+        thorough=True 时先把整块放大 `_THOROUGH_SCALE` 倍再 OCR：这条只给用户手动点的
+        「重新识别」走。字高只有 12px 上下时，检测器对小字号、孤零零一个字的短消息很不稳
+        （真机上「?」一个框都检不出、「嗯」检出一个墨高 0 的歪框），放大是最直接的补救。
+        **代价是慢三四倍**，所以正常的实时采集绝不能用它。框回来之后坐标折回原尺度，
+        下游（气泡范围、图标位置、调试窗）一律还按原图算。"""
         t0 = time.perf_counter()
-        res, _ = self.ocr(chat, use_cls=False)
+        k = _THOROUGH_SCALE if thorough else 1
+        # 只传 use_cls：RapidOCR.__call__ 收到**任何** kwargs 就会把 self.text_score 重置成它的
+        # 默认 0.5（`if kwargs:` 那一支），构造时配的 text_score 会被悄悄抹掉
+        res, _ = self.ocr(_upscale(chat, k), use_cls=False)
         self.last_ms = int((time.perf_counter() - t0) * 1000)
         self.last_boxes = []
+        self.last_metrics = []
         self.last_voice = []
         self.last_voice_open = []
         W = chat.shape[1]
@@ -200,14 +247,21 @@ class Reader:
         # ponytail: 名字行被 OCR 漏掉时会挂到上一个人头上。
         name, raw = None, []
         for box, text, _ in sorted(res or [], key=lambda r: r[0][0][1]):
-            kind, bg, h = who_said(chat, box)
+            if k > 1:  # 放大过就把框折回原尺度，后面一律按原图算
+                box = [(x / k, y / k) for x, y in box]
+            kind, bg, h, flat = who_said(chat, box)
             xs, ys = [p[0] for p in box], [p[1] for p in box]
             rect = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+            # 判定依据：出问题时把这一串摊给用户复制（调试窗那个按钮），数字比结论有用
+            m = {"rect": rect, "kind": kind or "", "text": text, "flat": flat, "ink": h,
+                 "bg": None if bg is None else tuple(int(v) for v in bg), "final": kind or ""}
+            self.last_metrics.append(m)
             if (_VOICE.fullmatch(text.strip()) or _VOICE_ICON.fullmatch(text.strip())
                     or (_DIGITS.fullmatch(text.strip()) and _has_icon(chat, box, kind, h))):
                 # 不进 raw（它没有正文，触发判断没意义），但位置记下来：
                 # 用户点「转文字」时要悬停到它上面。存的是**整个气泡**的范围，
                 # 不是这个 OCR 框——按钮挂在气泡外侧，得按气泡边缘算。见 app/voice.py
+                m["final"] = "voice"
                 self.last_boxes.append(rect + ("voice", text))
                 self.last_voice.append(_bubble_extent(chat, box, bg) + (text, kind))
                 continue
@@ -217,11 +271,13 @@ class Reader:
                              and not re.search("[:：]", text))
                 if taken:
                     name = text
-                self.last_boxes.append(rect + ("name" if taken else "gray", text))
+                m["final"] = "name" if taken else "gray"
+                self.last_boxes.append(rect + (m["final"], text))
                 continue
             if kind is None or (self.lh and h < 0.6 * self.lh):
                 # 字比正常气泡小得多 = 图片消息（截图/表情包）里的字，不是气泡
-                self.last_boxes.append(rect + ("image" if kind is None else "tiny", text))
+                m["final"] = "image" if kind is None else "tiny"
+                self.last_boxes.append(rect + (m["final"], text))
                 continue
             self.last_boxes.append(rect + (kind, text))
             raw.append((kind, name if kind == "her" else None, text, box[0][1], box[2][1], h))
@@ -332,6 +388,53 @@ class Reader:
         # 名字不参与判重：名字行滚出画面后同一条消息会从 her(LO) 变成 her，不能算新消息
         return any(w == who and similar(t, text) for w, _, t in self.seen)
 
+    def reset(self):
+        """把「见过哪些行」清掉：下一帧整屏都当新的报上去。
+
+        给界面上那个「重新识别」用（见 worker.run 的 reread）——平时绝不能调，一调就等于把
+        屏幕上所有消息重报一遍。只清 seen：floor 跟着没了（known_y 为空 → floor = -1），
+        每行都放行。**语音那份状态不动**（seen_voice / last_voice），不然屏幕上那几条语音会被
+        当成新出现的再记一遍「🔊 语音消息 N"」。"""
+        self.seen = []
+
+
+def reconcile(have, screen):
+    """把刚重读出来的整屏跟记录里已有的对一遍：哪些是漏掉的、哪些是同一条被读花了。
+
+    have / screen 都是 [(who, text)]，两边都按时间正序。have 传**记录的尾巴**（屏幕上那几屏
+    多半落在这几条里），screen 是刚读出来的整屏。
+
+    返回 (adds, fixes)：
+      adds  = [(插在 have 的第几条**之后**, who, text)]，屏幕上认得出、记录里没有的
+      fixes = [(have 里的下标, 新正文)]，同一条消息（同一个人 + similar 判同）但这次字不一样
+
+    **只加不删**：屏幕只显示最后那几屏，记录里比它多的那些是往上翻出去的老消息——不在这屏上
+    不等于不存在，删了才是真丢。所以对齐出来的 delete 段一律跳过。
+
+    配对从**后往前**：OCR 抖出来的差异是 1:1 的，从后往前配才不会因为中间多出一条就整段错位
+    （往前配的话第一条对不上，后面全跟着错）。"""
+    adds, fixes = [], []
+    a = [(str(w), str(t)) for w, t in have]
+    b = [(str(w), str(t)) for w, t in screen]
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag in ("equal", "delete"):
+            continue  # delete = 翻出去了，不动
+        block = []
+        for n, j in enumerate(range(j2 - 1, j1 - 1, -1)):
+            i = i2 - 1 - n
+            if i >= i1 and a[i][0] == b[j][0] and similar(a[i][1], b[j][1]):
+                block.append(("fix", i, b[j]))
+            else:
+                block.append(("add", max(i1, i + 1), b[j]))
+        for kind, at, item in reversed(block):  # 上面是倒着扫的，正过来
+            if kind == "fix":
+                fixes.append((at, item[1]))
+            else:
+                adds.append((at, item[0], item[1]))
+    adds.sort(key=lambda x: x[0])  # 调用方从后往前插，得按位置排好
+    fixes.sort()
+    return adds, fixes
+
 
 if __name__ == "__main__":
     def voice(t):
@@ -353,6 +456,30 @@ if __name__ == "__main__":
     # 前括号开头的不认（「（3）」「(3」这种真消息比「)3」常见），带正文的更不认
     for t in ("（3）", "(3", "3)", "好)3", ")3点见", "）3楼", "3", "8"):
         assert not _VOICE_ICON.fullmatch(t.strip()), t
+
+    # 「重新识别」的放大重读：坐标要能折回原尺度（框是放大后给的，下游一律按原图算）
+    assert _upscale(np.zeros((10, 20, 3), np.uint8), 1).shape == (10, 20, 3)
+    assert _upscale(np.zeros((10, 20, 3), np.uint8), 2).shape == (20, 40, 3)
+    assert _THOROUGH_SCALE >= 2, "只放一倍对 12px 的小字不够，检测器照样不稳"
+
+    # 重读之后跟记录对账：漏掉的补进来、读花了的就地改、翻出去的老消息一条都不许删
+    _have = [("her", "在吗"), ("me", "在"), ("her", "周末爬山去不去")]
+    assert reconcile(_have, [("her", "在吗"), ("me", "在")]) == ([], []), "一模一样就不动"
+    # 屏幕上多出一条（就是漏掉的那种，真机上「?」「嗯」这种单字被吃掉过）
+    assert reconcile(_have, [("her", "在吗"), ("me", "在"), ("her", "?"),
+                             ("her", "周末爬山去不去")]) == ([(2, "her", "?")], [])
+    # 同一条被读花了 → 改，不新增；两边都按「最后一条」对，中间多一条也不会整段错位
+    assert reconcile(_have, [("her", "在吗"), ("me", "在"), ("her", "周末爬山去不去啊")]) \
+        == ([], [(2, "周末爬山去不去啊")])
+    # 记录里比屏幕多 = 往上翻出去了 → 一条都不删
+    assert reconcile(_have, [("her", "周末爬山去不去")]) == ([], [])
+    # 屏幕上最新那条记录里没有 → 补在最后
+    assert reconcile(_have, _have + [("her", "嗯")]) == ([(3, "her", "嗯")], [])
+    # 换人了就不算同一条：同样一句「在吗」，她说和我说是两条
+    assert reconcile([("her", "在吗")], [("me", "在吗")]) == ([(1, "me", "在吗")], [])
+    # 一大段全对不上（切了会话/滚远了）也不会崩，全当新的补
+    adds, _ = reconcile([("her", "甲")], [("her", "乙"), ("me", "丙")])
+    assert adds == [(0, "her", "乙"), (1, "me", "丙")], adds
 
     # 引号被整个读丢时只剩一个裸数字（真机上出现过「3"」→「3」），这时只能靠像素认：
     # 造一块气泡底，数字左边有喇叭图标 = 语音时长，空着 = 真消息

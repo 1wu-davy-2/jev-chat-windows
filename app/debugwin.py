@@ -5,8 +5,8 @@ from datetime import datetime
 
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPen
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
-from qfluentwidgets import PlainTextEdit
+from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from qfluentwidgets import PlainTextEdit, PushButton
 
 # (kind, 画框的色, 色的中文, 这类是什么)：跟设置页那条提示一个口径
 _KINDS = (("me", "#18794e", "绿", "我"), ("her", "#1f6fd0", "蓝", "对方"),
@@ -17,6 +17,34 @@ _COLOR = {k: c for k, c, _, _ in _KINDS}
 _NAME = {k: n for k, _, _, n in _KINDS}
 _AREA = "#1f6fd0"  # 消息区
 _HEAD = "#8b5cf6"  # 头部（会话名那条）
+
+
+def _box_dump(pkt):
+    """把每个识别框的判定依据列成人能读的几行。
+
+    为什么要它：OCR 会把短消息整条吃掉（真机上「?」「嗯」这种单字），而三道关——**当图片**
+    （众数底色占比 < 0.45）、**当小字**（墨高 < 0.6×lh）、**当灰字**（对比度 < 150）——到底哪一道
+    吃的、离阈值差多少，光看「被丢掉了」这个结论是猜不出来的，得把数字摊开。
+
+    **只出数字和 OCR 读出来的字，不出图、不落盘**：按钮把这段文字塞进剪贴板，用户自己粘出去。"""
+    lh = pkt.get("lh") or 0
+    eng = pkt.get("engine") or {}
+    stamp = datetime.fromtimestamp(pkt.get("ts") or 0).strftime("%H:%M:%S")
+    out = [f"帧时间 {stamp} · 会话 {pkt.get('title') or '（未识别）'}"
+           f" · 消息区底色 {pkt.get('pane_bg')} · 参考字高 lh = {lh}",
+           f"引擎 box_thresh {eng.get('box_thresh')} / text_score {eng.get('text_score')}"
+           f" · 这一帧是放大重读：{'是' if pkt.get('thorough') else '否'}",
+           f"阈值：众数占比 < 0.45 当图片 · 墨高 < {0.6 * lh:.1f}（0.6×lh）当小字 · 对比度 < 150 当灰字",
+           ""]
+    for m in pkt.get("metrics", ()):
+        x0, y0, x1, y1 = m["rect"]
+        out += [f"框 ({x0},{y0})-({x1},{y1})  {x1 - x0}×{y1 - y0}px",
+                f"    底色 {m['bg']}   众数占比 {m['flat']:.2f}   墨高 {m['ink']}",
+                f"    颜色判成 {m['kind'] or '（当图片）'} → 最后判成 {m['final']}"
+                f"   OCR 文字「{m['text']}」"]
+    if not pkt.get("metrics"):
+        out.append("（这一帧没有识别框）")
+    return "\n".join(out)
 
 
 class _Canvas(QWidget):
@@ -86,15 +114,34 @@ class DebugWindow(QWidget):
         row.setSpacing(8)
         self.canvas = _Canvas(self)
         row.addWidget(self.canvas, 1)
+        right = QVBoxLayout()
+        right.setSpacing(6)
+        # 复制这一帧每个框的判定依据：识别漏了东西时把这串数字发出去，比截图和猜都快。
+        # 只进剪贴板，不写文件（见 _box_dump）
+        self.copyButton = PushButton("复制框数据", self)
+        self.copyButton.setToolTip("把这一帧每个识别框的底色、众数占比、墨高、分类和 OCR 文字"
+                                   "复制到剪贴板。只出文字和数字，不出图、不写文件。")
+        self.copyButton.clicked.connect(self._copy_boxes)
+        right.addWidget(self.copyButton)
         self.info = PlainTextEdit(self)
         self.info.setReadOnly(True)
         self.info.setFixedWidth(300)
         self.info.setPlainText(_legend())
-        row.addWidget(self.info)
+        right.addWidget(self.info)
+        row.addLayout(right)
         outer.addLayout(row)
         self.status = QLabel("最近一帧 —— · 等待中…", self)
         self.status.setStyleSheet("color: #68776f;")
         outer.addWidget(self.status)
+
+    def _copy_boxes(self):
+        """把当前这一帧的框数据塞进剪贴板。没有帧就什么都不做，别塞一段空的进去把人原来的剪贴板顶掉。"""
+        if not self.canvas.pkt:
+            self.status.setText("还没有帧——先把聊天窗口弄出点动静")
+            return
+        QApplication.clipboard().setText(_box_dump(self.canvas.pkt))
+        self.status.setText(f"已复制 {len(self.canvas.pkt.get('metrics', ()))} 个框的数据，"
+                            "直接粘出去就行")
 
     def show_packet(self, pkt):
         """子进程送来的一帧：RGB 裸字节 → QImage（copy 一份，原 bytes 之后就回收了）。"""
@@ -115,6 +162,8 @@ class DebugWindow(QWidget):
             "框：" + ("、".join(f"{_NAME.get(k, k)} {v}" for k, v in counts.items()) or "无"),
             "",
             f"本帧 {len(pkt.get('lines', ()))} 行",
+            "",
+            "（要看每个框的判定依据，点上面的「复制框数据」）",
         ]
         for who, name, line in pkt.get("lines", ()):
             text.append(f"{who}({name})：{line}" if name else f"{who}：{line}")

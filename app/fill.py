@@ -1,8 +1,19 @@
 # -*- coding: utf-8 -*-
-"""把选中的候选填进微信输入框：写剪贴板 → 点输入框 → Ctrl+V。绝不发回车、绝不点发送。"""
+"""把选中的候选填进微信输入框：写剪贴板 → 点输入框 → Ctrl+V。
+
+`fill()` 到此为止，不发回车、不点发送——发不发、改不改，人来。
+
+`press_enter()` 是**全工程唯一**一处会真把消息发出去的代码：只被「系统设置」里那个
+**默认关着**的「自动发送」调试开关那条路调用（`main.auto_send_reply()`），见 CLAUDE.md 硬约束 4。
+别在别处调它，也别把回车并进 `fill()`——那样「填入」这个动作本身就变成发送了，
+界面上每一次「填入」都会直接发出去。"""
 import ctypes
 import ctypes.wintypes as w
 import time
+
+# 粘完到敲回车之间留的时间：给微信把剪贴板那段文字吃进输入框。刚 Ctrl+V 完就敲，
+# 赶上输入框还没更新完，发出去的会是空的或者半截——这俩都比不发更糟。
+_SEND_SETTLE = 0.3
 
 u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
 
@@ -94,3 +105,18 @@ def fill(hwnd, area, text):
     u32.keybd_event(0x56, 0, 2, 0)
     u32.keybd_event(0x11, 0, 2, 0)
     # 到此为止。发不发、改不改，人来。
+
+
+def press_enter(hwnd):
+    """敲一下回车 = 把输入框里的内容发出去。**全工程唯一一处会发送消息的代码。**
+
+    调用点只有 `main.auto_send_reply()` 一处——「系统设置」里那个默认关着的「自动发送」
+    调试开关。加第二个调用点之前先想清楚 CLAUDE.md 硬约束 4 那条边界。
+
+    前提跟 `fill()` 一样：微信在前台、输入框里已经有粘好的字。这里再要一次前台是故意的：
+    回车是打给**当前前台窗口**的，粘贴完之后要是焦点跑到别的程序去了（用户手快点了别处），
+    这一下回车就落在那个程序里——那比不发还糟。前台切回来再敲，至少落在微信上。"""
+    foreground(hwnd)
+    time.sleep(_SEND_SETTLE)
+    u32.keybd_event(0x0D, 0, 0, 0)  # Enter 按下（VK_RETURN）
+    u32.keybd_event(0x0D, 0, 2, 0)  # 抬起

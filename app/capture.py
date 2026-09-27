@@ -120,6 +120,7 @@ class Capture:
 
         self.settle, self.max_wait = settle, max_wait
         self.shape = self.area = self.last = self.pending = None
+        self.last_full = None  # 最近一帧整帧（画面变了才更新），给「重新识别」用，见 snapshot()
         self.t = self.t0 = 0.0
         # 包装层默认 cursor_capture=True，会去调 SetIsCursorCaptureEnabled。
         # 这个属性要 Win10 2004（build 19041）才有，1909 及更早直接抛 CursorConfigUnsupported。
@@ -143,6 +144,7 @@ class Capture:
         if self.last is not None and np.array_equal(chat, self.last):
             return
         self.last = chat
+        self.last_full = full  # 画面变了才更新，所以它跟 self.last 是同一张图
         if self.pending is None:
             self.t0 = time.perf_counter()
         self.pending, self.t = full, time.perf_counter()
@@ -159,6 +161,14 @@ class Capture:
             return None
         full, self.pending = self.pending, None
         return full
+
+    def snapshot(self):
+        """不管画面变没变，把手上最近那一帧交出来（「重新识别」用）。
+
+        settled() 只在画面**刚变过、又停稳了**的时候给帧，而用户点重新识别的时候画面多半早就
+        静止了——没有这一手，那个按钮点了等于没点。留一份最近整帧的引用不额外占内存：
+        pending 本来就压着一帧，两个指向的是同一张图。真的一帧都还没来过就返回 None。"""
+        return self.pending if self.pending is not None else self.last_full
 
     def alive(self):
         return not self.ctl.is_finished()

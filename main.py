@@ -20,8 +20,8 @@ from collections import deque
 
 from app import settings, update, voice, worker
 from app.capture import find_wechat_hwnd
-from app.fill import fill
-from app.ocr import similar
+from app.fill import fill, press_enter
+from app.ocr import reconcile, similar
 from app.overlay import Overlay
 from app.version import VERSION
 from core import chatlog, trace
@@ -53,6 +53,9 @@ _QUIET_MAX = 30.0
 _RESTORE_LINES = 300
 _RESTORE_HISTORY = 60
 _RESTORE_CHATS = 40  # 下拉框最多接回这么多个会话，免得历史一大堆时那个框长得没法用
+_REREAD_HAVE = 40  # 「重新识别」对账时往回看记录里的多少条（屏幕上一屏十来条，留够对齐的余量）
+# 子进程报回来的「被丢掉的框」是哪种丢法，翻成人话。这三道关见 app/ocr.py 的 read()
+_DROPPED_WHY = {"image": "当成图片里的字", "tiny": "当成小字", "gray": "当成灰字"}
 results = queue.Queue()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
 
@@ -234,7 +237,11 @@ def target_of(title):
     return chat["senders"][0] if chat["senders"] else None
 
 
-def fill_reply(text):
+def fill_reply(text, send=False):
+    """把文字填进微信输入框。`send=True` 时填完再敲一下回车，把消息真发出去。
+
+    **传 send=True 的只有 auto_send_reply() 一处**（「系统设置」里那个默认关着的「自动发送」
+    调试开关）——界面上那个「填入」按钮永远走默认的 send=False，填完就停手。见 CLAUDE.md 硬约束 4。"""
     if state["hwnd"] is None:  # 子进程重开过，hwnd 可能换了，用最新的
         raise RuntimeError("未找到聊天窗口，请确认已经打开")
     if state["area"] is None:
@@ -248,6 +255,52 @@ def fill_reply(text):
         if target:
             text = f"@{target} " + text  # 纯文本，微信不认成真正的 @，只是让群里看得出在跟谁说
     fill(state["hwnd"], state["area"], text)
+    if send:
+        press_enter(state["hwnd"])  # 到这儿才真的发出去；上面只是把字放进输入框
+
+
+def auto_send_reply(title, r):
+    """「系统设置」里那个默认关着的「自动发送」调试开关：填入匹配度最高的候选，再回车发出。
+
+    这是「绝不自动发送」那条硬约束**唯一的例外**（见 CLAUDE.md 硬约束 4），所以下面四条
+    每条都得成立才动，缺一条就写一行聊天记录、什么都不做：
+
+    ① 开关开着（默认关，而且要点「保存设置」才生效）；
+    ② `r["ranked"]`——模型确实把三条排过序。**没排序就不发**：那会儿 best_index 只是退回
+       第一条、不是模型选的，发出去等于随机挑一条发给真人。跟界面上「没排序就不标推荐」
+       同一个道理，别为了「总得发点什么」把这个闸拆了；
+    ③ 微信屏幕上开着的正是被分析的那个会话——粘贴是发给微信当前会话的，固定模式下面板钉在 A、
+       微信可能早开到 B 了（fill_reply 里还有一道，这里先说清楚为什么没发）；
+    ④ 采集没停——暂停就是「先别管我」，跟冷场开场白那条一个口径。
+
+    异常一律吞掉只记日志：这是旁路，不能因为我这儿出岔子把 tick 带崩。
+    发完刻意把话说死「可在微信里撤回」，别让状态栏读起来像「已经处理妥当、不用管了」。"""
+    if not settings.auto_send():
+        return
+    if r.get("opener"):
+        return  # 开场白只起草、不问 Jev（judged/ranked 全假），压根没有「匹配度」这一说
+    if not r.get("ranked"):
+        return  # 没排序就没有「最匹配」，宁可不发
+    if not capture_on.is_set():
+        ov.log("[自动发送] 采集已暂停，这一轮没发")
+        return
+    if ov.current_chat() != ov.screen_chat():
+        ov.log(f"[自动发送] 微信现在开着「{ov.screen_chat()}」，不是「{title}」，没发")
+        return
+    cands = r.get("candidates") or []
+    index = r.get("best_index") or 0
+    if not (0 <= index < len(cands)) or not cands[index].strip():
+        ov.log("[自动发送] 这一轮没有可发的候选")
+        return
+    try:
+        fill_reply(cands[index], send=True)
+    except Exception as e:
+        ov.set_status("自动发送失败，请确认聊天窗口可用。", "error")
+        ov.log(f"[自动发送失败] {type(e).__name__}: {e}")
+        return
+    mark_used(index, "auto")  # 记进 AI 记录：这一轮用的是「自动发送」，不是人点的
+    ov.log(f"[自动发送] 已发出第 {index + 1} 条：{cands[index]}")
+    ov.set_status("已自动发送，可在微信里撤回。", "warning")
 
 
 def convert_voice():
@@ -280,7 +333,7 @@ def convert_voice():
 def spawn_worker():
     """开一个采集子进程，它跟着 capture_on 走：置位=采集，清掉=暂停。"""
     p = multiprocessing.Process(target=worker.run,
-                                args=(q, state["hwnd"], capture_on, debug_on, voice_until),
+                                args=(q, state["hwnd"], capture_on, debug_on, voice_until, reread),
                                 daemon=True)
     p.start()
     return p
@@ -343,6 +396,88 @@ def restore_log():
         for who, text, name, _stamp, _voice in rows[-_RESTORE_HISTORY:]:
             chat["history"].append((who, text, name or None))
         ov.restore(title, rows)
+
+
+def reread_now():
+    """界面上的「重新识别」：叫子进程把手上那一帧**整个重读一遍**，回来跟记录对账。
+
+    不是「再等等看有没有新消息」——子进程那边的去重状态会被清掉，屏幕上每一屏都当新的报回来
+    （见 worker.run 的 reread / ocr.Reader.reset），父进程拿它跟已有的记录对。
+
+    只在采集真跑着的时候有意义：暂停着的时候子进程卡在 `enabled.wait()` 上，根本轮不到它。"""
+    if child is None or not capture_on.is_set():
+        ov.set_status("采集没在跑，先打开采集再重新识别", "warning")
+        return
+    reread.value += 1
+    # 这一遍子进程会把消息区放大再 OCR（短消息认得准得多，代价是慢三四倍），先说一声
+    ov.set_status("正在重新识别（放大重读，稍慢）…", "busy")
+
+
+def apply_reread(title, screen, dropped=(), stats=None):
+    """「重新识别」回来的整屏跟记录对账：漏掉的补进来、读花了的就地改掉。
+
+    **只补记录，不点火**：用户点它是为了把记录理顺（真机上「?」「嗯」这种单字被 OCR 吃掉过），
+    不是要再问一次 AI。所以这里不碰 pending / notify_until / rev。
+
+    screen 是**整屏**不是增量，所以不能走 `_already_read` 那道——那道会把整批当旧的丢掉，
+    正好把要补的那几条也一并丢了。
+
+    dropped 是子进程报回来的「被丢掉的框」[(分类, 正文, rect)]。这一批**本来就没进 screen**，
+    对账再对也补不回来——但它恰好能说清楚是三道关里的哪一道吃掉的（见 app/ocr.py 的 read）。
+    界面上要说一句，不然用户只会看到「补上 1 条」而屏幕上明明还挂着两条没认出来的。"""
+    chat = chat_of(title)
+    have = list(chat["history"])[-_REREAD_HAVE:]
+    adds, fixes = reconcile([(w, t) for w, t, _ in have], [(w, t) for w, _n, t, _d in screen])
+    base = len(chat["history"]) - len(have)
+    # 库里那一段尾巴要整段重写（漏掉的往往插在中间，append 追不进去，见 chatlog.rewrite_tail）。
+    # 先记下「这一段从界面的第几条开始」——改完之后顺序会变，那时候再找就找不着了
+    lines = ov.feeds.get(title, [])
+    at = ov.feed_index(title, have[0][:2]) if have else -1
+    if at < 0:
+        at = max(0, len(lines) - len(have))  # 锚点翻出去了：退回按条数截尾巴，别整段不写
+    drop = len(lines) - at
+    # 先改、后插：插进去会把后面的下标顶掉，而 fixes 记的是插之前的下标
+    for i, text in fixes:
+        who, old, name = chat["history"][base + i]
+        chat["history"][base + i] = (who, text, name)
+        ov.fix_message(title, who, old, text)
+    for pos, who, text in reversed(adds):  # 从后往前插，前面的位置才不会被顶掉
+        index = base + pos
+        chat["history"].insert(index, (who, text, None))
+        before = chat["history"][index - 1][:2] if index > 0 else None
+        ov.insert_message(title, before, who, text)
+    if adds or fixes:
+        # 顺序、正文、时间、语音标记全以界面那份为准；drop 是原来那一段的条数
+        # （界面里还有「🔊 语音消息 N"」这种不进 history 的占位行，拿 len(have) 会删错）
+        chatlog.rewrite_tail(title, ov.feeds.get(title, [])[at:], drop)
+    # 被 OCR 直接丢掉的框。空正文的（纯图标）和时间戳那种纯数字/冒号的灰字是故意不要的，
+    # 别拿来吓人——用户看到的应该是「屏幕上还有哪句话没认出来」
+    missed = [d for d in dropped
+              if str(d[1]).strip() and not re.fullmatch(r"[\d:：\s./\-]+", str(d[1]))]
+    bits = [b for b in (f"补上 {len(adds)} 条" if adds else "",
+                        f"改了 {len(fixes)} 条" if fixes else "") if b]
+    if missed:
+        why = "、".join(sorted({_DROPPED_WHY.get(d[0], d[0]) for d in missed}))
+        ov.set_status(f"重新识别：{len(missed)} 条被 OCR 丢掉了（{why}），看聊天记录", "warning")
+    else:
+        ov.set_status("重新识别：" + "，".join(bits) + "。" if bits
+                      else "重新识别：跟记录一致，没有漏掉的消息。",
+                      "success" if bits else "idle")
+    # 具体是哪几条写进聊天记录那片（居中灰字，跟采集状态行一个位置），状态栏只放得下一句
+    done = [f"补：{'对方' if w == 'her' else '我'}「{t}」" for _at, w, t in adds]
+    done += [f"改：「{t}」" for _i, t in fixes]
+    if done:
+        ov.log("重新识别 · " + "；".join(done[:6]) + ("…" if len(done) > 6 else ""))
+    if stats:
+        # 放大重读那一遍认出来多少：跟实时那一路的框数一比就知道放大有没有用
+        ov.log("重新识别 · 放大 %s 倍重读：认出 %s 个框 / %s 行，耗时 %s ms"
+               % (stats.get("scale"), stats.get("boxes"), stats.get("lines"), stats.get("ms")))
+    for kind, text, rect, flat, ink in missed[:6]:
+        ov.log("重新识别 · 「%s」被%s丢掉了：%d×%dpx，众数占比 %.2f、墨高 %d"
+               % (text, _DROPPED_WHY.get(kind, kind), rect[2] - rect[0], rect[3] - rect[1],
+                  flat, ink))
+    if len(missed) > 6:
+        ov.log(f"重新识别 · 另有 {len(missed) - 6} 条被丢掉的，没全列")
 
 
 def set_chatlog(on):
@@ -667,6 +802,12 @@ def drain():
             if state["pending"] and state["pending"][0] == msg[1]:
                 schedule_analyze(msg[1])
             continue
+        if kind == "reread":  # 用户点了「重新识别」：整屏回来了，跟记录对账（只补记录，不点火）
+            _, title, new, area, latest = msg[:5]
+            state["area"] = area
+            apply_reread(title, new, msg[5] if len(msg) > 5 else (),
+                         msg[6] if len(msg) > 6 else None)
+            continue
         if kind == "paused":  # 子进程确认已暂停
             ov.set_capture(False)
             continue
@@ -779,6 +920,9 @@ def tick():
                 chat["run_id"] = r.get("run_id")  # 「填入」时回填到 AI 记录里的就是这一轮
                 if title == ov.current_chat():
                     ov.show(r)
+                    # 「自动发送」调试开关（默认关）。摆在这儿是因为候选刚贴上去、人还没动手，
+                    # 也保证了「正看着这个会话」这条已经成立。不开开关时这个函数第一行就返回
+                    auto_send_reply(title, r)
                 else:
                     ov.set_busy(False)
             else:
@@ -820,6 +964,9 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     # 点了「转文字」之后盖的时间戳（time.monotonic()，同机同基准），子进程拿它决定
     # 认不认「语音气泡下面的新文字」。见 convert_voice() 和 app/worker.py
     voice_until = multiprocessing.Value("d", 0.0)
+    # 「重新识别」的计数器：父进程点一次 +1，子进程见一个没见过的值就把去重状态清掉、整屏重报
+    # （见 reread_now / app/worker.py）。用计数不用时间窗口——点的时候画面多半是静止的
+    reread = multiprocessing.Value("i", 0)
     state["pin"] = settings.chat_pin()  # 上次固定在哪个会话（"" = 跟随微信切），下面照样摆到界面上
     state["chat"] = state["pin"]
     ov = Overlay(on_fill=fill_reply, on_toggle_capture=on_toggle_capture,
@@ -828,7 +975,7 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
                  on_settings_saved=on_settings_saved, on_open_history=open_history,
                  on_use=mark_used, on_pin_change=set_pin,
                  on_relation_change=set_relation, on_scene_change=set_scene,
-                 on_toggle_chatlog=set_chatlog,
+                 on_toggle_chatlog=set_chatlog, on_reread=reread_now,
                  result_of=lambda t: chats.get(t, {}).get("result"))
     restore_log()  # 先把上次的记录接回来，再摆固定会话、再开采集（顺序有讲究，见函数里）
     if state["pin"]:

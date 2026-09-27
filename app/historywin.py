@@ -25,6 +25,9 @@ from core import trace
 from core.questions import CHOICE_LABELS, QUESTION_LABELS
 
 _KIND = {"reply": "回复", "opener": "开场白"}
+# 「最后用了哪条」的动作名。auto = 系统设置里那个「自动发送」调试开关替人发的
+# （trace.mark_used 的 action 参数，加一个新动作就往这儿加一条）
+_USED_LABELS = {"fill": "填入", "copy": "复制", "auto": "自动发送"}
 _REFRESH_MS = 3000
 
 
@@ -154,8 +157,10 @@ def _lines(row: dict) -> list[str]:
         out.append(f"  {i + 1}. {c}{pct}" + (mark if i == row.get("best_index") else ""))
     out += ["", "══ 人最后用了哪条 ══"]
     if row.get("used_action"):
+        # 认不出的动作原样打出来，别再退回「复制」——那会把「自动发送」说成复制（加新动作时
+        # 记得往 _USED_LABELS 里加一条，不然就是这句兜底在显示 raw 值）
         out.append(f"  {_clock(row.get('used_at'))} "
-                   + ("填入" if row["used_action"] == "fill" else "复制")
+                   + _USED_LABELS.get(row["used_action"], row["used_action"])
                    + f"第 {(row.get('used_index') or 0) + 1} 条：{_blank(row.get('used_text'))}")
     else:
         out.append("  （没用这一轮的候选——自己手打的，或者这轮被后来的消息顶掉了）")

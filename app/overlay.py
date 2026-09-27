@@ -743,7 +743,8 @@ class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
                  on_toggle_debug=None, on_voice_convert=None, on_opener_again=None,
                  on_settings_saved=None, on_open_history=None, on_use=None, on_pin_change=None,
-                 on_relation_change=None, on_scene_change=None, on_toggle_chatlog=None):
+                 on_relation_change=None, on_scene_change=None, on_toggle_chatlog=None,
+                 on_reread=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。
@@ -756,7 +757,8 @@ class Overlay:
         （它才是准的那一份，界面这边只是照着显示，见 set_pin）。
         on_relation_change(会话名, 关系键) → 用户给这个会话挑了关系；on_scene_change 同理，
         挑的是场景模板（第二项为空串 = 跟随关系）。两个都是拨一下立刻写盘、下次生成才用。
-        on_toggle_chatlog(开不开) → 「聊天会话存储」那个开关，拨一下立刻生效（父进程配库）。"""
+        on_toggle_chatlog(开不开) → 「聊天会话存储」那个开关，拨一下立刻生效（父进程配库）。
+        on_reread() → 用户点了「重新识别」，要叫醒子进程把屏幕整个重读一遍（父进程那边发信号）。"""
         self.app = QApplication.instance() or QApplication([])
         self.app.setWindowIcon(_app_icon())
         setTheme(Theme.LIGHT)
@@ -774,6 +776,7 @@ class Overlay:
         self.on_relation_change = on_relation_change
         self.on_scene_change = on_scene_change
         self.on_toggle_chatlog = on_toggle_chatlog
+        self.on_reread = on_reread
         self.result_of = result_of
         self._voices = {}  # {会话名: [(x0,y0,x1,y1,时长)]}，语音气泡的位置，转文字要右键它
         self._opener = {}  # {会话名: 对方多少分钟没回}，现在摆的是开场白（不是回复）的会话
@@ -892,7 +895,9 @@ class Overlay:
         self.app.aboutToQuit.connect(self.hotkeys.unregister_all)
         footer = QHBoxLayout()
         footer.setContentsMargins(GAP_LG, GAP_SM, GAP_SM, GAP_SM)
-        footer.addWidget(_label(f"仅填入输入框 · 发送由你确认 · v{VERSION}", FONT_XS, _MUTED), 1)
+        self.footerNote = _label("", FONT_XS, _MUTED)  # 文案跟着「自动发送」开关走，见 _sync_footer
+        footer.addWidget(self.footerNote, 1)
+        self._sync_footer()
         grip = QSizeGrip(self.win)
         grip.setFixedSize(16, 16)
         footer.addWidget(grip, 0, Qt.AlignBottom)
@@ -1115,10 +1120,23 @@ class Overlay:
         self.referenceNote.hide()
         body.addWidget(self.referenceNote)
 
+        log_row = QHBoxLayout()
+        log_row.setSpacing(GAP_SM)
         self.historyButton = PushButton(FIF.HISTORY, "聊天记录")
         self.historyButton.clicked.connect(self._toggle_history)
         self.historyButton.setAccessibleName("展开或收起聊天记录")
-        body.addWidget(self.historyButton)
+        log_row.addWidget(self.historyButton, 1)
+        # 重新识别：把微信里现在这几屏**整个重读一遍**，跟下面的记录对账——漏掉的补进来、
+        # 之前读花了的就地改掉（真机上出现过「?」「嗯」这种单字被 OCR 吃掉、当没说过）。
+        # 采集只在画面变过才交帧，点它的时候画面多半早静止了，所以走 Capture 留的那份最近帧
+        self.rereadButton = PushButton("重新识别")
+        self.rereadButton.clicked.connect(self._reread)
+        self.rereadButton.setAccessibleName("重新识别屏幕上的消息")
+        self.rereadButton.setToolTip(
+            "把聊天窗口里现在这几屏重新读一遍，跟下面的记录对一下：漏掉的补进来，"
+            "之前读花了的就地改掉。只补记录，不会去问 AI。")
+        log_row.addWidget(self.rereadButton, 0)
+        body.addLayout(log_row)
         self.feed = _ChatLog()
         self.feed.setMinimumHeight(160)
         self.feed.hide()
@@ -1273,6 +1291,28 @@ class Overlay:
             "另开一个窗口实时显示截到的画面和识别框：绿 = 我、蓝 = 对方、灰 = 过滤掉的灰字、"
             "红 = 当成图片丢掉、黄 = 小字丢掉、紫 = 语音消息丢掉。只在内存里画，不存图。"
         ))
+        # 「绝不自动发送」那条硬约束唯一的例外（见 CLAUDE.md 硬约束 4）。摆在这儿是故意的：
+        # 跟调试视图挨着，用户知道自己在拨一个开发用的东西。**要点「保存设置」才生效**——
+        # 这个开关会真发消息，多一步确认不算麻烦；而且它没有需要实时联动的界面状态，
+        # 不像「桌面宠物」「调试视图」那样必须拨一下立刻生效。
+        autosend_row = QHBoxLayout()
+        autosend_row.addWidget(_label("自动发送", FONT_MD), 1)
+        self.autoSendSwitch = SwitchButton()
+        self.autoSendSwitch.setOnText("开")
+        self.autoSendSwitch.setOffText("关")
+        self.autoSendSwitch.setAccessibleName("自动发送")
+        autosend_row.addWidget(self.autoSendSwitch)
+        box.addLayout(autosend_row)
+        # 这条不走 _hint()：那一行是灰的，而这条得让人一眼看见——它讲的是「会真发消息」。
+        # 用 WARN 色加粗，但照样登记进 _hintLabels，紧凑模式跟别的说明一起藏。
+        warn = _label(
+            "调试用，开了会真的替你发消息。模型确实排过序时，把匹配度最高的那条候选填进"
+            "输入框、再敲回车发出去——发之前不问你，撤回只有 2 分钟。只在「微信开着的正是"
+            "这个会话」「采集没暂停」「模型确实排了序」三条都成立时才动"
+            "（没排序就没有「最匹配」，那种一律不发）。默认关，用完记得关掉；"
+            "拨完要点下面的「保存设置」才生效。", FONT_XS, theme.WARN, bold=True)
+        self._hintLabels.append(warn)
+        box.addWidget(warn)
         pet_row = QHBoxLayout()
         pet_row.addWidget(_label("桌面宠物", FONT_MD), 1)
         self.petSwitch = SwitchButton()
@@ -1323,7 +1363,7 @@ class Overlay:
         type_row.addWidget(self.relDelButton)
         box.addLayout(type_row)
         box.addWidget(self._hint(
-            "内置这几型（朋友、恋人、暧昧、同事、职场、家人）各有出厂正文，可以随便改；自己新增的"
+            "内置这几型（朋友、恋人、暧昧、同事、职场、家人、18+）各有出厂正文，可以随便改；自己新增的"
             "（前女友、老板……）名字和正文都自己写。"))
         self.relNameLabel = _label("这种关系叫什么", FONT_MD)
         box.addWidget(self.relNameLabel)
@@ -1628,6 +1668,8 @@ class Overlay:
         self.thinkingSwitch.setChecked(settings.thinking())
         self.historySwitch.setChecked(settings.history())
         self.updateSwitch.setChecked(settings.check_update())
+        # 自动发送没有连 checkedChanged（它按「保存设置」生效），所以不用 blockSignals
+        self.autoSendSwitch.setChecked(settings.auto_send())
         self.set_debug_switch(settings.debug_view())  # 屏蔽信号地拨，别在加载时开关一遍窗口
         self.petSwitch.blockSignals(True)  # 同上：加载时别真去开关宠物
         self.petSwitch.setChecked(settings.pet_enabled())
@@ -1637,7 +1679,24 @@ class Overlay:
         self.chatlogSwitch.blockSignals(False)
         self._sync_chatlog()
         self._sync_model_fields()  # 上面屏蔽了信号，这里补一次
+        self._sync_footer()  # 「自动发送」换过之后，页脚那句「发送由你确认」就不能留着了
         self.settingsFeedback.hide()
+
+    def _sync_footer(self):
+        """页脚那行字得跟「自动发送」的实际状态一致。
+
+        默认那句「仅填入输入框 · 发送由你确认」在开关拨开之后就是假话了——页脚是应用一直在
+        摆着的东西，它说错话比设置页里少一行提示更糟。开着的时候换成警告色，扫一眼就知道
+        现在这程序会自己发消息。"""
+        note = getattr(self, "footerNote", None)  # _load_settings 在建页脚之前就会跑一次
+        if note is None:
+            return
+        on = settings.auto_send()
+        note.setText(f"自动发送已开启 · 候选会自动发出 · v{VERSION}" if on
+                     else f"仅填入输入框 · 发送由你确认 · v{VERSION}")
+        color = theme.WARN if on else _MUTED
+        qss = f"BodyLabel {{ color: {color}; background: transparent; }}"
+        setCustomStyleSheet(note, qss, qss)
 
     def _save(self):
         jev_provider = self._provider_of(self.jev)
@@ -1694,7 +1753,8 @@ class Overlay:
                           history_on=self.historySwitch.isChecked(),
                           check_update_on=self.updateSwitch.isChecked(),
                           pet_enabled_on=self.petSwitch.isChecked(),
-                          chatlog_on=self.chatlogSwitch.isChecked())
+                          chatlog_on=self.chatlogSwitch.isChecked(),
+                          auto_send_on=self.autoSendSwitch.isChecked())
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return
@@ -2346,6 +2406,73 @@ class Overlay:
     def log(self, line):
         """采集状态行：只进正在看的那个会话，不按会话存。"""
         self.feed.system(line)
+
+    def _reread(self):
+        """「重新识别」按钮。干活的在父进程（要叫醒子进程去重读），界面只管叫一声。"""
+        if self.on_reread:
+            self.on_reread()
+
+    def fix_message(self, chat, who, old, new):
+        """某条之前读花了，把记录里那条的就地改掉（重新识别对账用，见 app.ocr.reconcile）。
+
+        跟 `_merge_voice` 一样从后往前找**最近**的那条：同一个人连说两句一模一样的时候，
+        改最新的那条才对得上。正文没在 feeds 里（比如早翻出去了）就什么都不做。"""
+        lines = self.feeds.get(chat, [])
+        for i in range(len(lines) - 1, -1, -1):
+            w, text, name, stamp, voice = lines[i]
+            if w == who and text == old:
+                lines[i] = (w, new, name, stamp, voice)
+                self._sync_hers(chat)  # 「对方最近说」跟着换，不然还挂着读花的那句
+                if chat == self._shown:
+                    self._render_feed()
+                return True
+        return False
+
+    def _sync_hers(self, chat):
+        """按记录重算一遍「对方最近说」。
+
+        补漏/改字之后必须重算，不能按**插入顺序**顺手写：`insert_message` 是从后往前插的，
+        先插进去的「嗯」会被后插进去的「?」覆盖掉，明明「嗯」才是最后一条。"""
+        hers = [t for who, t, *_ in self.feeds.get(chat, []) if who == "her"]
+        if not hers:
+            return
+        self.hers[chat] = hers[-1]
+        if chat == self._shown:
+            self._show_latest(hers[-1])
+
+    def feed_index(self, chat, item):
+        """`item` 是 (who, text)，在 feeds[chat] 里从后往前找**最近**那条对得上的，返回下标；
+        找不到返回 -1。重新识别用它定位「这一段从哪儿开始变」，好把库里对应的尾巴整段重写。"""
+        if not item:
+            return -1
+        lines = self.feeds.get(chat, [])
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i][0] == item[0] and lines[i][1] == item[1]:
+                return i
+        return -1
+
+    def insert_message(self, chat, after, who, text, name=""):
+        """补一条漏掉的消息进聊天记录，插在 `after` 那条后面（after 是 (who, text)，None = 插到最前）。
+
+        重新识别专用：漏掉的消息多半在中间（「她 ? 」「我 在」「她 嗯」里那条「?」），直接 append
+        到末尾看着就像她最后才说的。锚点找不到（那条已经翻出去了）就退回末尾——宁可顺序差一点，
+        也别把这条丢了。
+
+        **不写库**：库里那一段由调用方整段重写（`chatlog.rewrite_tail`），append 追不到中间去。"""
+        entry = (who, text, name, datetime.now().strftime("%H:%M"), "")
+        lines = self.feeds.setdefault(chat, [])
+        at = 0 if after is None else len(lines)  # None = 补在开头；锚点找不到才退回末尾
+        if after:
+            found = self.feed_index(chat, after)
+            if found >= 0:
+                at = found + 1
+        lines.insert(at, entry)
+        del lines[:-_LOG_LINES]
+        self.counts[chat] = self.counts.get(chat, 0) + 1
+        self._sync_hers(chat)  # 按位置重算，不能直接写：从后往前插的时候最后写的不是最后一条
+        self._add_chat(chat)
+        if chat == self._shown:
+            self._render_feed()
 
     def restore(self, chat, rows):
         """开机把上次存下来的聊天记录填回内存（rows 是 core.chatlog 读出来的五元组，正序）。
