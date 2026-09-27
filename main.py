@@ -9,6 +9,7 @@
 import ctypes
 import multiprocessing
 import queue
+import re
 import threading
 import time
 import traceback
@@ -17,6 +18,7 @@ from collections import deque
 from app import settings, update, voice, worker
 from app.capture import find_wechat_hwnd
 from app.fill import fill
+from app.ocr import similar
 from app.overlay import Overlay
 from app.version import VERSION
 from core.engine import analyze
@@ -31,6 +33,8 @@ chats = {}
 state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "",
          "phase": "idle", "notify_until": 0.0, "voice": None}
 _NOTIFY_HOLD = 0.9  # 新消息到了先闪这么久「提醒」，再进判断
+_VOICE_WINDOW = 20.0  # 点了「转文字」之后，子进程认「语音气泡下面的新文字」的窗口（秒）
+_HISTORY_DUP = 24  # 判重时往回看这么多条（一屏大概也就十来条）
 results = queue.Queue()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
 
@@ -38,6 +42,23 @@ update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, 
 def chat_of(title):
     return chats.setdefault(title, {"history": deque(maxlen=60), "result": None, "rev": 0,
                                     "target": None, "senders": []})
+
+
+def _already_read(chat, item):
+    """这条是不是已经在会话记录里了。
+
+    去重本来是子进程 Reader 的活儿，但那份状态会丢：子进程重开（微信关了又开）、
+    标题 OCR 抖出一个没见过的名字，都会新起一个 Reader，把整屏当新消息重报一遍——
+    白触发一次判断，记录里还多一份。父进程这边留着 history，再兜一道。"""
+    who, _, text = item[:3]
+    return any(w == who and similar(t, text) for w, t, _ in list(chat["history"])[-_HISTORY_DUP:])
+
+
+def _voice_label(dur):
+    """语音时长统一成 `N"` 的样子：OCR 读出来的原样可能是 `3"`、`3″`、`)3`、`3 (`，
+    界面上别照搬，并语音那条也要靠这个字串对上号。认不出数字就原样返回。"""
+    digits = re.sub(r"\D", "", dur or "")
+    return f'{digits}"' if digits else (dur or "")
 
 
 def target_of(title):
@@ -76,13 +97,20 @@ def convert_voice():
     if title != state["chat"] or title != ov.current_chat():
         return "微信现在开着的不是这条语音所在的会话，切回去再试"
     last = state["voice"][1][-1]  # 取最近的那条（气泡自上而下排）
-    return voice.convert(state["hwnd"], last[:4], last[5])
+    reason = voice.convert(state["hwnd"], last[:4], last[5])
+    if not reason:
+        # 点成了：给子进程开个口子。转出来的字是**插在那条语音气泡正下方**的，位置在
+        # 「已知行」上面，不开口子会被当成往上翻出来的旧消息丢掉。只在这个窗口里认，
+        # 不然往上翻、把窗口拉高时露出来的旧语音，底下那条老转写会被当成新消息报上去。
+        voice_until.value = time.monotonic() + _VOICE_WINDOW
+    return reason
 
 
 def spawn_worker():
     """开一个采集子进程，它跟着 capture_on 走：置位=采集，清掉=暂停。"""
     p = multiprocessing.Process(target=worker.run,
-                                args=(q, state["hwnd"], capture_on, debug_on), daemon=True)
+                                args=(q, state["hwnd"], capture_on, debug_on, voice_until),
+                                daemon=True)
     p.start()
     return p
 
@@ -216,8 +244,9 @@ def drain():
             ov.set_voice(title, items)
             if len(items) > had:  # 多出来一条才提醒；拖动/滚动只是坐标变，不算新消息
                 # 聊天记录里也留一行，不然这条语音在界面上等于不存在（只有显示用，
-                # 不进喂模型的那份 history——「🔊 语音消息 3"」对模型是噪音）
-                ov.log_message("her", f"🔊 语音消息 {items[-1][4]}", chat=title)
+                # 不进喂模型的那份 history——「🔊 语音消息 3"」对模型是噪音）。
+                # 谁发的按气泡底色走：自己发的语音别挂到对方头上
+                ov.log_message(items[-1][5], f"🔊 语音消息 {_voice_label(items[-1][4])}", chat=title)
                 state["notify_until"] = time.monotonic() + _NOTIFY_HOLD
             continue
         if kind == "paused":  # 子进程确认已暂停
@@ -243,17 +272,25 @@ def drain():
         _, title, new, area = msg
         state["area"] = area
         chat = chat_of(title)
+        fresh = [m for m in new if not _already_read(chat, m)]  # 屏幕上翻出来的旧消息不算数
+        if not fresh:
+            continue  # 整批都是旧的（子进程重开、往上翻、把窗口拉高）：不记不触发
+        # fresh 里就是 new 里那几个元组本身，所以能按身份比：屏幕上最新那条是不是真新的
+        newest = fresh[-1] is new[-1]
         chat["rev"] += 1  # 这个会话有新消息了，它在跑的分析作废
         if title == ov.current_chat():  # 看的是别的会话就别把人家的候选划掉
             ov.invalidate_replies()
-        for who, name, text in new:
-            chat["history"].append((who, text, name))
-            ov.log_message(who, text, name, chat=title)
+        for who, name, text, dur in fresh:
+            chat["history"].append((who, text, name))  # 喂模型的那份不带语音标记
+            # dur 非空 = 这条是语音转出来的字，值是那条语音的时长：界面拿它并回「🔊 语音消息 N"」
+            ov.log_message(who, text, name, chat=title, voice=_voice_label(dur) if dur else "")
             if who == "her" and name:  # 群里发过言的人，去重后最近的排最前
                 if name in chat["senders"]:
                     chat["senders"].remove(name)
                 chat["senders"].insert(0, name)
         ov.set_targets(title, chat["senders"], target_of(title))  # 显不显示这一行由悬浮窗按开关决定
+        if not newest:
+            continue  # 补记的是中间那条，流水线按屏幕最底下那条走，别动它
         if new[-1][0] == "her":  # 只有对方最新说话才值得分析
             state["notify_until"] = time.monotonic() + _NOTIFY_HOLD  # 宠物先换个姿势提醒一下
             msgs = list(chat["history"])
@@ -333,6 +370,9 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     q = multiprocessing.Queue()
     capture_on = multiprocessing.Event()  # 父子进程共用的开关，置位=采集
     debug_on = multiprocessing.Event()  # 同上，置位=子进程往队列里送整帧给调试窗
+    # 点了「转文字」之后盖的时间戳（time.monotonic()，同机同基准），子进程拿它决定
+    # 认不认「语音气泡下面的新文字」。见 convert_voice() 和 app/worker.py
+    voice_until = multiprocessing.Value("d", 0.0)
     ov = Overlay(on_fill=fill_reply, on_toggle_capture=on_toggle_capture,
                  on_target_change=on_target_change, on_toggle_debug=set_debug,
                  on_voice_convert=convert_voice,

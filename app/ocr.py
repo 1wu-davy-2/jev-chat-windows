@@ -19,12 +19,20 @@ _ENGINE = None
 #
 # 必须有那个引号，纯数字的消息才不会被误伤：「6」「666」「88」「5G」「8点见」「8-9」
 # 都不带引号，照常放行。
-_VOICE = re.compile(r"\d{1,3}\s*[\"”″＂'′’‘()（）?？!！|｜]{1,2}.{0,2}")
+_VOICE = re.compile(r"\d{1,3}\s*[\"”“″＂'′’‘()（）?？!！|｜]{1,2}.{0,2}")
 
 # 时长被读成光秃秃一个数字、引号整个丢掉的情况（真机上出现过「3"」→「3」）。
 # 这种只靠文字认不出来——「3」也可能是真消息——所以得看像素：语音气泡里数字旁边
 # 紧挨着喇叭图标，真发一个「3」旁边是空的。见 _has_icon()。
 _DIGITS = re.compile(r"\d{1,3}")
+
+# 喇叭图标本身被读成一个**后**括号/竖线、跑到时长前面：「3"」→「)3」（真机上出现过，
+# 界面上就多出一条「)3」的假消息，还拿它去触发判断）。前面那个符号是图标的一部分，
+# 所以不走 _has_icon——图标已经被并进这个框里了，框左边是空的，量不出来。
+#
+# 要求**整条**就是这个形状，且只认后括号：真消息里「)3」这种写法几乎没有，而「（3）」
+# 「(3」这类前括号开头的很常见，别误伤（引号那一段可选，因为引号常常也一起丢）。
+_VOICE_ICON = re.compile(r"[)）\]】|｜]{1,2}\s*\d{1,3}\s*[\"”“″＂'′’‘()（）?？!！|｜]{0,2}")
 
 
 def _bubble_extent(chat, box, bg):
@@ -177,8 +185,8 @@ class Reader:
             kind, bg, h = who_said(chat, box)
             xs, ys = [p[0] for p in box], [p[1] for p in box]
             rect = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
-            if _VOICE.fullmatch(text.strip()) or (_DIGITS.fullmatch(text.strip())
-                                                  and _has_icon(chat, box, kind, h)):
+            if (_VOICE.fullmatch(text.strip()) or _VOICE_ICON.fullmatch(text.strip())
+                    or (_DIGITS.fullmatch(text.strip()) and _has_icon(chat, box, kind, h))):
                 # 不进 raw（它没有正文，触发判断没意义），但位置记下来：
                 # 用户点「转文字」时要悬停到它上面。存的是**整个气泡**的范围，
                 # 不是这个 OCR 框——按钮挂在气泡外侧，得按气泡边缘算。见 app/voice.py
@@ -218,26 +226,38 @@ class Reader:
         return out
 
     def _under_voice(self, y):
-        """这一行是不是紧跟在某个语音气泡下面。
+        """这一行紧跟在哪个语音气泡下面？是的话返回那条语音的时长（OCR 原样，可能是 `3"`、
+        也可能是 `)3`），不是就返回空串——空串在布尔位置上就是假，调用方直接当条件用。
 
         微信的「语音转文字」是**插在那条语音气泡正下方**的，不是追加到聊天末尾——转一条老语音，
         结果落在「已知行」上面，按下面那条「只认已知行下方的」规则会被当成往上翻出来的旧消息丢掉，
-        用户转完了应用却根本没看见。所以这一类单独放行。"""
-        for item in self.last_voice:
-            if 0 <= y - item[3] <= 2.5 * (self.lh or 17):  # item[3] = 气泡底
-                return True
-        return False
+        用户转完了应用却根本没看见。所以这一类单独放行。
 
-    def new_lines(self, lines):
-        """去重（滚动不重复）→ 这一帧里真正新出现的 [(who, name, text)]。
+        返回时长是为了让父进程把转写并回它那条「🔊 语音消息 N"」上——同一个时长才并。"""
+        for item in self.last_voice:
+            if 0 <= y - item[3] <= 2.5 * (self.lh or 17):  # item[3] = 气泡底，item[4] = 时长
+                return item[4]
+        return ""
+
+    def new_lines(self, lines, under_voice=False):
+        """去重（滚动不重复）→ 这一帧里真正新出现的 [(who, name, text, 语音时长或 "")]。
         本帧有已知行时只要已知行下方的：往上滚翻出来的旧消息在已知行上方，不算。
         例外是语音转出来的字（见 _under_voice）：它就插在语音气泡下面，位置在已知行上方。
+
+        under_voice 才开那个例外，而且只在「用户刚点过转文字」之后开一小会儿——见
+        worker.run()。常开的话，往上翻/把窗口拉高时露出来的旧语音，底下那条老转写
+        也会被当成新消息报上去，白触发一次判断（判断不便宜，还打扰人）。
+
+        第四个字段只给界面用（聊天记录里标/并「语音」那条）：判据就是「紧贴在某个语音
+        气泡下面」，跟放不放它过 floor 无关——最新那条语音转出来的字是走正常规则进来的，
+        同样得标上。实测转写贴 17px、下一条普通消息隔 69px，2.5×lh 分得开。
+
         本帧一行已知的都没有（大图把旧文字全顶出去了、切了聊天、滚远了）：全算，宁可多算不能漏。
         ponytail: 同一人连发两句一模一样的会吞一句——对触发分析无害。"""
         known_y = [y for w, n, t, y in lines if self._seen(w, n, t)]
         floor = max(known_y) if known_y else -1
-        new = [(w, n, t) for w, n, t, y in lines
-               if (y > floor or self._under_voice(y)) and not self._seen(w, n, t)]
+        new = [(w, n, t, self._under_voice(y)) for w, n, t, y in lines
+               if (y > floor or (under_voice and self._under_voice(y))) and not self._seen(w, n, t)]
         self.seen.extend((w, n, t) for w, n, t, _ in lines if not self._seen(w, n, t))
         del self.seen[:-500]
         return new
@@ -260,6 +280,14 @@ if __name__ == "__main__":
               "5G", "8G", '8" 屏幕', "3D", "8楼"):
         assert not voice(t), t
 
+    # 喇叭图标被读成后括号、跑到时长前面（真机上出现过「3"」→「)3」）：界面上会多出一条
+    # 假消息，还拿它去触发判断
+    for t in (')3', ')3"', '）3', '｜3', ') 3', ')3“', '))3', ']12'):
+        assert _VOICE_ICON.fullmatch(t.strip()), t
+    # 前括号开头的不认（「（3）」「(3」这种真消息比「)3」常见），带正文的更不认
+    for t in ("（3）", "(3", "3)", "好)3", ")3点见", "）3楼", "3", "8"):
+        assert not _VOICE_ICON.fullmatch(t.strip()), t
+
     # 引号被整个读丢时只剩一个裸数字（真机上出现过「3"」→「3」），这时只能靠像素认：
     # 造一块气泡底，数字左边有喇叭图标 = 语音时长，空着 = 真消息
     assert _DIGITS.fullmatch("3") and not _VOICE.fullmatch("3")
@@ -270,4 +298,18 @@ if __name__ == "__main__":
     frame[9:25, 26:37] = 30                                     # 左边放上喇叭图标
     assert _has_icon(frame, digit, "her", 11), "有图标，是语音时长"
     assert not _has_icon(frame, digit, "gray", 11), "灰字不参与"
+
+    # 转写那个口子：语音气泡底 y=50，转出来的字贴在上面 y=67（实测隔 17px），
+    # 下面还有一条已知的新消息 y=130 —— 转写落在「已知行上方」，只有开了口子才认
+    reader = Reader.__new__(Reader)  # 不走 __init__：那会去建 OCR 引擎，自测不该那么重
+    reader.lh, reader.last_voice = 13.0, [(0, 0, 100, 50, '4"', "her")]
+    lines = [("her", None, "在吗", 130), ("her", None, "干什么呢？快下来", 67)]
+    reader.seen = [("her", None, "在吗")]
+    assert reader.new_lines(lines, under_voice=True) == [("her", None, "干什么呢？快下来", '4"')]
+    reader.seen = [("her", None, "在吗")]  # new_lines 会把这一帧的行记进 seen，比第二次前先还原
+    assert reader.new_lines(lines) == [], "没点过转文字就不认这个口子（往上翻出来的旧转写）"
+    # 第四位：贴着气泡的带回那条语音的时长（父进程拿它并成一条），下面那条普通消息是空串
+    reader.seen = []
+    assert reader.new_lines([("her", None, "在吗", 130), ("her", None, "刚转出来的", 67)]) == [
+        ("her", None, "在吗", ""), ("her", None, "刚转出来的", '4"')]
     print("ocr._VOICE ok")

@@ -30,10 +30,14 @@ def _packet(full, area, title, reader, lines):
             "ocr_ms": reader.last_ms if reader else 0, "ts": time.time()}
 
 
-def run(q, hwnd, enabled, debug_on):
+def run(q, hwnd, enabled, debug_on, voice_until=None):
     """enabled 置位=采集，清掉=暂停。暂停时停掉 WGC 会话（Windows 那圈黄色采集边框也跟着没了），
     恢复时重开一个；readers 一直留着，去重状态不丢，恢复后不会把屏幕上的旧消息再报一遍。
-    debug_on 置位才往队列里送整帧（一帧 2~3MB），关着一点额外活都不干。"""
+    debug_on 置位才往队列里送整帧（一帧 2~3MB），关着一点额外活都不干。
+
+    voice_until 是父进程在点了「转文字」之后盖的一个时间戳（time.monotonic()，两个进程
+    同一台机器同一个基准）。只有在这个窗口里，才认「插在语音气泡下面的新文字」——
+    不然往上翻、把窗口拉高时露出来的旧语音，底下那条老转写会被当成新消息报上去。"""
     ctypes.windll.user32.SetProcessDPIAware()
     cap = None
     readers = {}  # {会话名: Reader}，一个会话一套去重状态
@@ -90,7 +94,9 @@ def run(q, hwnd, enabled, debug_on):
                             q.put(("chat", title))
                     reader = readers.setdefault(title, Reader())
                     lines = reader.read(full[y0:y1, x0:x1], bg)
-                    new = reader.new_lines(lines)
+                    # 只有刚点过「转文字」那一小会儿，才认插在语音气泡下面的新文字
+                    converting = voice_until is not None and time.monotonic() < voice_until.value
+                    new = reader.new_lines(lines, under_voice=converting)
                     if new:
                         q.put(("lines", title, new, rect))
                     # 语音气泡：Reader 那边按坐标裁剪过，这里加回裁剪原点，父进程才好换算成屏幕坐标。

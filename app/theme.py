@@ -25,6 +25,7 @@ CARAMEL = "#c4a07a"    # 点缀色
 WARN = "#b45309"       # 警告
 DANGER = "#b44832"     # 错误
 OCR = "#3d7ea6"        # 调试视图的识别框用色
+IM_MINE = "#95ec69"    # 聊天记录里自己那条的底色（跟 grok-ui 的 --color-im-mine 一个值，就是微信那个绿）
 
 # CSS 里的 rgba(28,25,23,x) 就是 INK 的三个通道
 _INK_RGB = (28, 25, 23)
@@ -54,6 +55,16 @@ GAP_SM = 8
 GAP_MD = 12
 GAP_LG = 16
 GAP_XL = 24
+
+def mix(color, alpha, base=CREAM):
+    """把 color 按 alpha 压到 base 上，返回一个实色。
+
+    CSS 里写 `bg-caramel/40` 是半透明叠底，Qt 这边 QSS 的 rgba() 在部分控件上不生效
+    （背景会整块不画），所以直接算成实色最稳。用在聊天记录的头像底色这类地方。"""
+    a = tuple(int(color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+    b = tuple(int(base.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+    return "#%02x%02x%02x" % tuple(round(x * alpha + y * (1 - alpha)) for x, y in zip(a, b))
+
 
 def card_qss(bg=PAPER, radius=RADIUS_MD, ring=True):
     """卡片样式串：底色 + 圆角 + 1px 描边环。

@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import (
     Action, BodyLabel, CardWidget, CheckBox, ComboBox, EditableComboBox, FluentIcon as FIF,
-    HyperlinkButton, IndeterminateProgressBar, LineEdit, PasswordLineEdit, PlainTextEdit,
+    HyperlinkButton, IndeterminateProgressBar, LineEdit, PasswordLineEdit,
     PrimaryPushButton, PushButton, RoundMenu, ScrollArea, SpinBox, SwitchButton, Theme,
     TransparentToolButton, setCustomStyleSheet, setFont, setTheme, setThemeColor,
 )
@@ -236,12 +236,16 @@ class _ReplyCard(_Surface):
 
 
 class _BarRow(QWidget):
-    """候选条里的一行：序号方块 + 正文/百分比 + 复制按钮。整行可点，等于「填入」。"""
+    """候选条里的一行：序号方块 + 正文/百分比 + 复制按钮。整行可点，等于「填入」。
 
-    def __init__(self, owner, index, parent=None):
+    index 是这条候选在 `cands` 里的**原始下标**，不是行号——候选条按推荐顺序重排过，
+    界面上看到的「1/2/3」是排完的位置，两者只有推荐那条本来就排第一时才重合。
+    每次 set_content() 都会把它刷成对的那条，别在这儿存行号。"""
+
+    def __init__(self, owner, parent=None):
         super().__init__(parent)
         self.owner = owner
-        self.index = index
+        self.index = 0  # 还没喂内容；行是 hidden 的，点不到
         self.recommended = False
         self.setObjectName("barRow")
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -270,7 +274,8 @@ class _BarRow(QWidget):
     def _copy(self):
         self.owner._copy(self.index)
 
-    def set_content(self, text, meta, number, recommended):
+    def set_content(self, index, text, meta, number, recommended):
+        self.index = index
         self.text.setText(text)
         self.meta.setText(meta)
         self.number.setText(str(number))
@@ -387,7 +392,7 @@ class _CandidateBar(QWidget):
         self.hint.hide()
         box.addWidget(self.hint)
 
-        self.rows = [_BarRow(owner, i, self.frame) for i in range(self._ROWS)]
+        self.rows = [_BarRow(owner, self.frame) for _ in range(self._ROWS)]
         for r in self.rows:
             r.hide()
             box.addWidget(r)
@@ -430,8 +435,10 @@ class _CandidateBar(QWidget):
             )
 
     def set_items(self, items, suggest, phase, heard="", voice=""):
-        """items: [(序号, 正文, 百分比或 None, 是否推荐)]；voice 非空 = 这条会话有语音消息，
-        这时把「转文字」那一块顶上来，候选行让位。
+        """items: [(候选原始下标, 序号, 正文, 百分比或 None, 是否推荐)]；voice 非空 = 这条会话
+        有语音消息，这时把「转文字」那一块顶上来，候选行让位。
+
+        下标要带着走：行是按显示位置摆的，但点下去填的必须是那条候选本身。
 
         候选行、忙碌文案、建议行三者按 phase 互斥（跟设计稿的 CandidateIme 一个口径）：
         只有 ready 才摆候选，其余阶段只显示一句进度说明。这样即便上层忘了清候选，
@@ -460,15 +467,211 @@ class _CandidateBar(QWidget):
         self.foot.setVisible(ready)
         for i, row in enumerate(self.rows):
             if ready and i < len(items):
-                number, text, score, recommended = items[i]
+                index, number, text, score, recommended = items[i]
                 meta = ("推荐回复" if recommended else f"备选 {i}")
                 if score is not None:
                     meta += f" · {round(score * 100)}%"
-                row.set_content(text, meta, number, recommended)
+                row.set_content(index, text, meta, number, recommended)
                 row.show()
             else:
                 row.hide()
         self.adjustSize()
+
+
+def _fit_width(label, limit, pad=0):
+    """折行 QLabel 的宽度得自己定：Qt 对开了 wordWrap 的标签会挑一个「看着合适」的窄宽度，
+    结果气泡被挤成细细一条（实测 16 个字折成三行）。这里按字体量单行要多宽，取 min(上限, 单行宽)。
+
+    量之前得先 setFont，QSS 里的 font-size 不保证这会儿已经生效。"""
+    fm = label.fontMetrics()
+    want = max(fm.horizontalAdvance(line) for line in label.text().split("\n"))
+    return max(48, min(limit, want + pad))
+
+
+class _Bubble(QWidget):
+    """聊天记录里的一条消息：头像 + 气泡。对方在左、我在右，跟微信一个排法。
+
+    气泡宽度由 _ChatLog 按记录区宽度封顶（设计稿是 max-w-[70%]），超了自动折行——
+    QLabel 自己算折行后的高度，所以宽度一变（拉窗口、过紧凑断点）得重新设一遍上限。
+    头像里那个字：单聊用会话名首字，群里用发言人首字。
+
+    voice 非空的是语音转出来的字，值是那条语音的时长：气泡里多一行「🔊 语音消息 3"」的
+    小字。转写气泡本身长得跟普通文字消息一模一样，不标一下根本分不出来（而且微信那边
+    那条语音气泡我们是不显示的）。"""
+
+    AVATAR = 26
+
+    def __init__(self, who, text, name="", peer="", voice="", parent=None):
+        super().__init__(parent)
+        mine = who == "me"
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(GAP_SM)
+        avatar = QLabel("我" if mine else (name or peer or "对方")[:1], self)
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setFixedSize(self.AVATAR, self.AVATAR)
+        avatar.setStyleSheet(
+            f"QLabel {{ background: {theme.mix(theme.CARAMEL, 0.4)}; color: {theme.INK}; "
+            f"border-radius: {RADIUS_SM}px; font-size: {FONT_XS}px; }}")
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(1)
+        if name and not mine:  # 群里才在气泡上方标发言人；单聊不标
+            speaker = QLabel(name, self)
+            setFont(speaker, FONT_XS)
+            speaker.setStyleSheet(f"QLabel {{ color: {_MUTED}; background: transparent; }}")
+            col.addWidget(speaker)
+        # 气泡是个容器（不是单个 QLabel）：里面可能还压着一行「语音转文字」的标记
+        self.bubble = QWidget(self)
+        self.bubble.setObjectName("bubble")
+        self.bubble.setAttribute(Qt.WA_StyledBackground, True)
+        ring = "" if mine else f" border: 1px solid {theme.LINE};"
+        self.bubble.setStyleSheet(
+            f"QWidget#bubble {{ background: {theme.IM_MINE if mine else theme.PAPER};"
+            f"{ring} border-radius: {RADIUS_MD}px; }}")
+        box = QVBoxLayout(self.bubble)
+        box.setContentsMargins(9, 5, 9, 5)
+        box.setSpacing(1)
+        self.tag = None
+        if voice:
+            self.tag = QLabel(f"🔊 语音消息 {voice}", self.bubble)
+            setFont(self.tag, FONT_XS)
+            self.tag.setStyleSheet(f"QLabel {{ color: {_MUTED}; background: transparent; }}")
+            box.addWidget(self.tag)
+        self.text = QLabel(text, self.bubble)
+        self.text.setWordWrap(True)
+        setFont(self.text, FONT_MD)
+        self.text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.text.setStyleSheet(f"QLabel {{ color: {theme.INK}; background: transparent; }}")
+        box.addWidget(self.text)
+        col.addWidget(self.bubble)
+        if mine:
+            row.addStretch(1)
+            row.addLayout(col)
+            row.addWidget(avatar, 0, Qt.AlignTop)
+        else:
+            row.addWidget(avatar, 0, Qt.AlignTop)
+            row.addLayout(col)
+            row.addStretch(1)
+
+    def set_limit(self, width):
+        # 22 = 气泡左右 padding + 富余。标记那行比正文宽时（短语音）按它算，别把标记折了
+        want = _fit_width(self.text, width, 22)
+        if self.tag is not None:
+            want = max(want, _fit_width(self.tag, width, 22))
+        self.bubble.setFixedWidth(want)
+
+
+class _Note(QWidget):
+    """居中的一行小字：时间条（chip=True，灰底胶囊）和采集状态行（纯灰字，跟微信
+    「你撤回了一条消息」那种系统提示一个位置）。"""
+
+    def __init__(self, text, chip=False, parent=None):
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
+        self.label = QLabel(text, self)
+        self.label.setWordWrap(True)
+        self.label.setAlignment(Qt.AlignCenter)
+        setFont(self.label, FONT_XS)
+        self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bg = theme.mix(theme.INK, 0.06) if chip else "transparent"
+        self.label.setStyleSheet(
+            f"QLabel {{ background: {bg}; color: {_MUTED}; border-radius: {RADIUS_SM}px; "
+            f"padding: 1px 8px; }}")
+        row.addWidget(self.label)
+        row.addStretch(1)
+
+    def set_limit(self, width):
+        self.label.setFixedWidth(_fit_width(self.label, width, 20))  # 20 = 左右 padding + 富余
+
+
+class _ChatLog(QWidget):
+    """聊天记录：像微信那样一条条气泡，不是原来那种纯文本流水账。
+
+    内容是 Overlay.feeds[会话名] 里存的那份，切会话时整体重建；采集状态行只落在
+    当前视图上、不按会话存（跟原来那个 PlainTextEdit 一个口径）。行数封顶 _LOG_LINES，
+    超了从头上删——聊天记录是给你回看的，不是日志。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("chatLog")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(
+            f"QWidget#chatLog {{ background: {theme.CREAM}; border-radius: {RADIUS_MD}px; }}")
+        box = QVBoxLayout(self)
+        box.setContentsMargins(GAP_SM, GAP_SM, GAP_SM, GAP_SM)
+        self.scroll = ScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self.scroll.viewport().setAutoFillBackground(False)
+        self.content = QWidget()
+        self.content.setStyleSheet("background: transparent;")
+        self.col = QVBoxLayout(self.content)
+        self.col.setContentsMargins(0, 0, 0, 0)
+        self.col.setSpacing(GAP_SM)
+        self.placeholder = QLabel("识别到的聊天内容会显示在这里")
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.placeholder.setStyleSheet(
+            f"QLabel {{ color: {_MUTED}; background: transparent; font-size: {FONT_SM}px; }}")
+        self.col.addWidget(self.placeholder)
+        self.col.addStretch(1)  # 内容不满一屏时贴着顶排，跟微信一样
+        self.scroll.setWidget(self.content)
+        box.addWidget(self.scroll)
+        self.rows = []  # 已经排上去的行，删最老的那条时要拿它
+        self._time = ""  # 上一条的时间，变了才插一根时间条
+
+    def _add(self, widget):
+        follow = self.at_bottom()  # 先问再看：加完就已经滚下去了，判断会永远为真
+        self.col.insertWidget(self.col.count() - 1, widget)  # 插在末尾那根 stretch 前面
+        self.rows.append(widget)
+        widget.set_limit(self._limit())
+        self.placeholder.hide()
+        while len(self.rows) > _LOG_LINES:
+            old = self.rows.pop(0)
+            self.col.removeWidget(old)
+            old.deleteLater()
+        if follow:
+            # 布局要等这一轮事件循环走完才重算，这会儿读 scrollbar 的 maximum 还是旧的
+            QTimer.singleShot(0, self._to_bottom)
+
+    def at_bottom(self):
+        """是不是正贴着底看。是才跟着新消息走，用户往上翻着看就别把他拽回来。"""
+        bar = self.scroll.verticalScrollBar()
+        return self.isHidden() or bar.value() >= bar.maximum() - 4
+
+    def _to_bottom(self):
+        bar = self.scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _limit(self):
+        """气泡宽度上限：记录区的 72%（设计稿 max-w-[70%]），再扣掉头像和间距。"""
+        return max(96, int(self.width() * 0.72) - _Bubble.AVATAR - GAP_SM)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        for row in self.rows:
+            row.set_limit(self._limit())
+
+    def message(self, who, text, name="", timestamp="", peer="", voice=False):
+        if timestamp and timestamp != self._time:
+            self._add(_Note(timestamp, chip=True))  # 时间变了才插一根，跟微信一样
+        self._time = timestamp or self._time
+        self._add(_Bubble(who, text, name, peer, voice))
+
+    def system(self, text):
+        self._add(_Note(text))
+
+    def clear(self):
+        for row in self.rows:
+            self.col.removeWidget(row)
+            row.deleteLater()
+        self.rows = []
+        self._time = ""
+        self.placeholder.show()
 
 
 class Overlay:
@@ -496,7 +699,7 @@ class Overlay:
         self._compact = None  # 断点模式：None 保证 _relayout 第一次调用必定生效
         self._pageLayouts = []
         self._hintLabels = []
-        self.feeds = {}  # {会话名: [排好版的记录]}
+        self.feeds = {}  # {会话名: [(who, text, name, 时间, 是不是语音转出来的)]}，切会话时重建
         self.counts = {}  # {会话名: 消息条数}
         self.hers = {}  # {会话名: 对方最近一句}
         self.targets = {}  # {会话名: ([发言人], 当前回复对象)}
@@ -586,7 +789,8 @@ class Overlay:
         self._barTimer.setSingleShot(True)
         self._barTimer.timeout.connect(self.bar.hide)
         self.hotkeys = HotkeyHost()
-        self.hotkeys.hotkey.connect(lambda i: self._fill(i - 1))
+        # Ctrl+1/2/3 按的是界面上看到的位置，得折成候选原始下标——见 _cand_at()
+        self.hotkeys.hotkey.connect(lambda i: self._fill(self._cand_at(i - 1)))
         self._hotkeyFailed = [i for i in (1, 2, 3) if not self.hotkeys.register(i, 0x30 + i)]
         self.app.aboutToQuit.connect(self.hotkeys.unregister_all)
         footer = QHBoxLayout()
@@ -629,12 +833,15 @@ class Overlay:
         return scroll, layout
 
     def _relayout(self, w, h):
-        """宽度跨过断点才重新摆布局（省事）；高度每次都重算，反正只是设个定高。"""
+        """宽度跨过断点才重新摆布局（省事）；高度每次都重算，反正只是设个下限。
+
+        聊天记录只设**下限**不设定高：上面的卡片占满一屏时它就是下限那么高、页面自己滚，
+        窗口拉高了剩下的空间全归它（拉伸因子在 _build_home 里给的）。"""
         compact = w < 400
         if compact != self._compact:
             self._compact = compact
             self._apply_compact(compact)
-        self.feed.setFixedHeight(max(100, min(240, int(h * 0.25))))
+        self.feed.setMinimumHeight(max(140, min(240, int(h * 0.3))))
 
     def _apply_compact(self, compact):
         """紧凑/常规两套间距和可见性；断点没变时不会被调用。"""
@@ -764,15 +971,16 @@ class Overlay:
         self.historyButton.clicked.connect(self._toggle_history)
         self.historyButton.setAccessibleName("展开或收起聊天记录")
         body.addWidget(self.historyButton)
-        self.feed = PlainTextEdit()
-        self.feed.setReadOnly(True)
-        self.feed.setPlaceholderText("识别到的聊天内容会显示在这里")
-        self.feed.setMaximumBlockCount(_LOG_LINES)
-        self.feed.setFixedHeight(160)
+        self.feed = _ChatLog()
+        self.feed.setMinimumHeight(160)
         self.feed.hide()
-        body.addWidget(self.feed)
+        # 记录区拉伸因子 1、末尾那根弹簧也 1：展开时 _toggle_history() 把弹簧松成 0，
+        # 剩下的竖向空间就全归记录区；收起时弹簧挂着，页面照旧顶部对齐。
+        # **不能**干脆不挂弹簧——那样余量会被页面里一堆 Preferred 的控件分掉，排版散开。
+        body.addWidget(self.feed, 1)
         self._history_title()
         body.addStretch(1)
+        self.homeBody = body
 
     def _build_settings(self):
         self.settingsPage, body = self._scroll_page()
@@ -1282,6 +1490,15 @@ class Overlay:
         self.pages.setCurrentWidget(self.home)
         self.settingsButton.setEnabled(True)
 
+    def _cand_at(self, position):
+        """界面上第 position 个位置（从 0 数）摆的是哪条候选（`cands` 里的原始下标）。
+
+        候选条和面板都按推荐顺序重排过：看到的「1/2/3」是排完的位置，跟原始下标只有在
+        推荐那条本来就排第一时才重合。没有候选时退回 position，反正 _fill 会拦掉。"""
+        if 0 <= position < len(self._ordered):
+            return self._ordered[position][0]
+        return position
+
     def _fill(self, index):
         if self._busy or not self._current or index >= len(self.cands):
             return
@@ -1423,7 +1640,7 @@ class Overlay:
 
     def _sync_bar(self):
         """把紧凑候选条刷成和面板一致。两边共用 self.cands / self._ordered，不新增数据流。"""
-        items = [(position + 1, self.cands[index], score, recommended)
+        items = [(index, position + 1, self.cands[index], score, recommended)
                  for position, (index, score, recommended) in enumerate(self._ordered)]
         heard = self.hers.get(self._shown) or self.hers.get(self._chat) or ""
         self.bar.set_items(items, self._suggest_text() if items else "", self._phase, heard,
@@ -1554,7 +1771,9 @@ class Overlay:
             self.setupButton.setVisible(not settings.has_key())
 
     def _toggle_history(self):
+        """展开/收起聊天记录。展开时把末尾那根弹簧松掉，剩下的竖向空间才轮到记录区吃。"""
         self.feed.setVisible(self.feed.isHidden())
+        self.homeBody.setStretch(self.homeBody.count() - 1, 0 if self.feed.isVisible() else 1)
         self._history_title()
 
     def _history_title(self):
@@ -1564,30 +1783,65 @@ class Overlay:
 
     def log(self, line):
         """采集状态行：只进正在看的那个会话，不按会话存。"""
-        bar = self.feed.verticalScrollBar()
-        follow = self.feed.isHidden() or bar.value() >= bar.maximum() - 4
-        self.feed.appendPlainText(line)
-        if follow:
-            bar.setValue(bar.maximum())
+        self.feed.system(line)
 
-    def log_message(self, who, text, name="", timestamp=None, chat=None):
-        """按会话存一份；只有正在看的那个会往显示区里写。"""
+    def log_message(self, who, text, name="", timestamp=None, chat=None, voice=""):
+        """按会话存一份；只有正在看的那个会往显示区里写。
+
+        voice 非空 = 这条是语音转出来的字，值是那条语音的时长（`3"`）：能对上前面那条
+        「🔊 语音消息 3"」就并成一条（微信那边本来就是一条：气泡 + 转写），对不上就单独
+        一条、气泡里标一行「🔊 语音转文字」。"""
         chat = chat or self._shown
-        speaker = (name or "对方") if who == "her" else "我"
         timestamp = timestamp or datetime.now().strftime("%H:%M")
+        if voice and self._merge_voice(chat, who, text, name, voice):
+            if who == "her":
+                self.hers[chat] = text
+                if chat == self._shown:
+                    self._show_latest(text)  # 并了要重画，最新的那句也换掉
+            return
         self.counts[chat] = self.counts.get(chat, 0) + 1
         lines = self.feeds.setdefault(chat, [])
-        lines.append(f"{timestamp}  {speaker}\n{text}\n")
+        lines.append((who, text, name, timestamp, voice))
         del lines[:-_LOG_LINES]
         if who == "her":
             self.hers[chat] = text
         self._add_chat(chat)
         if chat != self._shown:
             return
-        self.log(lines[-1])
+        self.feed.message(who, text, name, timestamp, chat, voice)
         if who == "her":
             self._show_latest(text)
         self._history_title()
+
+    def _merge_voice(self, chat, who, text, name, dur):
+        """语音转出来的字并回它那条语音：把「🔊 语音消息 N"」那条占位换成带时长的转写。
+
+        微信那边本来就是一条（语音气泡 + 底下的转写），分成两条看着像对方说了两句话。
+        并上了返回 True。从后往前找**还没并过**的那条——并过之后 text 就不是占位那句了，
+        不会再撞上同名占位。时间沿用语音那条的（消息本来的时间，不是转文字的时间）。"""
+        mark = f"🔊 语音消息 {dur}"
+        lines = self.feeds.get(chat, [])
+        for i in range(len(lines) - 1, -1, -1):
+            _, old, _, stamp, _ = lines[i]
+            if old == mark:
+                lines[i] = (who, text, name, stamp, dur)
+                if chat == self._shown:
+                    self._render_feed()
+                return True
+        return False
+
+    def _render_feed(self, keep_scroll=True):
+        """按 feeds[正在看的会话] 整屏重画。切会话和「并语音」都要走它。
+
+        重画会把滚动条打回顶部，所以先记住用户是不是正贴着底看：贴着就跟着走，
+        翻着旧记录看的时候别把他拽回底部。切会话（keep_scroll=False）则一律落到底。"""
+        bar = self.feed.scroll.verticalScrollBar()
+        keep = bar.value() if keep_scroll and not self.feed.at_bottom() else None
+        self.feed.clear()
+        for who, text, name, stamp, voice in self.feeds.get(self._shown, []):
+            self.feed.message(who, text, name, stamp, self._shown, voice)
+        if keep is not None:
+            QTimer.singleShot(0, lambda: bar.setValue(min(keep, bar.maximum())))
 
     def _show_latest(self, text):
         self.latest.setText(text if len(text) <= 120 else text[:120] + "…")
@@ -1629,9 +1883,7 @@ class Overlay:
     def _switch_to(self, title):
         """换正在看的会话：记录、对方最近说、条数、上次的建议一起换过去。"""
         self._shown = title
-        self.feed.clear()
-        for line in self.feeds.get(title, []):
-            self.feed.appendPlainText(line)
+        self._render_feed(keep_scroll=False)
         her = self.hers.get(title)
         if her:
             self._show_latest(her)

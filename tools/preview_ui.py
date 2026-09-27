@@ -17,7 +17,7 @@ from app import settings
 
 
 _STATES = ("ready", "waiting", "loading", "error", "setup", "settings", "paused", "debug",
-           "ime", "ime-thinking", "pet", "pet-menu", "bar", "voice")
+           "ime", "ime-thinking", "pet", "pet-menu", "bar", "voice", "log")
 
 # 调试视图预览用的真微信截图（只读进内存，不改不存）；没有就退一张空画面
 _FRAME = Path("/private/tmp/claude-501/-Users-lpitiless-Documents-project-wechatjev"
@@ -62,12 +62,18 @@ def _debug_packet():
             "ocr_ms": 261, "ts": time.time()}
 
 _CHAT = "白金搬砖小分队"  # 演示里「微信当前开着的」会话：用群聊，回复对象那一行才看得见
-# (会话, 谁, 内容, 群里的发言人, 时间)：两个会话，下拉框里都能看到
+# (会话, 谁, 内容, 群里的发言人, 时间[, 语音时长])：两个会话，下拉框里都能看到。
+# 第 6 位非空 = 这条是语音转出来的字，值是那条语音的时长：能对上前面那条「🔊 语音消息 N"」
+# 就并成一条（下面 2" 那对走的就是这条路），对不上就自己一条、气泡里标一行时长
 _MESSAGES = (
     ("白金搬砖小分队", "her", "周末有人去爬山吗", "阿杰", "09:12"),
     ("白金搬砖小分队", "me", "我有空，几点集合？", "", "09:15"),
     ("白金搬砖小分队", "her", "我也去，带上我一个", "陈与小金", "09:15"),
     ("白金搬砖小分队", "her", "八点地铁口见，记得带水", "阿杰", "09:16"),
+    (_CHAT, "her", '🔊 语音消息 2"', "阿杰", "18:39"),
+    (_CHAT, "her", "在楼下，在楼下。", "阿杰", "18:39", '2"'),
+    (_CHAT, "her", "干什么呢？干什么呢？到了没？到了没？快下来。", "阿杰", "18:40", '4"'),
+    (_CHAT, "me", "来了来了，刚下楼", "", "18:41"),
     (_CHAT, "me", "有空呀，还是上次那家？", "", "18:43"),
     (_CHAT, "her", "好呀！六点见怎么样？我好久没吃了 😋", "", "18:43"),
 )
@@ -236,8 +242,10 @@ def main() -> int:
         elif args.state == "waiting":
             ov.set_status("演示模式：等待对方的新消息；当前未连接微信。")
         else:
-            for chat, who, text, name, timestamp in _MESSAGES:
-                ov.log_message(who, text, name, timestamp=timestamp, chat=chat)
+            for entry in _MESSAGES:
+                chat, who, text, name, timestamp = entry[:5]
+                ov.log_message(who, text, name, timestamp=timestamp, chat=chat,
+                               voice=entry[5] if len(entry) > 5 else "")
             ov.set_targets(_GROUP, _SENDERS, _SENDERS[0])  # 群聊才有回复对象这一行
             ov.set_chat(_CHAT)
             ov.show(_RESULT)
@@ -253,6 +261,10 @@ def main() -> int:
                 ov.open_settings()
             elif args.state == "paused":
                 ov.set_capture(False)
+            elif args.state == "log":
+                # 聊天记录（气泡形态）：默认是收起的，展开才截得到
+                ov.log("演示模式：这条是采集状态行，混在记录里居中显示。")
+                ov._toggle_history()
             elif args.state == "bar":
                 # 宠物 + 候选条（ready 态）：候选条会自己贴到宠物旁边
                 ov.set_phase("ready")
@@ -280,6 +292,10 @@ def main() -> int:
                         # 中转那几项在「模型设置」页签里，先切过去再滚到底
                         ov._switch_tab("models")
                         bar = ov.settingsPage.verticalScrollBar()
+                        bar.setValue(bar.maximum())
+                        ov.app.processEvents()
+                    if args.state == "log":
+                        bar = ov.home.verticalScrollBar()  # 聊天记录在页面下半截，滚下去才看得见
                         bar.setValue(bar.maximum())
                         ov.app.processEvents()
                     target.parent.mkdir(parents=True, exist_ok=True)
