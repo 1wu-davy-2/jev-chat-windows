@@ -15,9 +15,9 @@ from PySide6.QtWidgets import (
 )
 from qfluentwidgets import (
     Action, BodyLabel, CardWidget, CheckBox, ComboBox, EditableComboBox, FluentIcon as FIF,
-    HyperlinkButton, IndeterminateProgressBar, LineEdit, PasswordLineEdit,
-    PrimaryPushButton, PushButton, RoundMenu, ScrollArea, SpinBox, SwitchButton, Theme,
-    TransparentToolButton, setCustomStyleSheet, setFont, setTheme, setThemeColor,
+    HyperlinkButton, IndeterminateProgressBar, LineEdit, MessageBoxBase, PasswordLineEdit,
+    PrimaryPushButton, PushButton, RoundMenu, ScrollArea, SpinBox, SubtitleLabel, SwitchButton,
+    TextEdit, Theme, TransparentToolButton, setCustomStyleSheet, setFont, setTheme, setThemeColor,
 )
 
 from app import settings, theme
@@ -28,7 +28,7 @@ from app.theme import (
     RADIUS_XL, SHADOW_PAD,
 )
 from app.version import VERSION
-from core import jev_client, llm, providers, relay
+from core import jev_client, llm, providers, relay, styles
 from core.questions import CHOICE_LABELS
 
 _LOG_LINES = 300
@@ -40,6 +40,9 @@ _RELATIONSHIPS = [
     ("恋人", "romantic partners"), ("朋友", "friends"), ("同事", "colleagues"),
     ("家人", "family"), ("自定义", None),
 ]
+# 「场景模板」下拉的选项 → core/styles 里的键。空串 = 不用，什么都不追加
+_PRESET_CHOICES = ((("", "不用"),) + tuple((k, styles.NAMES[k]) for k in styles.KEYS)
+                   + ((styles.CUSTOM, styles.CUSTOM_NAME),))
 # 「思考开关的传法」下拉框的索引 → core/relay.py 里的键。顺序得跟下面 addItems 一致
 _THINK_STYLE_ORDER = ("thinking", "reasoning", "none")
 
@@ -79,6 +82,30 @@ class _FitCombo(ComboBox):
         # 右侧箭头大约 28px。还没排上版时先按一个窄宽度省略，避免最小宽度被整句名字撑开。
         avail = self.width() - 36 if self.width() > 64 else 120
         return self.fontMetrics().elidedText(text, Qt.ElideRight, max(24, avail))
+
+
+def _short_error(text, limit=90):
+    """状态栏只有一行，服务器那串原文得截断。全文留给「查看详情」。"""
+    one = " ".join(str(text or "").split())
+    return one if len(one) <= limit else one[:limit] + "…"
+
+
+class _ErrorBox(MessageBoxBase):
+    """报错原文。用只读多行框，不用 MessageBox 那个标签：原文要能选中、能复制——
+    多半得拿去问中转站或者搜索。挂面板上（不是独立窗口），所以面板收起时它也跟着看不见，
+    那种时候报错只在面板的状态栏里，展开面板才看得到。"""
+
+    def __init__(self, text, parent):
+        super().__init__(parent)
+        self.titleLabel = SubtitleLabel("出错了，原文在这儿", self)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.textEdit = TextEdit(self)
+        self.textEdit.setPlainText(text)
+        self.textEdit.setReadOnly(True)
+        self.textEdit.setMinimumHeight(160)
+        self.viewLayout.addWidget(self.textEdit)
+        self.yesButton.setText("知道了")
+        self.cancelButton.hide()
 
 
 def _label(text="", size=14, color=None, bold=False, parent=None):
@@ -468,7 +495,8 @@ class _CandidateBar(QWidget):
         for i, row in enumerate(self.rows):
             if ready and i < len(items):
                 index, number, text, score, recommended = items[i]
-                meta = ("推荐回复" if recommended else f"备选 {i}")
+                # 用 number（1 起）不用行号：行号从 0 数，跟左边那个序号方块对不上
+                meta = ("推荐回复" if recommended else f"备选 {number}")
                 if score is not None:
                     meta += f" · {round(score * 100)}%"
                 row.set_content(index, text, meta, number, recommended)
@@ -707,6 +735,7 @@ class Overlay:
         self._shown = ""  # 界面上正在看的会话（浏览时和上面不一样）
         self._ordered = []  # [(candidates 里的原始索引, 百分比, 是否推荐)]，按推荐顺序排好
         self._answers = {}  # 上一次判断的 7 道题答案，候选条和面板共用
+        self._errorDetail = ""  # 最近一次失败的原文，「查看详情」里显示它
         self._phase = "idle"  # 流水线状态，由 main.py 派生后经 set_phase() 推进来
         self.win = _MainWindow(self._relayout)
         self.win.setObjectName("assistantWindow")
@@ -901,8 +930,17 @@ class Overlay:
         target_row.addWidget(self.atCheck)
         self.targetRow.hide()
         body.addWidget(self.targetRow)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(GAP_SM)
         self.status = _label("", FONT_SM, _MUTED)
-        body.addWidget(self.status)
+        status_row.addWidget(self.status, 1)
+        # 服务器回的原文（一串 JSON）塞不进状态栏，留个口子点开看
+        self.detailButton = PushButton("查看详情")
+        self.detailButton.setFixedHeight(24)
+        self.detailButton.clicked.connect(self._show_error_detail)
+        self.detailButton.hide()
+        status_row.addWidget(self.detailButton, 0, Qt.AlignTop)
+        body.addLayout(status_row)
         self.progress = IndeterminateProgressBar()
         self.progress.setFixedHeight(3)
         self.progress.hide()
@@ -988,7 +1026,7 @@ class Overlay:
         heading.addWidget(_tool(FIF.RETURN, "返回回复建议", self._back_home))
         heading.addWidget(_label("设置", FONT_H1, theme.INK, True), 1)
         body.addLayout(heading)
-        body.addWidget(_label("调整关系背景，配置判断和起草用的两个模型。", FONT_MD, _MUTED))
+        body.addWidget(_label("调整关系背景和说话风格，配置判断和起草用的两个模型。", FONT_MD, _MUTED))
         # 两块内容分页签摆，别堆成一长条滚动。标题交给页签，卡片里就不再重复写一遍
         tabs = QHBoxLayout()
         tabs.setSpacing(GAP_SM)
@@ -1024,14 +1062,6 @@ class Overlay:
             lambda index: self.relEdit.setVisible(_RELATIONSHIPS[index][1] is None)
         )
         box.addWidget(self._hint("帮助助手把握称呼、语气和回应分寸。"))
-        style_label = _label("说话风格（可选）", FONT_MD)
-        box.addWidget(style_label)
-        self.styleEdit = LineEdit()
-        self.styleEdit.setPlaceholderText("例如：话少、不用标点、偶尔用 doge、不说客套话")
-        self.styleEdit.setAccessibleName("说话风格")
-        style_label.setBuddy(self.styleEdit)
-        box.addWidget(self.styleEdit)
-        box.addWidget(self._hint("候选本来就照着你最近发的消息模仿；这里可以再补一句你自己的口吻。"))
         context_label = _label("参考上下文", FONT_MD)
         box.addWidget(context_label)
         self.contextBox = SpinBox()
@@ -1097,18 +1127,46 @@ class Overlay:
         self.preferenceCard = preference
         body.addWidget(preference)
 
-        # 第三页签「个人风格」：里面放什么还没定，先占个位。页签这一排一起摆出来，
-        # 免得后加的时候又得动这一行和 _switch_tab
+        # 第三页签「个人风格」：选一个场景模板，正文摊在大框里，可以直接改。
+        # 内置原文只有一份（core/styles.py），改过的版本按类型分开存在 config.json 的 style_texts 里
         style = _Surface()
         box = QVBoxLayout(style)
         box.setContentsMargins(GAP_LG, GAP_LG, GAP_LG, GAP_LG)
         box.setSpacing(GAP_MD)
-        # 这段说明用 _label 不用 _hint：它是这张卡唯一的内容，而 _hint 在紧凑模式下会被
-        # 整批藏掉，那样就剩一张空卡片，看着像坏了
-        box.addWidget(_label(
-            "这一页先占个位：之后往这儿放你自己的说话习惯——口头禅、常挂嘴边的词、"
-            "怎么称呼对方、标点怎么用。比「回复偏好」里那句「说话风格」更细，只影响起草出来的候选。",
-            FONT_MD, _MUTED))
+        self._presetTexts = {}  # 内存里正在改的各型正文，点保存才落盘
+        self._presetShown = ""  # 框里现在装的是哪一型：换型前得按它先把字收回来
+        top = QHBoxLayout()
+        top.addWidget(_label("场景模板", FONT_MD), 1)
+        top.addWidget(_label("类型", FONT_MD))
+        self.presetBox = ComboBox()
+        self.presetBox.setMinimumWidth(0)
+        self.presetBox.setAccessibleName("场景模板类型")
+        self.presetBox.addItems([name for _, name in _PRESET_CHOICES])
+        top.addWidget(self.presetBox)
+        box.addLayout(top)
+        box.addWidget(_label("追加到 AI 上下文的内容", FONT_MD))
+        self.presetEdit = TextEdit()
+        self.presetEdit.setPlaceholderText("选一个类型，这里会填上它的正文；也可以自己写。留空 = 不追加。")
+        self.presetEdit.setFixedHeight(180)
+        self.presetEdit.setAccessibleName("追加到 AI 上下文的内容")
+        box.addWidget(self.presetEdit)
+        preset_row = QHBoxLayout()
+        self.presetReset = PushButton("重置为内置原文")
+        self.presetReset.clicked.connect(self._preset_reset)
+        preset_row.addWidget(self.presetReset)
+        preset_row.addStretch(1)
+        self.presetSave = PrimaryPushButton("保存")  # 跟页面底部那个「保存设置」是同一个动作
+        self.presetSave.clicked.connect(self._save)
+        preset_row.addWidget(self.presetSave)
+        box.addLayout(preset_row)
+        self.presetCount = _label("", FONT_XS, _MUTED)
+        box.addWidget(self.presetCount)
+        box.addWidget(self._hint(
+            "选中的这段正文会拼进每次起草的上下文，管称呼、语气和分寸；判断那一步不喂，它只看意图和"
+            "紧张度。改过的版本按类型分开存着，点「重置为内置原文」就回到出厂那份。"))
+        # 信号接在控件都建好之后：addItems 自己会发一次 currentIndexChanged，那会儿框还没建出来
+        self.presetBox.currentIndexChanged.connect(self._preset_type_changed)
+        self.presetEdit.textChanged.connect(self._preset_count)
         self.styleCard = style
         body.addWidget(style)
 
@@ -1365,7 +1423,11 @@ class Overlay:
         self.relationshipBox.setCurrentIndex(index)
         self.relEdit.setText(relationship if _RELATIONSHIPS[index][1] is None else "")
         self.relEdit.setVisible(_RELATIONSHIPS[index][1] is None)
-        self.styleEdit.setText(settings.style())
+        self._presetTexts = dict(settings.style_texts())
+        self._presetShown = ""  # 下面 setCurrentIndex 会触发换型，别拿上一轮的键去收框里的字
+        self.presetBox.setCurrentIndex(
+            next((i for i, (k, _) in enumerate(_PRESET_CHOICES) if k == settings.style_preset()), 0))
+        self._preset_type_changed()  # 索引没变时上面不发信号，框得自己刷一次
         self.contextBox.setValue(settings.context())
         self.targetSwitch.setChecked(settings.reply_target())
         self._set_group(self.jev, settings.jev_provider(), settings.jev_model())
@@ -1432,7 +1494,8 @@ class Overlay:
                           relay_thinking_style_text=_THINK_STYLE_ORDER[
                               max(0, self.thinkStyleBox.currentIndex())],
                           reply_target_on=self.targetSwitch.isChecked(),
-                          style_text=self.styleEdit.text().strip(),
+                          style_preset_text=self._preset_key(),
+                          style_texts_dict=self._preset_dirty(),
                           thinking_on=self.thinkingSwitch.isChecked(),
                           check_update_on=self.updateSwitch.isChecked(),
                           pet_enabled_on=self.petSwitch.isChecked())
@@ -1446,6 +1509,43 @@ class Overlay:
         if not self.cands and not self._busy:
             self._empty_text()
             self.set_status("设置已就绪，等待新消息", "idle")
+
+    def _preset_key(self):
+        """下拉里选中的类型键；空串 = 不用。"""
+        return _PRESET_CHOICES[max(0, self.presetBox.currentIndex())][0]
+
+    def _preset_stash(self):
+        """把框里正在改的正文收回内存——换类型、保存之前都得先收一次。"""
+        if self._presetShown:
+            self._presetTexts[self._presetShown] = self.presetEdit.toPlainText().strip()
+
+    def _preset_dirty(self):
+        """收回内存之后，挑出跟内置原文不一样的那些——只有这些值得写进 config.json。"""
+        self._preset_stash()
+        return {k: t for k, t in self._presetTexts.items() if t != styles.default_text(k)}
+
+    def _preset_type_changed(self, _=None):
+        """换了类型：先把框里那份收好，再换上这一型的（改过的优先，没改过就用内置原文）。
+        「不用」把框灰掉——那会儿框里写什么都进不了 prompt，别让人白写。"""
+        self._preset_stash()
+        key = self._preset_key()
+        self._presetShown = key
+        self.presetEdit.setPlainText(self._presetTexts.get(key, styles.default_text(key)))
+        self.presetEdit.setEnabled(bool(key))
+        self.presetReset.setEnabled(bool(key))
+        self.presetReset.setText("清空" if key == styles.CUSTOM else "重置为内置原文")
+
+    def _preset_reset(self):
+        """回到内置原文（自定义就是清空）。只动框里的字，落盘还是走保存。"""
+        key = self._preset_key()
+        self._presetTexts.pop(key, None)
+        self.presetEdit.setPlainText(styles.default_text(key))
+
+    def _preset_count(self):
+        """框里多少字。内置的都压在 200 以内，自己加写的超过这个数就该掂量一下了。"""
+        n = len(self.presetEdit.toPlainText().strip())
+        self.presetCount.setText(f"{n} 字" + (f"，超过 {styles.LIMIT} 了，会盖过对话本身"
+                                              if n > styles.LIMIT else ""))
 
     def _debug_toggled(self, on):
         """调试视图独立于「保存设置」：拨一下就开窗/收窗，顺手落盘，重启还在。"""
@@ -1784,6 +1884,23 @@ class Overlay:
         x = min(max(x, area.left() + gap), area.right() - self.bar.width() - gap)
         self.bar.move(x, y)
 
+    def _note_trouble(self, text):
+        """把一段故障原文挂在状态栏旁边；空串 = 把上一次的收掉。"""
+        self._errorDetail = " ".join(str(text or "").split())
+        self.detailButton.setVisible(bool(self._errorDetail))
+
+    def _show_error_detail(self):
+        if self._errorDetail:
+            _ErrorBox(self._errorDetail, self.win).exec()
+
+    def set_error(self, text):
+        """生成失败。状态栏给一句短的，**原文一个字都不改地留着**等「查看详情」——
+        以前这儿永远是一句「请检查网络和服务设置」，真正的原因（中转回的 401 之类）
+        埋在聊天记录里，等于没提示。"""
+        self._note_trouble(text)
+        self.set_status("生成失败：" + _short_error(self._errorDetail), "error")
+        self.log("分析失败：" + self._errorDetail)
+
     def set_status(self, text, kind="idle"):
         colors = {"idle": _MUTED, "busy": _ACCENT, "success": _ACCENT,
                   "warning": theme.WARN, "error": theme.DANGER}
@@ -1983,8 +2100,11 @@ class Overlay:
         self.set_busy(False)
         self._current = bool(self.cands)
         self._clear_cards()
+        self._note_trouble(result.get("trouble"))  # 这次成了/没成，都把上一次的报错收掉
         best = result.get("best_index", 0)
-        if best not in range(len(self.cands)):
+        if not result.get("ranked", True):  # 老结果没这个键，按「排过序」处理
+            best = None  # 排序没跑成：三条按起草顺序摆，谁也不标「推荐」——那不是模型选的
+        elif best not in range(len(self.cands)):
             best = 0
         raw_scores = result.get("scores") or []
         scores = [raw_scores[i] if i < len(raw_scores) else None for i in range(len(self.cands))]
@@ -1993,7 +2113,10 @@ class Overlay:
         # 按概率降序排，推荐位（API 给的 choice）强制第一，同分按原索引
         order = sorted(range(len(self.cands)), key=lambda i: (i != best, -(scores[i] or 0), i))
         for position, index in enumerate(order):
-            card = _ReplyCard(self, index, recommended=index == best, number=position, score=scores[index])
+            # 编号从 1 起，跟候选条的序号方块和 Ctrl+1/2/3 对齐；推荐那条改写「推荐回复」，
+            # 所以排过序时看到的是「推荐回复 / 备选 2 / 备选 3」
+            card = _ReplyCard(self, index, recommended=index == best, number=position + 1,
+                              score=scores[index])
             self.replyBox.addWidget(card)
             self.cards.append(card)
         reply_to = result.get("reply_to")
@@ -2016,7 +2139,11 @@ class Overlay:
         self.insight.setVisible(bool(self.cands))
         self.referenceNote.setVisible(bool(self.cands) and not self._compact)
         self.updated.setText(datetime.now().strftime("%H:%M") + " 更新")
-        if self.cands:
+        if self.cands and self._errorDetail:
+            # 候选是好的、只是判断/排序那一步挂了：照样能用，但要说清楚为什么没有概率和推荐
+            self.set_status("判断服务没应答，这三条是按对话直接起草的；点「查看详情」看原因。",
+                            "warning")
+        elif self.cands:
             self.set_status("建议已更新，选一句适合你的回复", "success")
         else:
             self.set_status("未生成可用回复，请等待下一条新消息。", "error")

@@ -105,7 +105,7 @@ def fill_reply(text):
 
 
 def convert_voice():
-    """用户点了候选条上的「转文字」：悬停那条语音 → 点微信冒出来的「转文字」按钮。
+    """用户点了候选条上的「转文字」：右键那条语音 → 点菜单第一项「语音转文字」。
 
     转出来的文字会作为一条新气泡出现在聊天区，被采集链路照常读到、照常触发判断——
     所以这里点完就完事，不用自己再去 OCR 一遍。返回 "" 表示成功，否则是给用户看的原因。"""
@@ -120,7 +120,7 @@ def convert_voice():
     if title != state["chat"] or title != ov.current_chat():
         return "微信现在开着的不是这条语音所在的会话，切回去再试"
     last = state["voice"][1][-1]  # 取最近的那条（气泡自上而下排）
-    reason = voice.convert(state["hwnd"], last[:4], last[5])
+    reason = voice.convert(state["hwnd"], last[:4])
     if not reason:
         # 点成了：给子进程开个口子。转出来的字是**插在那条语音气泡正下方**的，位置在
         # 「已知行」上面，不开口子会被当成往上翻出来的旧消息丢掉。只在这个窗口里认，
@@ -190,7 +190,7 @@ def analyze_bg(msgs, title, revision, reply_to=None):
                                    provider=provider,
                                    base_url=(relay_base if "relay" in (provider, jev_provider)
                                              else settings.draft_base_url()) or None,
-                                   reply_to=reply_to, style=settings.style(),
+                                   reply_to=reply_to, scene=settings.scene_text(),
                                    thinking=settings.thinking(),
                                    thinking_style=settings.relay_thinking_style(),
                                    judge_path=settings.relay_judge_path(),
@@ -198,7 +198,8 @@ def analyze_bg(msgs, title, revision, reply_to=None):
                                    jev_model=settings.jev_model() or None),
                      title, revision))
     except Exception as e:
-        results.put(("err", f"分析失败: {e}", title, revision))
+        # 原文照发，别在这儿包一层套话：界面那条状态栏会截短显示，点「查看详情」看全文
+        results.put(("err", str(e), title, revision))
 
 
 def check_update_bg():
@@ -390,8 +391,7 @@ def tick():
                     ov.set_busy(False)
             else:
                 ov.set_busy(False)
-                ov.set_status("生成失败，请检查网络和服务设置；新消息到来后会重试。", "error")
-                ov.log(r)
+                ov.set_error(r)  # 状态栏给一句短的，「查看详情」里是服务器返回的原文
         # 静默窗口到了才真去问。这期间攒下的消息早就在 history 里了（drain 一收到就记），
         # 所以这里现取一次，连着发的几条一起喂进去
         pending = state["pending"]

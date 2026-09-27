@@ -12,6 +12,7 @@ import json
 import os
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
 
+from core import styles
 from core.providers import CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, LEGACY, LLM_ENV
 from core.relay import DEFAULT_JUDGE_PATH, DEFAULT_THINKING_STYLE, THINKING_STYLES
 
@@ -45,8 +46,29 @@ def context() -> int:
     return max(3, min(30, n))
 
 def style() -> str:
-    """用户自己描述的说话风格（可选，自由文本），只喂给起草模型。默认空 = 只照着最近的消息模仿。"""
+    """老字段：一句自由文本口吻。已被「场景模板」取代（见 style_preset / style_texts），
+    这里只留着读升级前的配置做迁移，保存一次之后 config.json 里就没有它了。"""
     return str(_read("style") or "")
+
+def style_preset() -> str:
+    """选中的场景模板：core/styles 的键、"custom"（自定义），或空串（不用 = 什么都不追加）。"""
+    v = str(_read("style_preset") or "").strip()
+    if v in styles.KEYS or v == styles.CUSTOM:
+        return v
+    # 老配置里没有这一项：那句自由文本就当「自定义」接过来，没写就是不用
+    return styles.CUSTOM if style().strip() else ""
+
+def style_texts() -> dict:
+    """用户改过的模板正文 {类型: 正文}，只存跟内置不一样的（见 save）。认不出的键、非字符串的值丢掉。
+    老配置里那句自由文本（style）当「自定义」接过来——升级前只有那一个地方能写字。"""
+    v = _read("style_texts")
+    if isinstance(v, dict):
+        return {k: str(t).strip() for k, t in v.items() if k in styles.KEYS or k == styles.CUSTOM}
+    return {styles.CUSTOM: style().strip()} if style().strip() else {}
+
+def scene_text() -> str:
+    """这次要追加到起草 prompt 的正文（选中的类型 + 用户改过的版本）。空 = 不追加。"""
+    return styles.resolve(style_preset(), style_texts())
 
 def jev_provider() -> str:
     """判断模型走哪家：openrouter（默认）、typesafe 直连，或 relay 第三方中转。"""
@@ -198,7 +220,8 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          jev_model_text: str | None = None, draft_provider_text: str | None = None,
          llm_key_text: str | None = None, draft_model_text: str | None = None,
          draft_base_url_text: str | None = None, reply_target_on: bool | None = None,
-         style_text: str | None = None, thinking_on: bool | None = None,
+         style_preset_text: str | None = None, style_texts_dict: dict | None = None,
+         thinking_on: bool | None = None,
          check_update_on: bool | None = None, debug_view_on: bool | None = None,
          relay_base_url_text: str | None = None, relay_judge_path_text: str | None = None,
          relay_thinking_style_text: str | None = None,
@@ -219,12 +242,21 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
     # 空串 = 清掉，None = 原样留着（读原始字段，别读补过默认值的那个）
     keep = lambda new, name: str(_read(name) or "") if new is None else str(new).strip()
     flag = lambda new, now: now() if new is None else bool(new)
+    # 场景模板：None = 原样留着。正文只存跟内置原文**不一样**的那些——这样以后改 core/styles.py
+    # 的文案，没动过手的人能跟着更新，动过手的那一型则原样保留他改的版本
+    preset = style_preset() if style_preset_text is None else str(style_preset_text).strip()
+    if preset not in styles.KEYS and preset != styles.CUSTOM:
+        preset = ""  # 认不出的类型按「不用」处理，别写个坏值进去
+    texts = style_texts() if style_texts_dict is None else {
+        str(k): str(v).strip() for k, v in dict(style_texts_dict).items()
+        if k in styles.KEYS or k == styles.CUSTOM}
+    texts = {k: t for k, t in texts.items() if t != styles.default_text(k)}
     # 整个 dict 必须在 open(..., "w") **之前**拼好：open 一上来就把文件截断，
     # 之后再 _read() 读到的是空文件，None 那几项就不是「保留」而是被清空了。
     data = {
         # 关系为空 = 只改别的开关（调试视图那种单项保存），别把它写没了
         "relationship": relationship_text or relationship(), "context": n,
-        "style": keep(style_text, "style"),
+        "style_preset": preset, "style_texts": texts,
         "jev_provider": jev, "jev_model": keep(jev_model_text, "jev_model"),
         "draft_provider": draft, "draft_model": keep(draft_model_text, "draft_model"),
         "draft_base_url": keep(draft_base_url_text, "draft_base_url"),

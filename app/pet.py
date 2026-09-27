@@ -197,8 +197,23 @@ class PetWindow(QWidget):
         self._place_badge()
 
     def _place_badge(self):
-        pad_left, pad_top = theme.SHADOW_PAD_MASCOT[0], theme.SHADOW_PAD_MASCOT[1]
-        self.badge.move(self.width() - pad_left - 26, pad_top + 4)
+        """角标钉在**贴图**的右上角，不是窗口右上角。
+
+        两张贴图宽窄差很多（idle 那张带两个甜甜圈，比 alert 那张宽一半），换姿势时窗口
+        跟着变宽变窄。钉窗口的话，`_apply_pixmap` 里这一次拿到的可能还是旧宽度，角标就被
+        摆到窗口外面去了；而角标是 frame 的子控件、frame 又挂着阴影效果——QGraphicsEffect
+        会把子控件渲进自己的画布，超出 frame 矩形的部分**直接裁掉**，真机上看到的就是
+        「红色角标只剩半个」。钉贴图则永远落在贴图范围内，换姿势也好、布局晚一拍也好，
+        都不会跑出去。"""
+        m = self.mascot.geometry()
+        self.badge.move(m.x() + m.width() - 26, m.y() + 4)
+
+    def resizeEvent(self, event):
+        """窗口尺寸变了（换姿势时贴图宽窄不同，窗口跟着变）就把角标重摆一次。
+
+        布局是延迟重排的：_apply_pixmap 里 adjustSize() 之后立刻读宽度，拿到的可能还是旧值。"""
+        super().resizeEvent(event)
+        self._place_badge()
 
     def _animate(self):
         """漂浮 + 思考态旋转。控件位置不动，只改绘制偏移，脏区永远落在窗口内。"""

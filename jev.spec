@@ -14,7 +14,7 @@ hiddenimports = [
     "app.version", "app.update", "app.debugwin",  # debugwin 是开了调试视图才 import 的
     "app.theme", "app.pet",  # theme 是纯数据；pet 是桌面宠物窗
     "core.engine", "core.draft", "core.jev_client", "core.questions", "core.providers",
-    "core.llm", "core.relay",
+    "core.llm", "core.relay", "core.styles",
 ]
 datas, binaries = [], []
 for pkg in (

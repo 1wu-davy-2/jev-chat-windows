@@ -14,10 +14,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import settings
+from core import styles
 
 
-_STATES = ("ready", "waiting", "loading", "error", "setup", "settings", "paused", "debug",
-           "ime", "ime-thinking", "pet", "pet-menu", "bar", "voice", "log")
+_STATES = ("ready", "waiting", "loading", "error", "degraded", "setup", "settings", "paused",
+           "debug", "ime", "ime-thinking", "pet", "pet-menu", "bar", "voice", "log")
 
 # 调试视图预览用的真微信截图（只读进内存，不改不存）；没有就退一张空画面
 _FRAME = Path("/private/tmp/claude-501/-Users-lpitiless-Documents-project-wechatjev"
@@ -105,7 +106,15 @@ _RESULT = {
     },
     "usage": {},
     "reply_to": "阿杰",  # 跟 _SENDERS[0] 一致，让「回复给 …」那行在演示里看得见
+    "judged": True, "ranked": True, "trouble": "",
 }
+
+# 判断那一路挂了（比如中转把令牌停用）：三条候选照样摆出来，只是没概率、没推荐，带一句原因
+_TROUBLE = ("Jev HTTP 401: 该令牌因内容违规已被停用，可在令牌管理页重新启用；"
+            "详情请查收违规通知邮件 (request id: 01M3GV641MS0X5EV6K8GPH5DYC)")
+_DEGRADED = {**_RESULT, "best_index": 0, "best_reply": _RESULT["candidates"][0],
+             "scores": [0.0, 0.0, 0.0], "answers": {},
+             "judged": False, "ranked": False, "trouble": _TROUBLE}
 
 
 def main() -> int:
@@ -131,7 +140,9 @@ def main() -> int:
                      "draft_provider": "relay" if args.relay else "deepseek",
                      "draft_model": "deepseek-flash",
                      "draft_base_url": "", "reply_target": True,
-                     "style": "话少，基本不用标点，急了才发感叹号", "thinking": False,
+                     # 「个人风格」页签：选一型、并且有一型是改过的，两种状态都看得到
+                     "style_preset": "friend", "style_texts": {"romance": "哥哥视角：她是你妹妹。"},
+                     "thinking": False,
                      "check_update": True, "debug_view": args.state == "debug",
                      # 只有宠物相关的状态才开宠物形态；其余状态保持「面板直接可见」，
                      # 不然面板从没 show 过，grab 出来是空的
@@ -144,14 +155,18 @@ def main() -> int:
     def save_demo_settings(relationship_text=None, context_n=None, *, jev_provider_text=None,
                            jev_key_text=None, jev_model_text=None, draft_provider_text=None,
                            llm_key_text=None, draft_model_text=None, draft_base_url_text=None,
-                           reply_target_on=None, style_text=None, thinking_on=None,
-                           check_update_on=None, debug_view_on=None,
+                           reply_target_on=None, style_preset_text=None, style_texts_dict=None,
+                           thinking_on=None, check_update_on=None, debug_view_on=None,
                            relay_base_url_text=None, relay_judge_path_text=None,
                            relay_thinking_style_text=None, pet_enabled_on=None):
         if relationship_text:
             demo_settings["relationship"] = relationship_text
         if context_n is not None:
             demo_settings["context"] = context_n
+        if style_preset_text is not None:
+            demo_settings["style_preset"] = style_preset_text
+        if style_texts_dict is not None:
+            demo_settings["style_texts"] = dict(style_texts_dict)
         for name, value in (("jev_provider", jev_provider_text), ("jev_model", jev_model_text),
                             ("draft_provider", draft_provider_text), ("draft_model", draft_model_text),
                             ("draft_base_url", draft_base_url_text), ("style", style_text),
@@ -199,7 +214,10 @@ def main() -> int:
         relay_judge_path=lambda: demo_settings["relay_judge_path"],
         relay_thinking_style=lambda: demo_settings["relay_thinking_style"],
         reply_target=lambda: demo_settings["reply_target"],
-        style=lambda: demo_settings["style"],
+        style_preset=lambda: demo_settings["style_preset"],
+        style_texts=lambda: demo_settings["style_texts"],
+        scene_text=lambda: styles.resolve(
+            demo_settings["style_preset"], demo_settings["style_texts"]),
         thinking=lambda: demo_settings["thinking"],
         check_update=lambda: demo_settings["check_update"],
         debug_view=lambda: demo_settings["debug_view"],
@@ -250,15 +268,18 @@ def main() -> int:
                                voice=entry[5] if len(entry) > 5 else "")
             ov.set_targets(_GROUP, _SENDERS, _SENDERS[0])  # 群聊才有回复对象这一行
             ov.set_chat(_CHAT)
-            ov.show(_RESULT)
-            ov.set_status("演示模式：已生成 3 条建议，点击填入仅模拟操作。", kind="success")
+            degraded = args.state == "degraded"
+            ov.show(_DEGRADED if degraded else _RESULT)
+            if not degraded:  # degraded 那句状态栏是 show() 自己写的，别盖掉
+                ov.set_status("演示模式：已生成 3 条建议，点击填入仅模拟操作。", kind="success")
             ov.set_update("9.9.9", "https://github.com/jev-chat/jev-chat-windows/releases/latest")
             if args.state == "loading":
                 ov.set_busy(True)
                 ov.set_status("演示模式：正在为最新消息生成建议…", kind="busy")
             elif args.state == "error":
+                # 走真的报错路径：状态栏一句短的 +「查看详情」里是原文
                 ov.set_busy(True)
-                ov.set_status("演示模式：分析失败，请检查网络和密钥，等待下一条消息后重试。", kind="error")
+                ov.set_error(_TROUBLE)
             elif args.state == "settings":
                 ov.open_settings()
                 if args.tab:

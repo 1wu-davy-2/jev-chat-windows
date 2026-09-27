@@ -171,13 +171,14 @@ def _line(m) -> str:
 def draft_candidates(messages: list, relationship: str, provider: str = "deepseek",
                      model: str | None = None, base_url: str | None = None,
                      timeout: float = 30, keep: int = 10,
-                     reply_to: str | None = None, style: str = "", thinking: bool = False,
+                     reply_to: str | None = None, scene: str = "", thinking: bool = False,
                      guidance: str | None = None, thinking_style: str = "") -> list[str]:
     """messages: [(from, text)] 或 [(from, text, name)]，from ∈ {her, me}，name = 群里的发言人；
     只看最近 keep 条。返回最多 3 条中文候选（过滤后可能是 0 条，调用方要处理）。
 
     reply_to: 群聊里指定回复给谁；None = 正常回复。
-    style: 用户自己描述的口吻（设置里的「说话风格」），空就只靠样本模仿。
+    scene: 这次要追加的场景正文（设置里选的场景模板 + 用户改过的版本，由 core/styles 归一），
+    管这个关系里怎么称呼、语气、分寸；空 = 不加。
     thinking: 思考模式，默认关（慢且贵）；开了模型会先想再写。设置里的开关。
     guidance: Jev 的判断小抄（core.questions.guidance_text），空就是盲起草。
     thinking_style: 只对第三方中转有意义——思考开关带哪个字段各家中转不一样，
@@ -198,8 +199,9 @@ def draft_candidates(messages: list, relationship: str, provider: str = "deepsee
     samples = [t for t in said if t and len(t) <= 60 and "http" not in t][-12:]
     if len(samples) >= 2:
         user += "\n\n我平时是这么说话的（模仿用词、长短、标点习惯）：\n" + "\n".join(samples)
-    if style.strip():
-        user += f"\n\n我对自己口吻的描述：{style.strip()}"
+    # 场景模板：管这个关系里怎么说话（称呼、分寸、禁忌、长度）
+    if scene.strip():
+        user += "\n\n这次的场景（只管称呼、语气、分寸，别的规则照旧）：\n" + scene.strip()
     if reply_to:
         user += f"\n\n这是群聊。你要回复的是「{reply_to}」的话，三条候选都对 TA 说，不要@别人。"
     if guidance and guidance.strip():
