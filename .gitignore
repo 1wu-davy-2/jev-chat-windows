@@ -8,6 +8,10 @@ venv/
 
 # 每个人自己的关系设置，不进仓库（.gitignore 里 # 只能整行注释，写在模式后面会变成模式的一部分）
 config.json
+# AI 记录库：里面是这个人自己的聊天原文，只在本机，绝不提交
+history.db
+history.db-wal
+history.db-shm
 # 根目录下的临时截图（docs/ 里的照常提交）
 /*.png
 wechat_probe.png

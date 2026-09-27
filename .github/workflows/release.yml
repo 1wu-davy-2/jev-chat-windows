@@ -29,6 +29,21 @@ jobs:
       - name: 装依赖
         run: pip install -r requirements.txt pyinstaller
 
+      - name: 自测（不联网，纯本地断言）
+        shell: pwsh
+        run: |
+          # 仓库自带的全部自测，都是纯逻辑断言、不联网、不碰微信，CI 上直接能跑。
+          # 摆在打包前面：断言挂了就别出包，省得拿一个坏 zip 去测。
+          # 双导入写法（core/ 里那几个模块）让脚本不设 PYTHONPATH 也跑得起来。
+          $tests = @('core/draft.py', 'core/styles.py', 'core/engine.py', 'core/trace.py', 'app/ocr.py', 'app/capture.py')
+          foreach ($t in $tests) {
+            Write-Host "== python $t"
+            python $t
+            if ($LASTEXITCODE -ne 0) { throw "$t 自测没过" }
+          }
+          python -m app.update
+          if ($LASTEXITCODE -ne 0) { throw "app/update 自测没过" }
+
       - name: 打包
         run: pyinstaller --noconfirm --clean jev.spec
 

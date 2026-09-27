@@ -19,6 +19,7 @@ from core.relay import DEFAULT_JUDGE_PATH, DEFAULT_THINKING_STYLE, THINKING_STYL
 _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CONFIG = os.path.join(_ROOT, "config.json")
+_HISTORY_DB = os.path.join(_ROOT, "history.db")  # AI 调用记录，见 core/trace.py（已进 .gitignore）
 _DEFAULT_RELATIONSHIP = "romantic partners"
 _DEFAULT_CONTEXT = 10
 _DEFAULT_JEV = "openrouter"
@@ -135,6 +136,15 @@ def opener() -> bool:
     开场白让人挑。默认关——关着的时候调模型的条件还是「只有对方来了新消息」。"""
     return bool(_read("opener", False))
 
+def history() -> bool:
+    """记不记 AI 调用（每一轮发了什么提示、模型回了什么、最后用了哪条）。默认开，
+    存本机 history.db，只有「AI 记录」窗口读它。关掉就一次都不写。"""
+    return bool(_read("history", True))
+
+def history_db() -> str:
+    """记录库的路径：跟 config.json 并排。路径的算法只在这儿一处（core/trace 不认识 app）。"""
+    return _HISTORY_DB
+
 def opener_minutes() -> int:
     """等多少分钟算冷场。1~720，缺失/脏数据一律退默认值。"""
     try:
@@ -240,7 +250,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
          relay_base_url_text: str | None = None, relay_judge_path_text: str | None = None,
          relay_thinking_style_text: str | None = None,
          pet_enabled_on: bool | None = None, opener_on: bool | None = None,
-         opener_minutes_n: int | None = None) -> None:
+         opener_minutes_n: int | None = None, history_on: bool | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -282,6 +292,7 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
         "relay_thinking_style": keep(relay_thinking_style_text, "relay_thinking_style"),
         "reply_target": flag(reply_target_on, reply_target),
         "opener": flag(opener_on, opener), "opener_minutes": opener_n,
+        "history": flag(history_on, history),
         "thinking": flag(thinking_on, thinking),
         "check_update": flag(check_update_on, check_update),
         "debug_view": flag(debug_view_on, debug_view),

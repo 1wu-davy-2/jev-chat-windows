@@ -726,13 +726,15 @@ class _ChatLog(QWidget):
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
                  on_toggle_debug=None, on_voice_convert=None, on_opener_again=None,
-                 on_settings_saved=None):
+                 on_settings_saved=None, on_open_history=None, on_use=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。
         on_voice_convert() → 用户点了「转文字」，返回 "" 或一句给用户看的失败原因。
         on_opener_again() → 用户点了「换一批」，要重新起草一批开场白。
-        on_settings_saved() → 设置存盘了，父进程有些「按新设置现算一次」的事要做。"""
+        on_settings_saved() → 设置存盘了，父进程有些「按新设置现算一次」的事要做。
+        on_open_history() → 用户点了标题栏那个「AI 记录」，开（或收起）记录窗。
+        on_use(原始下标, "fill"|"copy") → 用户用了第几条候选，父进程记进 AI 记录里。"""
         self.app = QApplication.instance() or QApplication([])
         self.app.setWindowIcon(_app_icon())
         setTheme(Theme.LIGHT)
@@ -744,6 +746,8 @@ class Overlay:
         self.on_voice_convert = on_voice_convert
         self.on_opener_again = on_opener_again
         self.on_settings_saved = on_settings_saved
+        self.on_open_history = on_open_history
+        self.on_use = on_use
         self.result_of = result_of
         self._voices = {}  # {会话名: [(x0,y0,x1,y1,时长)]}，语音气泡的位置，转文字要右键它
         self._opener = {}  # {会话名: 对方多少分钟没回}，现在摆的是开场白（不是回复）的会话
@@ -799,6 +803,10 @@ class Overlay:
         title.addWidget(self.captureSwitch)
         self.settingsButton = _tool(FIF.SETTING, "设置", self.open_settings, header)
         title.addWidget(self.settingsButton)
+        # 名字别叫 historyButton：面板底部那个「聊天记录」已经占了，两边会打架
+        self.traceButton = _tool(FIF.DOCUMENT, "AI 记录", self._open_history, header)
+        self.traceButton.setToolTip("每一轮 AI 调用问了什么、回了什么、你最后用了哪条（只在本机）")
+        title.addWidget(self.traceButton)
         title.addWidget(_tool(FIF.MINIMIZE, "收起（宠物还在）", self.collapse, header))
         title.addWidget(_tool(FIF.CLOSE, "退出助手", self._quit, header))
         outer.addWidget(header)
@@ -1261,6 +1269,19 @@ class Overlay:
             "关：秒回，够用。开：模型先想再写，更斟酌但慢好几倍、贵一些。"
             "只有 " + " / ".join(providers.THINKING) + " 认这个开关。"
         ))
+        history_row = QHBoxLayout()
+        history_row.addWidget(_label("记录 AI 调用", FONT_MD), 1)
+        self.historySwitch = SwitchButton()
+        self.historySwitch.setOnText("开")
+        self.historySwitch.setOffText("关")
+        self.historySwitch.setAccessibleName("记录 AI 调用")
+        history_row.addWidget(self.historySwitch)
+        box.addLayout(history_row)
+        box.addWidget(self._hint(
+            "每一轮问了什么、模型回了什么、你最后用了哪条，都记在本机的 history.db 里，"
+            "点标题栏那个「AI 记录」能翻。存的是聊天原文（不存密钥，写库前统一脱敏）；"
+            "关掉就一次都不写，已有的记录还在，去记录窗里清空。"
+        ))
         # 中转那几项：来源选了「第三方中转」才露出来，起草和判断共用同一个地址
         self.relayLabel = _label("中转地址", FONT_MD)
         box.addWidget(self.relayLabel)
@@ -1505,6 +1526,7 @@ class Overlay:
         self.thinkStyleBox.setCurrentIndex(
             _THINK_STYLE_ORDER.index(settings.relay_thinking_style()))
         self.thinkingSwitch.setChecked(settings.thinking())
+        self.historySwitch.setChecked(settings.history())
         self.updateSwitch.setChecked(settings.check_update())
         self.set_debug_switch(settings.debug_view())  # 屏蔽信号地拨，别在加载时开关一遍窗口
         self.petSwitch.blockSignals(True)  # 同上：加载时别真去开关宠物
@@ -1566,6 +1588,7 @@ class Overlay:
                           style_preset_text=self._preset_key(),
                           style_texts_dict=self._preset_dirty(),
                           thinking_on=self.thinkingSwitch.isChecked(),
+                          history_on=self.historySwitch.isChecked(),
                           check_update_on=self.updateSwitch.isChecked(),
                           pet_enabled_on=self.petSwitch.isChecked())
         except Exception:
@@ -1692,11 +1715,22 @@ class Overlay:
             return self._ordered[position][0]
         return position
 
+    def _open_history(self):
+        """标题栏那个「AI 记录」：窗的开关在父进程手里（跟调试视图同一个套路）。"""
+        if self.on_open_history:
+            self.on_open_history()
+
+    def _used(self, index, action):
+        """候选条/面板上「填入」「复制」点了哪一条——记进 AI 记录，复盘时才知道最后用了哪条。"""
+        if self.on_use:
+            self.on_use(index, action)
+
     def _fill(self, index):
         if self._busy or not self._current or index >= len(self.cands):
             return
         try:
             self.on_fill(self.cands[index])
+            self._used(index, "fill")
         except Exception as e:
             # 状态栏保持友好文案；真实原因和压缩堆栈进聊天记录，认得出是哪一步炸的
             import traceback
@@ -1710,6 +1744,7 @@ class Overlay:
         if self._busy or not self._current or index >= len(self.cands):
             return
         self.app.clipboard().setText(self.cands[index])
+        self._used(index, "copy")
         self.set_status("回复已复制，可粘贴并修改。", "success")
 
     def _capture_toggled(self, on):

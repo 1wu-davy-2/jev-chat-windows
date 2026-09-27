@@ -24,6 +24,7 @@ from app.fill import fill
 from app.ocr import similar
 from app.overlay import Overlay
 from app.version import VERSION
+from core import trace
 from core.engine import analyze, analyze_opener
 
 # {会话名: {history, result, rev, target, senders}}：每个会话各自的上下文、上次结果和版本号，互不串味
@@ -52,8 +53,9 @@ def chat_of(title):
     # nudge：冷场计时（到期时刻，None = 没在计时），nudge_at 是起算时刻（界面上说「对方 N 分钟没回」
     # 用它算），nudge_len 是起算时 history 记到哪儿了（到点只查这之后有没有对方的话），
     # nudged：这个冷场已经自动出过一批开场白了吗——对方回了话才清掉（见 schedule_analyze）
+    # run_id：这个会话最近一轮在 AI 记录里是哪一行（「填入」时回填「我用了哪条」）
     return chats.setdefault(title, {"history": deque(maxlen=60), "result": None, "rev": 0,
-                                    "target": None, "senders": [],
+                                    "target": None, "senders": [], "run_id": None,
                                     "nudge": None, "nudge_at": 0.0, "nudge_len": 0,
                                     "nudged": False})
 
@@ -204,6 +206,96 @@ def on_debug_closed():
     settings.save(debug_view_on=False)
 
 
+def open_history():
+    """标题栏的「AI 记录」：开过就复用同一个窗（列表、选中位置都还在），没有就现建。
+
+    库按需初始化：设置里关着、也从没开过记录窗的话，硬盘上连 history.db 都不建。"""
+    global hist
+    trace.configure(settings.history_db())
+    if hist is None:
+        from app.historywin import HistoryWindow
+
+        hist = HistoryWindow(db_path=settings.history_db())
+    hist.show()
+    hist.raise_()
+    hist.activateWindow()
+
+
+def record_run(title, kind, trigger, result=None, exc=None):
+    """把一轮写进 AI 记录。设置里关着就不写——记录是个旁路，一次都不该影响生成。
+
+    result 是 engine 给的（里面带 trace），起草就挂了的话是异常，材料挂在 `exc.trace` 上
+    （那种轮次恰恰最该查，所以照样落库）。写库失败返回的 None 也就是没有 id 可回填而已。
+
+    **整个函数永不抛**：它是在 analyze_bg 的 except 分支里也被调用的，那儿一抛就没人往队列里
+    放结果了，界面的 busy 会永远卡在「正在生成」，比丢一条记录严重得多。"""
+    try:
+        return _record_run(title, kind, trigger, result, exc)
+    except Exception:
+        return None
+
+
+def _record_run(title, kind, trigger, result, exc):
+    if not settings.history():
+        return None
+    # 库按需初始化：设置里一直关着、也从没开过记录窗的话，硬盘上连 history.db 都不建
+    trace.configure(settings.history_db())
+    info = dict((getattr(exc, "trace", None) or {}) if exc is not None else result.get("trace") or {})
+    draft = info.get("draft") or {}
+    judge_usage = info.get("judge_usage") or {}
+    rank_usage = info.get("rank_usage") or {}
+    draft_usage = draft.get("usage") or {}
+    row = {
+        "finished_at": int(time.time() * 1000),
+        "chat": title, "kind": kind, "trigger": trigger,
+        "relationship": info.get("relationship"), "scene": info.get("scene"),
+        "context_n": info.get("context_n"), "messages": info.get("messages"),
+        "ms": info.get("ms"),
+        # 起草
+        "draft_provider": draft.get("provider"),
+        "draft_model": draft.get("model"), "draft_base_url": draft.get("base_url") or info.get("draft_base_url"),
+        "draft_thinking": draft.get("thinking"), "draft_ms": draft.get("ms"),
+        "draft_system": draft.get("system"), "draft_prompt": draft.get("prompt"),
+        "draft_reply": draft.get("reply"), "draft_candidates": draft.get("candidates"),
+        "draft_dropped": draft.get("dropped"),
+        "draft_retry_prompt": draft.get("retry_prompt"), "draft_retry_reply": draft.get("retry_reply"),
+        "draft_in": draft_usage.get("input_tokens"), "draft_out": draft_usage.get("output_tokens"),
+        # 只会在起草那一步炸（判断和排序挂了都不抛，走 trouble），异常本身就是原因
+        "draft_error": str(exc) if exc is not None else "",
+        # 判断
+        "judge_provider": info.get("judge_provider"), "judge_model": info.get("judge_model"),
+        "judge_path": info.get("judge_path"), "judge_ms": info.get("judge_ms"),
+        "judge_state": info.get("judge_state"), "judge_answers": info.get("judge_answers"),
+        "judge_reply": info.get("judge_reply"), "judge_error": info.get("judge_error"),
+        "judge_in": judge_usage.get("input_tokens"), "judge_out": judge_usage.get("output_tokens"),
+        # 排序
+        "rank_ms": info.get("rank_ms"), "rank_answers": info.get("rank_answers"),
+        "rank_reply": info.get("rank_reply"), "rank_error": info.get("rank_error"),
+        "rank_in": rank_usage.get("input_tokens"), "rank_out": rank_usage.get("output_tokens"),
+        # 结果
+        "candidates": (result or {}).get("candidates"), "best_index": (result or {}).get("best_index"),
+        "scores": (result or {}).get("scores"), "judged": (result or {}).get("judged"),
+        "ranked": (result or {}).get("ranked"),
+        "trouble": (result or {}).get("trouble") or (str(exc) if exc is not None else ""),
+    }
+    run_id = trace.record(row)
+    if run_id and result is not None:
+        result["run_id"] = run_id  # tick 里存进 chats[title]，回头「填入」要拿它回填
+    return run_id
+
+
+def mark_used(index, action):
+    """用户填了/复制了第几条候选：回填到那一轮上。只认「正在看着的会话 + 最近那轮」。"""
+    title = ov.current_chat() or state["chat"]
+    chat = chats.get(title) or {}
+    text = ""
+    result = chat.get("result") or {}
+    cands = result.get("candidates") or []
+    if 0 <= index < len(cands):
+        text = cands[index]
+    trace.mark_used(chat.get("run_id"), index, action, text)
+
+
 def on_toggle_capture(on):
     """标题栏开关。启动时没找到微信就没有子进程，这会儿再找一次，找到了才真开得起来。"""
     global child
@@ -222,36 +314,40 @@ def on_toggle_capture(on):
     capture_on.set()
 
 
-def analyze_bg(msgs, title, revision, reply_to=None):
+def analyze_bg(msgs, title, revision, reply_to=None, trigger="对方来新消息"):
     """后台线程只跑网络调用，结果丢队列；UI 只在主线程的 tick 里动（Qt 不能跨线程碰）。
 
-    读设置整体挪进 try：在外面抛的话下面一条结果都不入队，busy 永远卡在 True。"""
+    读设置整体挪进 try：在外面抛的话下面一条结果都不入队，busy 永远卡在 True。
+    trigger 只进 AI 记录，说明这轮是谁点着的（新消息 / 用户换了回复对象）。"""
     try:
         # 起草和判断都可能是中转，那边地址只有一个（设置里共用），谁选中转就把它传给它
         provider, jev_provider = settings.draft_provider(), settings.jev_provider()
         relay_base = settings.relay_base_url()
-        results.put(("ok", analyze(msgs, settings.relationship(), context=settings.context(),
-                                   model=settings.draft_model() or None,
-                                   provider=provider,
-                                   base_url=(relay_base if "relay" in (provider, jev_provider)
-                                             else settings.draft_base_url()) or None,
-                                   reply_to=reply_to, scene=settings.scene_text(),
-                                   thinking=settings.thinking(),
-                                   thinking_style=settings.relay_thinking_style(),
-                                   judge_path=settings.relay_judge_path(),
-                                   jev_provider=jev_provider,
-                                   jev_model=settings.jev_model() or None),
-                     title, revision))
+        r = analyze(msgs, settings.relationship(), context=settings.context(),
+                    model=settings.draft_model() or None,
+                    provider=provider,
+                    base_url=(relay_base if "relay" in (provider, jev_provider)
+                              else settings.draft_base_url()) or None,
+                    reply_to=reply_to, scene=settings.scene_text(),
+                    thinking=settings.thinking(),
+                    thinking_style=settings.relay_thinking_style(),
+                    judge_path=settings.relay_judge_path(),
+                    jev_provider=jev_provider,
+                    jev_model=settings.jev_model() or None)
+        record_run(title, "reply", trigger, result=r)
+        results.put(("ok", r, title, revision))
     except Exception as e:
+        record_run(title, "reply", trigger, exc=e)  # 挂了的轮次也留痕，材料挂在 e.trace 上
         # 原文照发，别在这儿包一层套话：界面那条状态栏会截短显示，点「查看详情」看全文
         results.put(("err", str(e), title, revision))
 
 
-def opener_bg(msgs, title, revision, waited, reply_to=None):
+def opener_bg(msgs, title, revision, waited, reply_to=None, trigger="冷场到点"):
     """起草一批开场白。跟 analyze_bg 一个套路：网络调用在线程里，结果丢队列，UI 只在 tick 里动。
 
     只打起草那个口——开场白不问 Jev（七道题问的都是「对方最新那条什么意思」，这儿对方没说话），
-    所以只要起草那把 key，jev_* 那几项一概不传。waited 是「对方多少分钟没回」，界面拿它说人话。"""
+    所以只要起草那把 key，jev_* 那几项一概不传。waited 是「对方多少分钟没回」，界面拿它说人话；
+    trigger 只进 AI 记录（冷场到点 / 用户点了「换一批」）。"""
     try:
         provider, jev_provider = settings.draft_provider(), settings.jev_provider()
         relay_base = settings.relay_base_url()
@@ -263,10 +359,12 @@ def opener_bg(msgs, title, revision, waited, reply_to=None):
                            thinking=settings.thinking(),
                            thinking_style=settings.relay_thinking_style())
         r["waited"] = waited
+        record_run(title, "opener", trigger, result=r)
         # 队列形状跟 analyze_bg 一样（kind, 结果, 会话名, 版本号）——是不是开场白看 r["opener"]，
         # tick 照它交给界面，不用再多一个槽位
         results.put(("ok", r, title, revision))
     except Exception as e:
+        record_run(title, "opener", trigger, exc=e)
         # 原文照发，别在这儿包一层套话：界面那条状态栏会截短显示，点「查看详情」看全文
         results.put(("err", str(e), title, revision))
 
@@ -278,7 +376,8 @@ def check_update_bg():
         update_result.put(r)
 
 
-def start_analyze(title, msgs):
+def start_analyze(title, msgs, trigger="对方来新消息"):
+    """trigger 只进 AI 记录：这一轮是谁点着的（新消息 / 用户换了回复对象）。"""
     if not settings.has_jev_key():
         ov.set_status("请先在设置中配置模型", "warning")
         return
@@ -288,7 +387,8 @@ def start_analyze(title, msgs):
     state["busy"] = True
     ov.set_busy(True)
     reply_to = target_of(title) if settings.reply_target() else None  # 开关关着就是今天的行为
-    threading.Thread(target=analyze_bg, args=(msgs, title, chat_of(title)["rev"], reply_to),
+    threading.Thread(target=analyze_bg,
+                     args=(msgs, title, chat_of(title)["rev"], reply_to, trigger),
                      daemon=True).start()
 
 
@@ -318,7 +418,9 @@ def start_opener(title, manual=False):
     ov.set_busy(True, opener=True, waited=waited)
     ov.set_status("正在给你想一句开场白…", "busy")  # set_busy 里那句是给正常流程写的
     reply_to = target_of(title) if settings.reply_target() else None
-    threading.Thread(target=opener_bg, args=(msgs, title, chat["rev"], waited, reply_to),
+    threading.Thread(target=opener_bg,
+                     args=(msgs, title, chat["rev"], waited, reply_to,
+                           "用户换一批" if manual else "冷场到点"),
                      daemon=True).start()
 
 
@@ -360,7 +462,7 @@ def on_target_change(title, name):
         state["rerun"] = (title, msgs)
         ov.set_busy(True)
     else:
-        start_analyze(title, msgs)
+        start_analyze(title, msgs, "用户换了回复对象")
 
 
 def drain():
@@ -517,7 +619,9 @@ def tick():
                 ov.set_busy(False)
                 continue
             if kind == "ok":
-                chat_of(title)["result"] = r  # 先存着；正看着这个会话才立刻贴上去
+                chat = chat_of(title)
+                chat["result"] = r  # 先存着；正看着这个会话才立刻贴上去
+                chat["run_id"] = r.get("run_id")  # 「填入」时回填到 AI 记录里的就是这一轮
                 if title == ov.current_chat():
                     ov.show(r)
                 else:
@@ -564,9 +668,10 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     ov = Overlay(on_fill=fill_reply, on_toggle_capture=on_toggle_capture,
                  on_target_change=on_target_change, on_toggle_debug=set_debug,
                  on_voice_convert=convert_voice, on_opener_again=opener_again,
-                 on_settings_saved=on_settings_saved,
+                 on_settings_saved=on_settings_saved, on_open_history=open_history,
+                 on_use=mark_used,
                  result_of=lambda t: chats.get(t, {}).get("result"))
-    child = dbg = None
+    child = dbg = hist = None
     try:
         state["hwnd"] = find_wechat_hwnd()
     except RuntimeError:

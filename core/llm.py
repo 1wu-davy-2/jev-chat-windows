@@ -24,28 +24,41 @@ def _turns(user_turns: list[str], assistant: str = "assistant") -> list[dict]:
             for i, text in enumerate(user_turns)]
 
 
+def _usage(out: dict | None, input_tokens, output_tokens) -> None:
+    """把这一轮用了多少 token 填进调用方给的 dict（键跟 jev_client 那边一个口径）。
+    三种协议的 usage 字段名各不相同、还可能整个缺（中转不回），取不到就当没有，不报错。"""
+    if out is None:
+        return
+    for name, value in (("input_tokens", input_tokens), ("output_tokens", output_tokens)):
+        if isinstance(value, int):
+            out[name] = value
+
+
 def chat(protocol: str, base_url: str | None, api_key: str, model: str, system: str,
          user_turns: list[str], *, temperature: float = 1.0, max_tokens: int = 400,
          thinking: bool = False, extra_body: dict | None = None,
-         headers: dict | None = None, timeout: float = 30) -> str:
+         headers: dict | None = None, timeout: float = 30,
+         usage_out: dict | None = None) -> str:
     """发一轮对话，返回模型输出的纯文本。
 
     user_turns: 用户/助手交替的文本，奇数条，首尾都是用户说的（追问补齐候选就是 3 条）。
     thinking: 思考模式。OpenAI 协议没有统一字段，各家自己的开关由调用方经 extra_body 带进来；
               anthropic / gemini 是协议自带的参数，这里直接处理。
+    usage_out: 非空就把这轮用了多少 token 填进去（键是 input_tokens / output_tokens）。
+              只有「AI 记录」要它，正常调用不传。
     """
     if protocol == "anthropic":
         return _anthropic(base_url, api_key, model, system, user_turns,
-                          temperature, max_tokens, thinking, timeout)
+                          temperature, max_tokens, thinking, timeout, usage_out)
     if protocol == "gemini":
         return _gemini(base_url, api_key, model, system, user_turns,
-                       temperature, max_tokens, thinking, timeout)
+                       temperature, max_tokens, thinking, timeout, usage_out)
     return _openai(base_url, api_key, model, system, user_turns,
-                   temperature, max_tokens, extra_body, headers, timeout)
+                   temperature, max_tokens, extra_body, headers, timeout, usage_out)
 
 
 def _openai(base_url, api_key, model, system, user_turns, temperature, max_tokens,
-            extra_body, headers, timeout) -> str:
+            extra_body, headers, timeout, usage_out=None) -> str:
     import openai
 
     try:
@@ -60,11 +73,13 @@ def _openai(base_url, api_key, model, system, user_turns, temperature, max_token
             **({"extra_body": extra_body} if extra_body else {}))
     except Exception as exc:
         _fail(exc, "起草")
+    use = getattr(resp, "usage", None)
+    _usage(usage_out, getattr(use, "prompt_tokens", None), getattr(use, "completion_tokens", None))
     return resp.choices[0].message.content or ""
 
 
 def _anthropic(base_url, api_key, model, system, user_turns, temperature, max_tokens,
-               thinking, timeout) -> str:
+               thinking, timeout, usage_out=None) -> str:
     import anthropic
 
     extra = {}
@@ -80,6 +95,8 @@ def _anthropic(base_url, api_key, model, system, user_turns, temperature, max_to
                                          temperature=temperature, **extra)
     except Exception as exc:
         _fail(exc, "起草")
+    use = getattr(message, "usage", None)
+    _usage(usage_out, getattr(use, "input_tokens", None), getattr(use, "output_tokens", None))
     # 开了思考的话前面还有 thinking 块，只取文本块
     return "".join(b.text for b in message.content if getattr(b, "type", "") == "text")
 
@@ -96,7 +113,7 @@ def _gemini_client(base_url, api_key, timeout):
 
 
 def _gemini(base_url, api_key, model, system, user_turns, temperature, max_tokens,
-            thinking, timeout) -> str:
+            thinking, timeout, usage_out=None) -> str:
     try:
         client, types = _gemini_client(base_url, api_key, timeout)
         config = types.GenerateContentConfig(
@@ -108,6 +125,9 @@ def _gemini(base_url, api_key, model, system, user_turns, temperature, max_token
         resp = client.models.generate_content(model=model, contents=contents, config=config)
     except Exception as exc:
         _fail(exc, "起草")
+    meta = getattr(resp, "usage_metadata", None)
+    _usage(usage_out, getattr(meta, "prompt_token_count", None),
+           getattr(meta, "candidates_token_count", None))
     return resp.text or ""
 
 

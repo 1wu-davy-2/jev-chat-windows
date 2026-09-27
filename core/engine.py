@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import time
+
 try:
     from .draft import draft_candidates, draft_openers
     from .jev_client import JevError, ask
@@ -42,18 +44,30 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     thinking: 起草时是否开思考模式，只影响起草，默认关。
     model / jev_model = None 用该来源的默认模型。
 
-    返回 {candidates, best_index, best_reply, scores, answers, usage, reply_to}。
+    返回 {candidates, best_index, best_reply, scores, answers, usage, reply_to, trace}。
     scores 是每条候选的胜出概率（0~1），取自 best_reply.probabilities，取不到记 0.0。
     只有对方最新说话时才有意义调它——是不是该触发由调用方判断（看 latest_from）。
 
     三段式（issue #4）：先让 Jev 答 7 道判断题，把判断当小抄喂给起草，最后 Jev 只排序。
     判断那次挂了就退回老路：盲起草 + 判断和排序一次问完，行为跟以前一样。usage 是两次之和。
+
+    trace 是这一轮的原始材料（两段提示原文、模型原始返回、扔掉的候选、judge 的 state、耗时、
+    token），给「AI 记录」落库用。起草就挂掉时它挂在 JevError 的 `.trace` 上一起抛出去——
+    失败的那轮恰恰最该留痕。
     """
     state = build_state(messages, relationship, keep=context, reply_to=reply_to)
     usage: dict = {}
     answers: dict = {}
     judged = False
     trouble = ""  # 判断/排序为什么没跑成。带给界面显示，别让调用方只看到「生成失败」
+    # 一路往里填，哪个环节挂了都有东西可查
+    trace: dict = {"messages": list(messages), "relationship": relationship, "context_n": context,
+                   "scene": scene, "reply_to": reply_to, "judge_state": state,
+                   "judge_provider": jev_provider, "judge_model": jev_model or "",
+                   "judge_path": judge_path, "draft_provider": provider,
+                   "draft_base_url": base_url or ""}
+    started = time.monotonic()
+    step = time.monotonic()
     try:
         first = ask(state, dict(JUDGE_QUESTIONS), timeout=timeout,
                     provider=jev_provider, model=jev_model,
@@ -61,21 +75,40 @@ def analyze(messages: list, relationship: str, model: str | None = None,
         answers = first.get("answers") or {}
         _add_usage(usage, first.get("usage"))
         judged = True
+        trace["judge_answers"] = answers
+        trace["judge_reply"] = first
+        trace["judge_usage"] = first.get("usage") or {}
     except JevError as e:
         trouble = str(e)  # 退回盲起草 + 老的一次合问；错误不打日志（里面可能带请求内容）
+        trace["judge_error"] = trouble
+    trace["judge_ms"] = int((time.monotonic() - step) * 1000)
 
-    candidates = draft_candidates(messages, relationship, provider=provider, model=model,
-                                  base_url=base_url, timeout=timeout, keep=context,
-                                  reply_to=reply_to, scene=scene,
-                                  thinking=thinking, thinking_style=thinking_style,
-                                  guidance=guidance_text(answers) if judged else None)
+    draft_info: dict = {}
+    try:
+        candidates = draft_candidates(messages, relationship, provider=provider, model=model,
+                                      base_url=base_url, timeout=timeout, keep=context,
+                                      reply_to=reply_to, scene=scene,
+                                      thinking=thinking, thinking_style=thinking_style,
+                                      guidance=guidance_text(answers) if judged else None,
+                                      info=draft_info)
+    except JevError as e:
+        # 起草就挂了：这轮照样要留痕（失败的那轮最该查），把材料挂在异常上带走
+        trace["draft"] = draft_info
+        trace["ms"] = int((time.monotonic() - started) * 1000)
+        e.trace = trace
+        raise
+    trace["draft"] = draft_info
     if not candidates:  # 注入过滤可以把起草结果全扔掉；接着取 [0] 会 IndexError
-        raise JevError("起草结果没有可用候选回复")
+        trace["ms"] = int((time.monotonic() - started) * 1000)
+        e = JevError("起草结果没有可用候选回复")
+        e.trace = trace
+        raise e
 
     questions = {} if judged else dict(JUDGE_QUESTIONS)
     if len(candidates) >= 2:  # 起草只给了 1 条就没什么可排的，判断题照问
         questions.update(build_rank_question(candidates))
     if questions:
+        step = time.monotonic()
         try:
             second = ask(state, questions, timeout=timeout,
                          provider=jev_provider, model=jev_model,
@@ -86,8 +119,15 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             # 只把原因记下来，带回去让界面说清楚这次为什么没排序。
             second = {}
             trouble = trouble or str(e)
+            trace["rank_error"] = str(e)
         answers = {**answers, **(second.get("answers") or {})}
         _add_usage(usage, second.get("usage"))
+        trace["rank_ms"] = int((time.monotonic() - step) * 1000)
+        trace["rank_questions"] = questions  # 排的是哪几条候选，复盘时要看
+        trace["rank_answers"] = second.get("answers") or {}
+        trace["rank_reply"] = second
+        trace["rank_usage"] = second.get("usage") or {}
+    trace["ms"] = int((time.monotonic() - started) * 1000)
 
     best_key = (answers.get("best_reply") or {}).get("choice")
     best_index = _REPLY_IDX.get(best_key, 0)  # 解析不出就退第一条
@@ -115,6 +155,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
         "judged": judged,
         "ranked": bool(answers.get("best_reply")),
         "trouble": trouble,
+        "trace": trace,
     }
 
 
@@ -130,13 +171,26 @@ def analyze_opener(messages: list, relationship: str, model: str | None = None,
 
     返回值形状跟 analyze() 一样，多一个 opener=True 让界面换一套说法（「对方刚说」→「对方还没回」，
     洞察卡不摆意图和紧张度）。参数含义同 analyze()，只是没有 jev_* 那几项——用不上。
+    trace 里也只有起草那半边（没有判断和排序），见 analyze()。
     """
-    candidates = draft_openers(messages, relationship, provider=provider, model=model,
-                               base_url=base_url, timeout=timeout, keep=context,
-                               reply_to=reply_to, scene=scene, thinking=thinking,
-                               thinking_style=thinking_style)
-    if not candidates:  # 注入过滤可以把起草结果全扔掉；接着取 [0] 会 IndexError
-        raise JevError("起草结果没有可用候选")
+    trace: dict = {"messages": list(messages), "relationship": relationship, "context_n": context,
+                   "scene": scene, "reply_to": reply_to, "draft_provider": provider,
+                   "draft_base_url": base_url or ""}
+    started = time.monotonic()
+    try:
+        draft_info: dict = {}
+        candidates = draft_openers(messages, relationship, provider=provider, model=model,
+                                   base_url=base_url, timeout=timeout, keep=context,
+                                   reply_to=reply_to, scene=scene, thinking=thinking,
+                                   thinking_style=thinking_style, info=draft_info)
+        trace["draft"] = draft_info
+        if not candidates:  # 注入过滤可以把起草结果全扔掉；接着取 [0] 会 IndexError
+            raise JevError("起草结果没有可用候选")
+    except JevError as e:
+        trace["ms"] = int((time.monotonic() - started) * 1000)
+        e.trace = trace  # 起草挂了也要留痕，由调用方落库
+        raise
+    trace["ms"] = int((time.monotonic() - started) * 1000)
     return {
         "candidates": candidates,
         "best_index": 0,
@@ -149,6 +203,7 @@ def analyze_opener(messages: list, relationship: str, model: str | None = None,
         "ranked": False,
         "trouble": "",
         "opener": True,
+        "trace": trace,
     }
 
 
@@ -208,4 +263,36 @@ if __name__ == "__main__":
             raise SystemExit("应当抛错")
         except JevError as e:
             assert "没有可用候选" in str(e)
+
+    # trace：这一轮的原始材料（「AI 记录」存的就是它）。判断挂了也留着，谁挂了一目了然
+    with patch("__main__.ask", side_effect=JevError("Jev HTTP 401")), \
+         patch("__main__.draft_candidates", return_value=["甲", "乙", "丙"]):
+        r = analyze([("her", "hello")], "friends")
+    tr = r["trace"]
+    assert tr["messages"] == [("her", "hello")] and tr["relationship"] == "friends"
+    assert tr["judge_state"]["chat"]["messages"][0]["text"] == "hello", "judge 收到的 state 要留着"
+    assert tr["judge_error"] == "Jev HTTP 401" and "judge_answers" not in tr
+    assert tr["judge_ms"] >= 0 and tr["ms"] >= 0 and "draft" in tr
+    assert tr["draft_provider"] == "deepseek" and tr["context_n"] == 10
+
+    # 起草就挂了：材料得挂在异常上一起抛出去，调用方照样能落库（失败的那轮最该查）
+    with patch("__main__.ask", return_value={"answers": {}, "usage": {}}), \
+         patch("__main__.draft_candidates", side_effect=JevError("起草结果解析不出候选")):
+        try:
+            analyze([("her", "hello")], "friends")
+            raise SystemExit("应当抛错")
+        except JevError as e:
+            assert e.trace["relationship"] == "friends" and "judge_ms" in e.trace
+    with patch("__main__.ask", return_value={"answers": {}, "usage": {}}), \
+         patch("__main__.draft_candidates", return_value=[]):
+        try:
+            analyze([("her", "hello")], "friends")
+            raise SystemExit("应当抛错")
+        except JevError as e:
+            assert "draft" in e.trace, "候选被过滤光也要带材料"
+
+    # 开场白那轮没有判断和排序，trace 里也就只有起草那半边
+    with patch("__main__.draft_openers", return_value=["在忙吗", "睡了吗"]):
+        op = analyze_opener([("me", "刚忙完")], "friends")
+    assert "draft_provider" in op["trace"] and "judge_ms" not in op["trace"]
     print("engine ok")

@@ -28,11 +28,15 @@ Windows 上挂在微信（4.x，`Weixin.exe`）旁边的回复助手：截自己
 5. 不碰钱：转账/红包/收款相关的界面元素一律不碰，起草的 system prompt 里也禁了这几个话题。
 6. **API key 只进环境变量**（`OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `RELAY_API_KEY`，落
    `HKCU\Environment`），任何文件里不出现 key，也绝不进日志——报错文本一律过
-   `core/jev_client.py:redact_secrets()`（加新 key 记得把它加进那个元组）。
+   `core/jev_client.py:redact_secrets()`（加新 key 记得把它加进那个元组）。这条也管落盘：
+   `core/trace.py` 写库前把**每个字符串**都过一遍 `redact_secrets()`。
 7. 静默期零调用：只有对方来了新消息（或群里换了回复对象）才调模型；而且消息来了还要先过
    静默窗口（见下），连着发的几条攒成一次问。**唯一的例外是默认关着的「冷场开场白」**
    （`opener`）：开着才多一个触发点——最后一句是自己说的、对方一直没回，等够 `opener_minutes()`
    起草一次开场白。关着的时候这条一字不变，别把它当成默认行为。
+8. **AI 记录（`history.db`）是全项目唯一把聊天原文写进磁盘的地方**，默认开、可以关
+   （`history`）、可以在记录窗里清空。加任何新的写盘口子之前先想清楚这条边界——
+   截图仍然一律不落盘（见 3），记录库记的是文字，且只在本机。
 
 ## 常用命令
 
@@ -40,9 +44,11 @@ Windows 上挂在微信（4.x，`Weixin.exe`）旁边的回复助手：截自己
 # 源码运行（首次会弹设置页填 key）
 python main.py
 
-# 内置自测（就这五处，跑完打印 ok）
-python core/draft.py        # 候选解析器 + 防注入过滤的断言
+# 内置自测（就这几处，跑完打印 ok）
+python core/draft.py        # 候选解析器 + 防注入过滤的断言 + 开场白那根管道
+python core/engine.py       # 判断挂了不丢候选、开场白不过 Jev、trace 留痕
 python core/styles.py       # 场景模板：每段 ≤200 字、键/名字不重、拼接顺序
+python core/trace.py        # AI 记录库：写读回填清空、类型转换、脱敏、没配库时不建文件
 python -m app.update        # 版本号比较，monkeypatch urlopen，不联网
 python app/ocr.py           # 语音消息过滤正则（纯正则，不加载 OCR 引擎）
 python app/capture.py       # 消息区定位：输入框顶那根细横线（合成帧，不截图）
@@ -53,6 +59,10 @@ set PYTHONPATH=. && python tools/demo.py
 # 界面预览：合成数据，不采集、不联网、不碰微信；可出 README 那几张截图
 python tools/preview_ui.py --state ready
 python tools/preview_ui.py --state ready --screenshot docs/ui_home.png
+# 可用的 --state：ready / waiting / loading / error / degraded / setup / settings / paused /
+#   debug / ime / ime-thinking / pet / pet-menu / bar / voice / log /
+#   opener / opener-bar / opener-loading / history
+# （history 会往临时目录写一个演示库，不碰本机那份 history.db）
 
 # 打包（onedir，产物 dist\jev-chat\ 整个文件夹才是成品）
 build.bat
@@ -132,6 +142,30 @@ main.py（父进程，只管界面和网络）
 多一个「换一批」（`opener_again()` → `start_opener(title, manual=True)`，人在看别的会话时不给换）。
 哪些会话现在摆的是开场白记在 `Overlay._opener`（会话名 → 等了多久），`invalidate_replies()` 里
 要一起清掉，否则新消息来了那个「换一批」还赖着不走。
+
+**AI 记录**（`core/trace.py` + `app/historywin.py`）：每一轮 AI 调用落一行，给流程审计用。
+库是 stdlib `sqlite3` 的**一张宽表** `runs`——不拆表不关联，审计要的是「一眼看完这一轮」，
+join 出来的碎片反而难读；加字段就往 `_COLUMNS` 里加一条，**老库不用管**——`configure()` 里的
+`_migrate()` 会对着 `PRAGMA table_info` 把缺的列 `ALTER TABLE ADD` 上（`ms` 就这么漏过一次：
+`record_run` 记了它、表里却没这列，insert 报 no such column 又被吞掉，界面上一条记录都没有）。
+命名参考 cc-switch（`~/.cc-switch/cc-switch.db` 的
+`proxy_request_logs`），但它只记模型/token/成本那些元数据，这边连提示原文一起记。
+
+原料从哪儿来：`engine.analyze()` 一路往 `trace` 这个 dict 里填（发给 Jev 的 state、七道题答案、
+两次调用的耗时和 usage），起草那半边由 `draft._draft(info=...)` 回填（system / user 提示原文、
+模型原始返回、出口过滤扔了哪几条、追问补齐那次、token）。**这些字符串只有 `info` 这一个出口**，
+正常调用不传就什么都不留。结果里带 `trace` 键；**起草就挂掉时它挂在 `JevError.trace` 上**
+一起抛出去——失败的那轮恰恰最该查，`main.record_run()` 两种都收。
+
+落库在 `main.record_run()`（从 `analyze_bg` / `opener_bg` 里调），写完把 id 塞回
+`result["run_id"]`，tick 存进 `chats[title]["run_id"]`；用户点「填入」「复制」时 `mark_used()`
+拿它回填「用了哪条」。三条边界：① 记录是旁路，`trace` 里每个函数都吞异常、返回 None 或空，
+**绝不能影响生成**；② 写库前每个字符串都过 `redact_secrets()`，key 绝不入库；③ 库**按需初始化**
+（`configure()` 同一个路径重复调直接返回），设置里关着、也没开过记录窗的话，硬盘上连库文件都不建。
+
+窗口是独立小窗（跟 debugwin 一个路子）：左边一轮一行、右边铺开那一轮的全程。刷新靠比较
+`latest_id()`——只在新记录出现时重建列表，重建时**停在原来那一轮**上（每 3 秒一次重画，
+别把正在看的那条顶掉）。加字段时 `app/historywin.py` 的 `_lines()` 记得一起改，不然记了看不见。
 
 **转文字出来的字不是「新消息」**（`drain()` 里那个 `said`），它只是把屏幕上那条语音气泡的内容
 补进记录（界面按时长并回「🔊 语音消息 N"」）。分两种：**对方那条**语音转出来的算他「说了句话」，
@@ -263,8 +297,10 @@ scrollbar 的 `maximum()` 还是旧值，跟底得 `QTimer.singleShot(0, ...)`�
   按 `(x0, _, _, y1)` 算输入框位置（底线下方 40px、左边界右侧 60px，微信改布局就得跟着调）。
 - **文案与编码**：Python 读写文件一律 `encoding='utf-8'`；`requirements.txt` 必须纯 ASCII
   （中文 Windows 上 pip 按 GBK 读会炸）；`build.bat` 同理。
-- UI 里显示的判断题选项中文在 `app/overlay.py` 的 `_CHOICES`，题目本身在 `core/questions.py`——
-  加一个 choice 要两处都加，不然界面显示「暂未判断」。
+- 判断题的中文文案都在 `core/questions.py`：选项名 `CHOICE_LABELS`（面板、候选条、起草小抄、
+  AI 记录窗共用这一份，别在界面里再抄一遍），题目名 `QUESTION_LABELS`（只有 AI 记录窗逐题列答案
+  时才用）。**加一个 choice 只要动 `CHOICE_LABELS`**，加一道题则 `JUDGE_QUESTIONS` 和
+  `QUESTION_LABELS` 两处都要加；漏了的话界面显示「暂未判断」。
 
 ## 技术坑（都踩过，别重踩）
 

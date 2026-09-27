@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 try:  # 当模块导入 / 当脚本直接跑 都能用
     from . import relay
@@ -230,8 +231,13 @@ def _draft(messages: list, relationship: str, system: str, opener: bool = False,
            provider: str = "deepseek", model: str | None = None,
            base_url: str | None = None, timeout: float = 30, keep: int = 10,
            reply_to: str | None = None, scene: str = "", thinking: bool = False,
-           guidance: str | None = None, thinking_style: str = "") -> list[str]:
-    """回复和开场白共用的那根管道：拼提示 → 调一次模型 → 解析 → 出口过滤 → 不够 3 条追问一次。"""
+           guidance: str | None = None, thinking_style: str = "",
+           info: dict | None = None) -> list[str]:
+    """回复和开场白共用的那根管道：拼提示 → 调一次模型 → 解析 → 出口过滤 → 不够 3 条追问一次。
+
+    info 非空就把这一轮的原始材料填进去（发给模型的两段提示、模型原文、解析出的候选、
+    被出口过滤扔掉的、耗时、token），给「AI 记录」存档用。这些字符串**只有 info 这一个出口**，
+    正常调用不传就什么都不留。追问补齐那次单独放 retry_*，别跟第一次的混在一起。"""
     spec = DRAFT_PROVIDERS[provider]
     user, suspects = _prompt(messages, relationship, keep, reply_to, scene, guidance, opener)
     key = _api_key(LLM_ENV)  # 起草只有这一把 key，换来源不用重填
@@ -240,30 +246,49 @@ def _draft(messages: list, relationship: str, system: str, opener: bool = False,
         extra_body = relay.thinking_extra(thinking_style, thinking)
     else:
         base, extra_body = base_url or spec.base, spec.extra(thinking)
+    usage: dict = {}
     # 1.2：DeepSeek 自己推荐的闲聊档位，0.8 出来的话太板正
     # max_tokens：三句话本来 400 够，但思考过程也算进 max_tokens，开了思考模式 400 会把答案截断
     call = lambda turns: chat(  # noqa: E731 —— 三个参数会变，其余每次都一样
         spec.protocol, base, key, model or spec.default, system, turns,
         temperature=1.2, max_tokens=4000 if thinking else 400, thinking=thinking,
-        extra_body=extra_body, headers=spec.headers, timeout=timeout)
+        extra_body=extra_body, headers=spec.headers, timeout=timeout, usage_out=usage)
 
+    started = time.monotonic()
     content = call([user])
     # 「跟对方最近几句一模一样就丢」是防鹦鹉学舌的（对方发「回我三遍」那种），只管回复：
     # 开场白是 me 主动开口，撞上对方以前说过的一句是巧合——她自己问过「睡了吗」，我隔天
     # 也这么起个头，本来就自然。所以 opener 传空，只留注入那一道。
     echo = () if opener else _her_recent(messages)
-    cands = _sanitize(_parse_candidates(content), suspects, echo)
+    parsed = _parse_candidates(content)
+    cands = _sanitize(parsed, suspects, echo)
+    dropped = [c for c in parsed if c not in cands]  # 出口过滤扔了哪几条，审计要看得见
+    retry_turns: list[str] = []
+    retry_content = ""
     if len(cands) < 3:
         # 模型偶尔只给 1~2 条（V4.1 Flash 实测会把三条揉成一条）。带着它的回答追问一次，要补齐的那几条。
         need = 3 - len(cands)
+        retry_turns = [
+            user, content,
+            f"只给了 {len(cands)} 条能用的。再给 {need} 条跟上面不一样、也别照抄对方原话的候选，"
+            f"只输出这 {need} 条的 JSON 数组。"]
         try:
-            extra = _parse_candidates(call([
-                user, content,
-                f"只给了 {len(cands)} 条能用的。再给 {need} 条跟上面不一样、也别照抄对方原话的候选，"
-                f"只输出这 {need} 条的 JSON 数组。"]))
+            retry_content = call(retry_turns)
+            extra = _parse_candidates(retry_content)
         except JevError:
             extra = []
         cands = _sanitize(cands + extra, suspects, echo)
+        dropped += [c for c in extra if c not in cands]
+    if info is not None:
+        info.update({
+            "system": system, "prompt": user, "reply": content,
+            "candidates": list(cands), "dropped": dropped,
+            "retry_prompt": "\n\n".join(retry_turns[1:]) if retry_turns else "",
+            "retry_reply": retry_content,
+            "ms": int((time.monotonic() - started) * 1000),
+            "usage": usage, "provider": provider, "model": model or spec.default,
+            "base_url": base, "thinking": thinking,
+        })
     return cands[:3]  # 可能仍不足 3 条，下游按实际条数处理
 
 
@@ -271,7 +296,8 @@ def draft_candidates(messages: list, relationship: str, provider: str = "deepsee
                      model: str | None = None, base_url: str | None = None,
                      timeout: float = 30, keep: int = 10,
                      reply_to: str | None = None, scene: str = "", thinking: bool = False,
-                     guidance: str | None = None, thinking_style: str = "") -> list[str]:
+                     guidance: str | None = None, thinking_style: str = "",
+                     info: dict | None = None) -> list[str]:
     """messages: [(from, text)] 或 [(from, text, name)]，from ∈ {her, me}，name = 群里的发言人；
     只看最近 keep 条。返回最多 3 条中文候选（过滤后可能是 0 条，调用方要处理）。
 
@@ -283,18 +309,20 @@ def draft_candidates(messages: list, relationship: str, provider: str = "deepsee
     thinking_style: 只对第三方中转有意义——思考开关带哪个字段各家中转不一样，
     见 core/relay.py 的 THINKING_STYLES（传错派系不报错、只被无视）。
     provider ∈ DRAFT_PROVIDERS；model=None 用该来源的默认模型；
-    base_url 自定义来源和中转要传（中转那份会先归一到 API 根）。"""
+    base_url 自定义来源和中转要传（中转那份会先归一到 API 根）。
+    info: 非空就把这一轮的原始材料（两段提示、模型原文、扔掉过哪几条、耗时、token）填进去，
+    给「AI 记录」存档，见 _draft。"""
     return _draft(messages, relationship, SYSTEM, provider=provider, model=model,
                   base_url=base_url, timeout=timeout, keep=keep, reply_to=reply_to,
                   scene=scene, thinking=thinking, guidance=guidance,
-                  thinking_style=thinking_style)
+                  thinking_style=thinking_style, info=info)
 
 
 def draft_openers(messages: list, relationship: str, provider: str = "deepseek",
                   model: str | None = None, base_url: str | None = None,
                   timeout: float = 30, keep: int = 10, reply_to: str | None = None,
                   scene: str = "", thinking: bool = False,
-                  thinking_style: str = "") -> list[str]:
+                  thinking_style: str = "", info: dict | None = None) -> list[str]:
     """冷场时的一批开场白：最后一句是 me 说的、对方一直没回，起草 3 条「主动再开一次口」的消息。
 
     跟 draft_candidates 同一根管道（同一个模型、同一份口吻样本和场景模板），三处不同：
@@ -304,7 +332,7 @@ def draft_openers(messages: list, relationship: str, provider: str = "deepseek",
     return _draft(messages, relationship, OPENER_SYSTEM, opener=True, provider=provider,
                   model=model, base_url=base_url, timeout=timeout, keep=keep,
                   reply_to=reply_to, scene=scene, thinking=thinking,
-                  thinking_style=thinking_style)
+                  thinking_style=thinking_style, info=info)
 
 
 if __name__ == "__main__":
@@ -360,4 +388,22 @@ if __name__ == "__main__":
     with patch("__main__.chat", fake), patch("__main__._api_key", lambda env: "k"):
         assert draft_openers(msgs, "friends") == ["在忙吗", "上次说的那家店还去吗", "睡了吗"]
         assert "在忙吗" not in draft_candidates(msgs, "friends")  # 回复那条管道照旧拦鹦鹉学舌
+        # info：这一轮的原始材料要能整份带出来（「AI 记录」存的就是它）；不传就什么都不留
+        got: dict = {}
+        draft_openers(msgs, "friends", info=got)
+        assert set(got) >= {"system", "prompt", "reply", "candidates", "dropped", "retry_reply",
+                            "ms", "usage", "model", "base_url", "thinking"}, sorted(got)
+        assert got["system"] == OPENER_SYSTEM and got["prompt"].startswith("relationship: friends")
+        assert got["model"] == "deepseek-flash" and isinstance(got["ms"], int)
+        assert json.loads(got["reply"]) == ["在忙吗", "上次说的那家店还去吗", "睡了吗"]
+        assert got["dropped"] == [] and got["retry_reply"] == ""  # 三条齐了，没走追问补齐
+
+    # 只有 1 条时追问补齐：补齐那次的提示和返回单独记，别跟第一次的混在一起
+    replies = ['["甲"]', '["乙","丙"]']
+    with patch("__main__.chat", lambda *a, **k: replies.pop(0)), \
+         patch("__main__._api_key", lambda env: "k"):
+        info: dict = {}
+        assert draft_candidates(msgs, "friends", info=info) == ["甲", "乙", "丙"]
+    assert info["reply"] == '["甲"]' and info["retry_reply"] == '["乙","丙"]'
+    assert "只给了 1 条能用的" in info["retry_prompt"]
     print("draft._parse_three ok")

@@ -204,6 +204,15 @@ JUDGE_QUESTIONS: dict = {
 }
 
 
+# 七道题在界面上的中文名。只有「AI 记录」窗要逐题列答案时才用得上（面板和候选条是
+# 把答案折成一句话显示的，用不着题目名）。键跟 JUDGE_QUESTIONS 对齐，加题记得加一条。
+QUESTION_LABELS: dict = {
+    "literal_question": "是否只是字面意思", "true_intent": "对方真实意图",
+    "danger_level": "紧张度", "should_reply_now": "该不该说实质内容",
+    "best_action": "建议动作", "she_needs": "对方需要", "tension_resolved": "紧张是否已化解",
+    "best_reply": "哪条候选最合适",
+}
+
 # choice 类答案的中文说法，界面和起草小抄共用这一份（app/overlay.py 从这里导）。
 CHOICE_LABELS: dict = {
     "true_intent": {
