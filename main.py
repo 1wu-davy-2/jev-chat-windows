@@ -61,7 +61,7 @@ def fill_reply(text):
 
 
 def convert_voice():
-    """用户点了候选条上的「转文字」：右键那条语音 → 点菜单里的「语音转文字」。
+    """用户点了候选条上的「转文字」：悬停那条语音 → 点微信冒出来的「转文字」按钮。
 
     转出来的文字会作为一条新气泡出现在聊天区，被采集链路照常读到、照常触发判断——
     所以这里点完就完事，不用自己再去 OCR 一遍。返回 "" 表示成功，否则是给用户看的原因。"""
@@ -71,11 +71,12 @@ def convert_voice():
         return "采集已暂停，先开启采集再转文字"
     if not state["voice"] or not state["voice"][1]:
         return "还没定位到那条语音，稍等一下再试"
-    # 坐标是相对那一帧的，只有微信现在开着的就是这条语音所在的会话，右键才落得准
+    # 坐标是相对那一帧的，只有微信现在开着的就是这条语音所在的会话，点下去才落得准
     title = state["voice"][0]
     if title != state["chat"] or title != ov.current_chat():
         return "微信现在开着的不是这条语音所在的会话，切回去再试"
-    return voice.convert(state["hwnd"], state["voice"][1][-1][:4])  # 取最近的那条（OCR 框自上而下排）
+    last = state["voice"][1][-1]  # 取最近的那条（气泡自上而下排）
+    return voice.convert(state["hwnd"], last[:4], last[5])
 
 
 def spawn_worker():
@@ -214,6 +215,9 @@ def drain():
             state["voice"] = (title, items)
             ov.set_voice(title, items)
             if len(items) > had:  # 多出来一条才提醒；拖动/滚动只是坐标变，不算新消息
+                # 聊天记录里也留一行，不然这条语音在界面上等于不存在（只有显示用，
+                # 不进喂模型的那份 history——「🔊 语音消息 3"」对模型是噪音）
+                ov.log_message("her", f"🔊 语音消息 {items[-1][4]}", chat=title)
                 state["notify_until"] = time.monotonic() + _NOTIFY_HOLD
             continue
         if kind == "paused":  # 子进程确认已暂停

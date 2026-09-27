@@ -93,9 +93,10 @@ def run(q, hwnd, enabled, debug_on):
                     new = reader.new_lines(lines)
                     if new:
                         q.put(("lines", title, new, rect))
-                    # 语音气泡：Reader 那边按坐标裁剪过，这里加回裁剪原点，父进程才好换算成屏幕坐标
-                    voice = tuple((x0 + a, y0 + b, x0 + c, y0 + d, t)
-                                  for a, b, c, d, t in reader.last_voice)
+                    # 语音气泡：Reader 那边按坐标裁剪过，这里加回裁剪原点，父进程才好换算成屏幕坐标。
+                    # 只发**还没转过文字**的（last_voice_open）——转过的就别再提示「转文字」了
+                    voice = tuple((x0 + a, y0 + b, x0 + c, y0 + d, t, k)
+                                  for a, b, c, d, t, k in reader.last_voice_open)
                     if voice != last_voice:
                         q.put(("voice", title, voice))
                         last_voice = voice
