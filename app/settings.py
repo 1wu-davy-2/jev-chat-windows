@@ -20,8 +20,9 @@ from core.relay import DEFAULT_JUDGE_PATH, DEFAULT_THINKING_STYLE, THINKING_STYL
 _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CONFIG = os.path.join(_ROOT, "config.json")
-_HISTORY_DB = os.path.join(_ROOT, "history.db")  # AI 调用记录，见 core/trace.py（已进 .gitignore）
-_CHATLOG_DB = os.path.join(_ROOT, "chatlog.db")  # 聊天记录，见 core/chatlog.py（已进 .gitignore）
+# 一个库文件、两张表：runs（AI 调用记录，core/trace.py）+ messages（聊天记录，core/chatlog.py）。
+# 合成一个文件只是「字节放哪儿」——两张表的开关、清空入口、默认值还是各管各的，别混。
+_DB = os.path.join(_ROOT, "jev.db")  # 已进 .gitignore
 _DEFAULT_CONTEXT = 10
 # 老配置里 relationship 存的是这几个英文（安卓原版传下来的），迁移时折回内置的键
 _LEGACY_RELATION_KEYS = {"romantic partners": "romance", "friends": "friend",
@@ -225,13 +226,13 @@ def opener() -> bool:
     return bool(_read("opener", False))
 
 def history() -> bool:
-    """记不记 AI 调用（每一轮发了什么提示、模型回了什么、最后用了哪条）。默认开，
-    存本机 history.db，只有「AI 记录」窗口读它。关掉就一次都不写。"""
-    return bool(_read("history", True))
+    """记不记 AI 调用（每一轮发了什么提示、模型回了什么、最后用了哪条）。存本机 jev.db 的
+    runs 表，只有「AI 记录」窗口读它。关掉就一次都不写。
 
-def history_db() -> str:
-    """记录库的路径：跟 config.json 并排。路径的算法只在这儿一处（core/trace 不认识 app）。"""
-    return _HISTORY_DB
+    **默认源码跑开着、打包版关着**（跟 chatlog 一个口径）：两个库现在装在同一个文件里，
+    只要有一个开着文件就会建出来，所以默认值必须一致——不然「打包版默认不在硬盘上留库文件」
+    这条就废了。判断依据是 `sys.frozen`（打包后为真），不用额外配置。"""
+    return bool(_read("history", not getattr(sys, "frozen", False)))
 
 def chatlog() -> bool:
     """聊天记录存不存本地（界面那串气泡 + 喂模型的上下文，见 core/chatlog.py）。
@@ -240,9 +241,10 @@ def chatlog() -> bool:
     要存自己去设置里开。判断依据是 `sys.frozen`（打包后为真），不用额外配置。"""
     return bool(_read("chatlog", not getattr(sys, "frozen", False)))
 
-def chatlog_db() -> str:
-    """聊天记录库的路径。跟 history.db 分开：两个开关、两个清空入口，各管各的。"""
-    return _CHATLOG_DB
+def db_path() -> str:
+    """库文件路径：跟 config.json 并排。路径的算法只在这儿一处（core/ 不认识 app）。
+    两张表共用它——core.trace 和 core.chatlog 各建各的表，谁开谁建。"""
+    return _DB
 
 def opener_minutes() -> int:
     """等多少分钟算冷场。1~720，缺失/脏数据一律退默认值。"""
@@ -575,13 +577,16 @@ if __name__ == "__main__":
     assert relation_of("李四") == "r1", "默认关系换了，没指定过的会话跟着换"
     assert relation_text("friend") == "我改的朋友"
 
-    # 聊天记录开关：源码跑默认开、打包版默认关；拨过之后按存的来
+    # 两个存储开关：都默认「源码跑开、打包版关」；拨过之后按存的来
     assert chatlog() is True, "自测是源码跑，默认该是开的"
+    assert history() is True, "同上，两个开关的默认值必须一致（见 history() 的说明）"
     save(10, chatlog_on=False)
     assert chatlog() is False and _load_all()["chatlog"] is False
     save(10, chatlog_on=True)
     assert chatlog() is True
-    assert chatlog_db().endswith("chatlog.db") and chatlog_db() != history_db(), "两个库别用同一个文件"
+    assert db_path().endswith("jev.db"), db_path()
+    # 两张表共用一个库文件；自测里 _ROOT 是仓库根，路径必须落在它下面
+    assert os.path.dirname(db_path()) == _ROOT, db_path()
 
     # 自动发送（「绝不自动发送」唯一的例外）：必须默认关，而且别的键写一遍不能把它带开
     assert auto_send() is False, "这个是调试开关，默认必须是关的"

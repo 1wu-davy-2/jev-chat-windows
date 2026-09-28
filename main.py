@@ -365,13 +365,14 @@ def on_debug_closed():
 def open_history():
     """标题栏的「AI 记录」：开过就复用同一个窗（列表、选中位置都还在），没有就现建。
 
-    库按需初始化：设置里关着、也从没开过记录窗的话，硬盘上连 history.db 都不建。"""
+    库按需初始化：设置里关着、也从没开过记录窗的话，连 runs 表都不建（库文件本身可能因为
+    聊天记录那个开关开着而在，那是另一张表的事，见 app/settings.db_path）。"""
     global hist
-    trace.configure(settings.history_db())
+    trace.configure(settings.db_path())
     if hist is None:
         from app.historywin import HistoryWindow
 
-        hist = HistoryWindow(db_path=settings.history_db())
+        hist = HistoryWindow(db_path=settings.db_path())
     hist.show()
     hist.raise_()
     hist.activateWindow()
@@ -387,7 +388,7 @@ def restore_log():
     **只回填内存、不写库**：库里本来就有，走 log_message 那条路会再插一遍，重启几次就翻几倍。"""
     if not settings.chatlog():
         return
-    chatlog.configure(settings.chatlog_db())
+    chatlog.configure(settings.db_path())
     for title, _n in chatlog.chats(_RESTORE_CHATS):
         rows = chatlog.recent(title, _RESTORE_LINES)
         if not rows:
@@ -486,7 +487,7 @@ def set_chatlog(on):
     关掉只是不再往库里写，**已经存下的一条都不动**——要删去设置页点「清空聊天记录」。
     两件事分开：拨一下开关就把人家攒的记录抹了，那才叫坑。"""
     if on:
-        chatlog.configure(settings.chatlog_db())
+        chatlog.configure(settings.db_path())
     else:
         chatlog.close()
     try:
@@ -512,8 +513,8 @@ def record_run(title, kind, trigger, result=None, exc=None):
 def _record_run(title, kind, trigger, result, exc):
     if not settings.history():
         return None
-    # 库按需初始化：设置里一直关着、也从没开过记录窗的话，硬盘上连 history.db 都不建
-    trace.configure(settings.history_db())
+    # 库按需初始化：设置里一直关着、也从没开过记录窗的话，连 runs 表都不建
+    trace.configure(settings.db_path())
     info = dict((getattr(exc, "trace", None) or {}) if exc is not None else result.get("trace") or {})
     draft = info.get("draft") or {}
     judge_usage = info.get("judge_usage") or {}

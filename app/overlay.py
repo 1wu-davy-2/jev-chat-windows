@@ -1243,7 +1243,7 @@ class Overlay:
         chatlog_row.addWidget(self.chatlogSwitch)
         box.addLayout(chatlog_row)
         box.addWidget(self._hint(
-            "界面上的聊天记录和 AI 看的上下文都存到本机的 chatlog.db 里，重启之后还在、模型还接得上"
+            "界面上的聊天记录和 AI 看的上下文都存到本机的 jev.db 里，重启之后还在、模型还接得上"
             "上次聊到哪儿。写库前统一脱敏（不存密钥），只留最近 90 天。关掉就不再写，"
             "已经存下的一条都不动——要删点下面那个按钮。"
         ))
@@ -1900,17 +1900,21 @@ class Overlay:
 
     def _sync_chatlog(self):
         """存储那一行的现状。关着的时候**不读库**（读一下 sqlite 就会把库文件建出来，
-        违背「关着就一个字都不往磁盘写」），只按文件大小说话。"""
+        违背「关着就一个字都不往磁盘写」），只按文件大小说话。
+
+        `size()` 报的是**整个库文件**——AI 记录和聊天记录两张表合用一个，所以关着的时候
+        不能说「硬盘上已经存了聊天记录」，只能说文件占多大（见 core/chatlog.py 头上那段）。"""
         size = chatlog.size()
         if not self.chatlogSwitch.isChecked():
             self.chatlogStats.setText(
-                f"已关闭；硬盘上已经存的不动（占着 {chatlog.human_size(size)}）。" if size
+                f"已关闭，不再写新的；已经存的不动（库文件占着 {chatlog.human_size(size)}）。" if size
                 else "已关闭，硬盘上还没存过东西。")
         else:
             self.chatlogStats.setText(
-                f"已存 {chatlog.count()} 条 · {chatlog.human_size(size)}。" if size
+                f"已存 {chatlog.count()} 条 · 库文件 {chatlog.human_size(size)}。" if size
                 else "还没存过东西；有消息就读进来。")
-        self.chatlogClear.setEnabled(self.chatlogSwitch.isChecked() and size > 0)
+        # 亮不亮看**这张表**有没有东西：库文件可能因为 AI 记录开着而在，那是另一张表
+        self.chatlogClear.setEnabled(self.chatlogSwitch.isChecked() and chatlog.count() > 0)
 
     def _chatlog_toggled(self, on):
         """聊天会话存储：拨一下立刻生效 + 落盘（跟调试视图、桌面宠物一个路子）。"""

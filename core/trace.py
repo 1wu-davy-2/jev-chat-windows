@@ -7,11 +7,15 @@
 出了问题能翻回「那一轮它到底看到了什么、回了什么」，所以除了元数据，system / user 提示原文、
 模型原始返回、被出口过滤扔掉的候选、Jev 的七道题答案也一并记。stdlib 自带 sqlite3，不加依赖。
 
-**存哪儿**：跟 config.json 并排（路径由调用方 `configure()` 传进来——core/ 不认识 app/，
-也不该认识）。没 configure 过就是空操作，tools/ 和自测里不会凭空建库。
+**存哪儿**：跟 config.json 并排的 `jev.db`，**跟聊天记录（`core/chatlog.py`）共用这一个文件**，
+只是各用各的表（`runs` / `messages`）。合成一个文件只是「字节放哪儿」——两张表的开关、清空入口、
+默认值还是各管各的。路径由调用方 `configure()` 传进来——core/ 不认识 app/，也不该认识。
+没 configure 过就是空操作，tools/ 和自测里不会凭空建库。
 
-**隐私**：库里是聊天原文的明文。设置里「记录 AI 调用」默认开，关掉就一次都不写；
-「AI 记录」窗口里能看、能清空。所有字符串进库前一律过 `redact_secrets()`，绝不落 key。
+**隐私**：库里是聊天原文的明文。设置里「记录 AI 调用」默认**源码跑开、打包版关**（跟 chatlog
+一个口径：既然共用一个文件，只要有一个开着文件就会建出来，默认值不一致的话「打包版默认不在
+硬盘上留库文件」这条就废了），关掉就一次都不写；「AI 记录」窗口里能看、能清空。
+所有字符串进库前一律过 `redact_secrets()`，绝不落 key。
 
 **一张宽表**：每条记录就是一轮，不拆表不关联——审计要的是「一眼看完这一轮」，
 join 出来的碎片反而难读。列名写死在 `_COLUMNS` 里，加字段就往那儿加一条。
@@ -73,7 +77,14 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS runs_time ON runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS runs_chat ON runs(chat, created_at DESC);
+-- 库自己的小账本（谁开谁建，chatlog 也要用）。现在只记「老库搬过来了没有」
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """ % ",\n    ".join(f"{c} {_col_type(c)}" for c in _COLUMNS)
+
+# 老版本那个库：合并之前 AI 记录单独一个文件。升级上来的用户手上还有它，
+# 首次开库把数据搬进 runs（见 _import_legacy），搬完老文件一个字节都不动，用户自己确认过再删
+_LEGACY_DB = "history.db"
+_IMPORT_TAG = "imported_history"
 
 
 def configure(path: str) -> None:
@@ -97,6 +108,49 @@ def configure(path: str) -> None:
             c.commit()
     except Exception:
         _DB = ""  # 建不出来就当没开，别每次写都再失败一遍
+        return
+    _import_legacy()
+
+
+def _import_legacy() -> int:
+    """把老版本那个 history.db 里的记录搬进 runs，只搬一次（搬完在 meta 里记一笔）。
+
+    **不能拿「runs 表空不空」当判据**：用户清空一次记录，下次启动又会把老数据搬回来。
+    老库可能比新库少几列（加字段就是往 _COLUMNS 里加一条，而它是上个版本建的），所以只搬
+    两边都有的列、缺的留空——直接 `insert into runs select * from old.runs` 列数对不上就整批丢。
+
+    整个过程一个事务，中途失败整体回滚、标记也不写，下次启动重来。老文件一个字节都不动
+    （改名/删除都是删数据，该由用户自己确认过再做），所以重试是安全的。"""
+    if not _DB or _imported():
+        return 0
+    old = os.path.join(os.path.dirname(_DB), _LEGACY_DB)
+    if os.path.abspath(old) == os.path.abspath(_DB) or not os.path.exists(old):
+        return 0
+    try:
+        with _LOCK, closing(_connect()) as c:
+            c.execute("attach database ? as old", (old,))
+            have = {r[1] for r in c.execute("pragma old.table_info(runs)")}
+            cols = [x for x in ("id",) + _COLUMNS if x in have]
+            if "id" not in cols:  # 没有 runs 表（或者根本不是我们的库）
+                raise sqlite3.OperationalError("老库里没有 runs 表")
+            names = ", ".join(cols)
+            c.execute(f"insert into runs ({names}) select {names} from old.runs")
+            n = int(c.execute("select changes()").fetchone()[0])
+            c.execute("insert or replace into meta (key, value) values (?, ?)",
+                      (_IMPORT_TAG, str(int(time.time()))))
+            c.commit()
+        return n
+    except Exception:
+        return 0
+
+
+def _imported() -> bool:
+    """这次搬迁做过了吗。读不出来一律当「做过了」——宁可漏搬一次，也别每次启动重搬一遍。"""
+    try:
+        with closing(_connect()) as c:
+            return c.execute("select 1 from meta where key=?", (_IMPORT_TAG,)).fetchone() is not None
+    except Exception:
+        return True
 
 
 def _migrate(c) -> None:
@@ -233,7 +287,7 @@ if __name__ == "__main__":
     assert record({"chat": "没配库"}) is None, "没 configure 就该是空操作"
     assert recent() == [] and count() == 0 and size() == 0 and latest_id() == 0
 
-    path = os.path.join(tempfile.mkdtemp(prefix="jev-trace-"), "history.db")
+    path = os.path.join(tempfile.mkdtemp(prefix="jev-trace-"), "jev.db")
     configure(path)
     rid = record({"chat": "白金搬砖小分队", "kind": "reply", "trigger": "对方来新消息",
                   "context_n": 10, "messages": [("her", "在吗"), ("me", "在")],
@@ -274,7 +328,7 @@ if __name__ == "__main__":
 
     # 老库补列：拿「上一个版本建的表」再配一次，缺的列要自动补上、写读照常。
     # 少了这一步，加了新列之后老库会一条都写不进去（insert 报 no such column，还被吞掉）
-    old = os.path.join(tempfile.mkdtemp(prefix="jev-old-"), "history.db")
+    old = os.path.join(tempfile.mkdtemp(prefix="jev-old-"), "jev.db")
     with sqlite3.connect(old) as c:
         c.execute("CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER,"
                   " chat TEXT, kind TEXT)")  # 只有最早那几列
@@ -288,6 +342,26 @@ if __name__ == "__main__":
     assert row["chat"] == "新记录" and row["ms"] == 123 and row["ranked"] == 1
     assert json.loads(row["draft_candidates"]) == ["甲"]
     assert recent()[1]["chat"] == "老记录" and recent()[1]["ms"] is None
+
+    # 老库导入：合并之前 AI 记录是单独一个 history.db，升级上来的用户手上还有它。
+    # 首次开库要把数据搬进 runs，而且**只搬一次**——判据不能是「runs 空不空」：
+    # 用户清空一次记录，下次启动又会把老数据搬回来。老文件一个字节都不许动。
+    legacy_dir = tempfile.mkdtemp(prefix="jev-trace-legacy-")
+    old_db = os.path.join(legacy_dir, "history.db")
+    with sqlite3.connect(old_db) as c:
+        c.execute("CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER,"
+                  " chat TEXT, kind TEXT)")  # 老库列少，只搬两边都有的那些
+        c.execute("INSERT INTO runs (created_at, chat, kind) VALUES (1, '老记录', 'reply')")
+    merged = os.path.join(legacy_dir, "jev.db")
+    configure("")  # 先关掉，逼下一次 configure 走完整流程（不然同路径直接返回了）
+    configure(merged)
+    assert count() == 1 and recent()[0]["chat"] == "老记录", "老库的数据要搬进来"
+    assert recent()[0]["kind"] == "reply", "两边都有的列要一起搬，缺的留空"
+    assert os.path.exists(old_db), "老文件不许动——删数据得用户自己确认过"
+    clear()
+    configure("")
+    configure(merged)
+    assert count() == 0, "清空之后重启，不能又把老数据搬回来一遍"
 
     # 库路径坏掉（目录不存在）不该抛：configure 之后 record 当没开
     configure(os.path.join(tempfile.gettempdir(), "没有这个目录-jev", "x.db"))
