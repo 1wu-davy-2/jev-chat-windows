@@ -267,6 +267,19 @@ def check_update() -> bool:
     """启动时要不要去 GitHub 查一次最新版本号：默认开，只出这一次网，设置里能关。"""
     return bool(_read("check_update", True))
 
+def shortcut_created() -> bool:
+    """桌面快捷方式**自动**建过了吗。建过一次就不再自动建——你在桌面把它删了，下次启动
+    也不会又冒出来（那最烦人）。设置页那个「创建桌面快捷方式」按钮不看这个键，随时能重建。"""
+    return bool(_read("shortcut", False))
+
+def save_shortcut_created() -> None:
+    """记一笔「自动建过了」。走 save() 的话会顺带把两把 key 重写进注册表、再广播一次
+    WM_SETTINGCHANGE，为这一个布尔不值当（跟 save_pet_pos 一个道理）。"""
+    data = _load_all()
+    data["shortcut"] = True
+    with open(_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
 def debug_view() -> bool:
     """调试视图：另开一个窗口实时画识别框。默认关，开了子进程才往队列里送帧。"""
     return bool(_read("debug_view", False))

@@ -69,6 +69,7 @@ python core/chatlog.py      # 聊天记录库：写读正序、并语音、90 �
 python -m app.update        # 版本号比较，monkeypatch urlopen，不联网
 python app/ocr.py           # 语音消息过滤正则 + 「重新识别」的对账 reconcile（都不加载 OCR 引擎）
 python app/capture.py       # 消息区定位：输入框顶那根细横线（合成帧，不截图）
+python app/shortcut.py      # 桌面快捷方式：在临时目录真写一个 .lnk 再读回来（不碰用户桌面）
 
 # 端到端冒烟：写死的一段对话跑完整链，需 key + 联网
 set PYTHONPATH=. && python tools/demo.py
@@ -331,6 +332,25 @@ join 出来的碎片反而难读；加字段就往 `_COLUMNS` 里加一条，**�
 菜单内容拆在 `_build_pet_menu()` 里而不是塞进 `contextMenuEvent`，是为了 `tools/preview_ui.py
 --state pet-menu` 能摆出来截图（`exec()` 是嵌套事件循环，截图回调进不去）。菜单每次右键现建，
 所以那两项的亮/灰和文字都是当下的状态。
+
+**桌面快捷方式**（`app/shortcut.py`，打包版第一次跑自动建一次）：`.lnk` 没有公开的简单 Win32 API，
+走的是 ctypes 手写的 COM（`IShellLinkW` + `IPersistFile`）。**别改成拉 PowerShell**——没签名的
+exe 去拉脚本是杀软和 EDR 的典型拦截形状，而且每次要等它冷启动。三条容易踩的：
+
+- **vtable 下标按各自接口从 0 数**。`IShellLinkW` 的 SetPath 是 20、SetWorkingDirectory 是 9；
+  `IPersistFile` 的 Save 是 **6**（IUnknown 三个 + IPersist::GetClassID + IsDirty + Load 之后），
+  **不是**接在 IShellLinkW 后面接着数。写错一个就是野指针。
+- **COM 是按线程算的**：A 线程初始化、B 线程调 `CoCreateInstance`，拿到的是「尚未调用
+  CoInitialize」（0x800401F0）；而这儿的失败一律只是返回一句原因，界面上看不见。所以
+  `_ensure_com()` 在每个入口自己保证，别指望调用方记得。Qt 建 QApplication 时已经在主线程
+  OleInitialize 过（也是 STA），所以自动那条放在 `ov` 建好之后调。
+- **桌面路径不能拼 `%USERPROFILE%\Desktop`**：Win10 起很多人被 OneDrive 重定向过，那个目录是空的，
+  得用 `SHGetKnownFolderPath`。
+
+自动建**只做一次**（`settings.shortcut_created()`，存 config.json 的 `shortcut` 键），而且
+**建失败不记这一笔**——下次启动再试，成功了才记，免得一次偶发失败就永远没图标。源码跑不建
+（`sys.executable` 是 python.exe），那一支**不记标记**：同一份 config.json 装了打包版照样该建。
+设置页那个「创建」按钮不看这个键，随时能重建（挪了文件夹、手滑删了都靠它）。
 
 `phase`（idle/scanning/notify/thinking/ready）是**派生**出来的，不是事件流水账：
 `main.py:phase_now()` 是纯函数，`refresh_phase()` 是唯一写者、唯一调用点是 `tick()` 的出口。

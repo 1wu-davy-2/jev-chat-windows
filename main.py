@@ -18,7 +18,7 @@ import time
 import traceback
 from collections import deque
 
-from app import settings, update, voice, worker
+from app import settings, shortcut, update, voice, worker
 from app.capture import find_wechat_hwnd
 from app.fill import fill, press_enter
 from app.ocr import reconcile, similar
@@ -494,6 +494,35 @@ def set_chatlog(on):
         settings.save(chatlog_on=bool(on))
     except Exception:  # 存不下也不该把开关拨不动
         pass
+
+
+def make_shortcut():
+    """设置页那个「创建桌面快捷方式」按钮：建一个指向本 exe 的，**把结果说出来**。
+
+    跟自动那条（auto_shortcut）的区别就在这儿：这个失败要说原因，那条失败了悄悄算了。
+    不看 settings.shortcut_created()——那个键管的是「自动建过没有」，你挪了文件夹、
+    或者手滑把桌面图标删了，随时点这个重建。"""
+    reason = shortcut.create()
+    if reason:
+        ov.set_status(f"没建成桌面快捷方式：{reason}", "warning")
+        return
+    ov.set_status("桌面快捷方式建好了，以后直接双击桌面那个图标。", "success")
+
+
+def auto_shortcut():
+    """打包版第一次跑：在桌面放个快捷方式，省得每次都翻进文件夹双击 exe。
+
+    只做一次，而且**建失败不记这一笔**——下次启动再试，成功了才记，免得一次偶发失败
+    （桌面只读、COM 被组策略挡了）就永远没图标。失败也不吭声：用户没主动要过这个，
+    真想知道为什么，设置页那个按钮会说。"""
+    if settings.shortcut_created() or shortcut.can_create():
+        # 已经自动建过；或者源码跑（sys.executable 是 python.exe，指过去是个打不开的图标）。
+        # 源码跑这一支**不记标记**：同一份 config.json 装了打包版照样该建
+        return
+    if shortcut.create():
+        return
+    settings.save_shortcut_created()
+    ov.log(f"已在桌面创建快捷方式（{shortcut.LINK_NAME}），以后直接双击桌面图标就行。")
 
 
 def record_run(title, kind, trigger, result=None, exc=None):
@@ -977,6 +1006,7 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
                  on_use=mark_used, on_pin_change=set_pin,
                  on_relation_change=set_relation, on_scene_change=set_scene,
                  on_toggle_chatlog=set_chatlog, on_reread=reread_now,
+                 on_make_shortcut=make_shortcut,
                  result_of=lambda t: chats.get(t, {}).get("result"))
     restore_log()  # 先把上次的记录接回来，再摆固定会话、再开采集（顺序有讲究，见函数里）
     if state["pin"]:
@@ -991,6 +1021,9 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
         child = spawn_worker()
     if settings.debug_view():  # 上次开着就直接开回来
         set_debug(True)
+    # 打包版第一次跑：往桌面放个快捷方式。**必须在这儿**——Qt 建 QApplication 时已经
+    # 在主线程初始化过 COM，早了（比如模块顶层）CoCreateInstance 会报「尚未调用 CoInitialize」
+    auto_shortcut()
     if not settings.has_jev_key():
         ov.set_status("请先在设置中配置模型", "warning")
         ov.after(0, ov.open_settings)

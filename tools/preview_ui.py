@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from app import settings
+from app import settings, shortcut
 from core import chatlog, relations, styles
 
 
@@ -369,7 +369,11 @@ def main() -> int:
     ), patch.multiple(chatlog, count=lambda: len(_MESSAGES), size=lambda: 1_254_000,
                       configure=lambda path: None, close=lambda: None,
                       append=lambda *a, **k: True, merge_voice=lambda *a, **k: False,
-                      rewrite_tail=lambda *a, **k: True, clear=lambda: True):
+                      rewrite_tail=lambda *a, **k: True, clear=lambda: True), patch.multiple(
+        # 桌面快捷方式：预览是源码跑，can_create() 本来会拒（没有 exe 可指），那样截出来的
+        # 按钮是灰的、说明里还挂着一句「打包版才有」。这儿假装能建，让截图跟打包版看到的一样；
+        # create 也一并换掉——真去写 .lnk 就碰用户的桌面了
+        shortcut, can_create=lambda: "", create=lambda: ""):
         from PySide6.QtCore import QPoint, QTimer
         from app.overlay import Overlay
 
