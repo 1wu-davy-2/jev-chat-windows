@@ -95,4 +95,4 @@ if __name__ == "__main__":
     assert judge_url("https://x.com/api") == "https://x.com/api/alpha/decisions"
     assert judge_url("https://x.com") == "https://x.com/api/alpha/decisions"
     assert chat_url("") == "/v1/chat/completions"  # 空 base 由调用方拦住，这里只保证不炸
-    print("core/relay.py 自测通过")
+    print("relay ok")  # 纯 ASCII：CI 的 stdout 是 cp1252，中文 print 会 UnicodeEncodeError
