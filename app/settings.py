@@ -308,8 +308,18 @@ def _read_env(env_name: str) -> str:
     return v
 
 def _get_key(env_name: str) -> str:
-    """两把 key 之一。新名字空着就退回老版本按来源存的变量（下次保存会抄进新名字）。"""
-    return _read_env(env_name) or _read_env(LEGACY[env_name])
+    """两把 key 之一。新名字空着就按顺序退回老版本按来源存的变量（下次保存会抄进新名字）。
+
+    LEGACY 里挂的是**一串**老名字（元组），得展开成一个个名字逐个试。以前是把整个元组
+    塞进 _read_env 的，于是变成 os.environ.get(元组) → TypeError: str expected——
+    而且只在「新名字没设」的机器上炸（新名字有值时 or 就短路了，右边根本不求值），
+    所以本机一直没发现，装到别人机器上启动即崩（崩在 Overlay 构造里，连设置页都进不去）。
+    写法跟 core/jev_client._api_key 保持一致。"""
+    for name in (env_name, *LEGACY.get(env_name, ())):
+        v = _read_env(name)
+        if v:
+            return v
+    return ""
 
 def _set_key(env_name: str, value: str) -> None:
     """只写进程环境 + HKCU\\Environment，不写任何文件。"""
@@ -581,4 +591,23 @@ if __name__ == "__main__":
     assert auto_send() is True and _load_all()["auto_send"] is True
     save(10, pet_enabled_on=False)
     assert auto_send() is True, "改别的开关不能顺手把它关掉"
+
+    # 老名字迁移：新名字空着要**逐个**试老名字——LEGACY 里挂的是一串（元组），不是单个名字。
+    # 以前是把整个元组塞进 _read_env 的，于是变成 os.environ.get(元组) → TypeError:
+    # str expected；而且只在「新名字没设」的机器上炸（有值就被 or 短路了，右边根本不求值），
+    # 本机一直没发现，装出去启动即崩（崩在 Overlay 构造里，连设置页都进不去）。
+    # 下面这个替身卡的就是这件事：_read_env 只许收到 str，收到元组就当场炸。
+    env = {"OPENROUTER_API_KEY": "老名字的判断 key"}
+
+    def _read_env(name):  # noqa: F811 —— 换掉真的那个：它要读注册表，自测不许碰
+        assert isinstance(name, str), f"_read_env 只吃单个名字，收到 {name!r}"
+        return env.get(name, "")
+
+    assert _get_key(JEV_ENV) == "老名字的判断 key", "新名字空着要退回老名字"
+    env["JEV_API_KEY"] = "新名字的判断 key"
+    assert _get_key(JEV_ENV) == "新名字的判断 key", "新名字有值就用新的，别再翻老的"
+    env.clear()
+    assert _get_key(JEV_ENV) == "", "两处都没有就返回空串，界面据此提示去设置里填"
+    env["RELAY_API_KEY"] = "中转的老 key"
+    assert _get_key(LLM_ENV) == "中转的老 key", "起草那把的第二个老名字也要试到"
     print("settings ok")
