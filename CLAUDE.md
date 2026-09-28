@@ -97,6 +97,27 @@ pyinstaller --noconfirm --clean jev.spec
 CI：推 `v*` tag → `.github/workflows/release.yml` 在 windows-latest 上打包、用 tag 覆盖
 `app/version.py` 的 `VERSION`、压 zip 挂 Release；手动触发只出 artifact。
 
+## 远端（推代码之前先看这条）
+
+**用户不说具体是哪个远端时，一律指 `origin`** = `https://github.com/1wu-davy-2/jev-chat-windows`。
+
+| 远端 | 地址 | 是什么 |
+| --- | --- | --- |
+| `origin` | `github.com/1wu-davy-2/jev-chat-windows` | **默认**，本仓库的 fork，推拉都走它 |
+| `upstream` | `github.com/jev-chat/jev-chat-windows` | 上游原作者，**只读**；要合它的代码得显式写 `upstream` |
+
+**命令里一律把远端名写全**：
+
+```bash
+git push origin main        # 推到自己的 fork
+git fetch origin            # 从自己的 fork 拉
+git merge upstream/main     # 只有明确要合上游时才写 upstream
+```
+
+`main` 以前跟踪的是 `upstream/main`（裸 `git push` 会打到上游去），2026-09-28 已经改成
+`origin/main` 了，现在裸推也安全。但还是写全——写全了就不依赖本机这份 git 配置，
+换台机器、换个克隆照样对。
+
 ## 架构
 
 **两个进程 + 两条队列**，这是理解全局的关键：
