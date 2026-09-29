@@ -18,7 +18,7 @@ import time
 import traceback
 from collections import deque
 
-from app import settings, update, voice, worker
+from app import settings, shortcut, update, voice, worker
 from app.capture import find_wechat_hwnd
 from app.fill import fill, press_enter
 from app.ocr import reconcile, similar
@@ -365,13 +365,14 @@ def on_debug_closed():
 def open_history():
     """标题栏的「AI 记录」：开过就复用同一个窗（列表、选中位置都还在），没有就现建。
 
-    库按需初始化：设置里关着、也从没开过记录窗的话，硬盘上连 history.db 都不建。"""
+    库按需初始化：设置里关着、也从没开过记录窗的话，连 runs 表都不建（库文件本身可能因为
+    聊天记录那个开关开着而在，那是另一张表的事，见 app/settings.db_path）。"""
     global hist
-    trace.configure(settings.history_db())
+    trace.configure(settings.db_path())
     if hist is None:
         from app.historywin import HistoryWindow
 
-        hist = HistoryWindow(db_path=settings.history_db())
+        hist = HistoryWindow(db_path=settings.db_path())
     hist.show()
     hist.raise_()
     hist.activateWindow()
@@ -387,7 +388,7 @@ def restore_log():
     **只回填内存、不写库**：库里本来就有，走 log_message 那条路会再插一遍，重启几次就翻几倍。"""
     if not settings.chatlog():
         return
-    chatlog.configure(settings.chatlog_db())
+    chatlog.configure(settings.db_path())
     for title, _n in chatlog.chats(_RESTORE_CHATS):
         rows = chatlog.recent(title, _RESTORE_LINES)
         if not rows:
@@ -486,13 +487,42 @@ def set_chatlog(on):
     关掉只是不再往库里写，**已经存下的一条都不动**——要删去设置页点「清空聊天记录」。
     两件事分开：拨一下开关就把人家攒的记录抹了，那才叫坑。"""
     if on:
-        chatlog.configure(settings.chatlog_db())
+        chatlog.configure(settings.db_path())
     else:
         chatlog.close()
     try:
         settings.save(chatlog_on=bool(on))
     except Exception:  # 存不下也不该把开关拨不动
         pass
+
+
+def make_shortcut():
+    """设置页那个「创建桌面快捷方式」按钮：建一个指向本 exe 的，**把结果说出来**。
+
+    跟自动那条（auto_shortcut）的区别就在这儿：这个失败要说原因，那条失败了悄悄算了。
+    不看 settings.shortcut_created()——那个键管的是「自动建过没有」，你挪了文件夹、
+    或者手滑把桌面图标删了，随时点这个重建。"""
+    reason = shortcut.create()
+    if reason:
+        ov.set_status(f"没建成桌面快捷方式：{reason}", "warning")
+        return
+    ov.set_status("桌面快捷方式建好了，以后直接双击桌面那个图标。", "success")
+
+
+def auto_shortcut():
+    """打包版第一次跑：在桌面放个快捷方式，省得每次都翻进文件夹双击 exe。
+
+    只做一次，而且**建失败不记这一笔**——下次启动再试，成功了才记，免得一次偶发失败
+    （桌面只读、COM 被组策略挡了）就永远没图标。失败也不吭声：用户没主动要过这个，
+    真想知道为什么，设置页那个按钮会说。"""
+    if settings.shortcut_created() or shortcut.can_create():
+        # 已经自动建过；或者源码跑（sys.executable 是 python.exe，指过去是个打不开的图标）。
+        # 源码跑这一支**不记标记**：同一份 config.json 装了打包版照样该建
+        return
+    if shortcut.create():
+        return
+    settings.save_shortcut_created()
+    ov.log(f"已在桌面创建快捷方式（{shortcut.LINK_NAME}），以后直接双击桌面图标就行。")
 
 
 def record_run(title, kind, trigger, result=None, exc=None):
@@ -512,8 +542,8 @@ def record_run(title, kind, trigger, result=None, exc=None):
 def _record_run(title, kind, trigger, result, exc):
     if not settings.history():
         return None
-    # 库按需初始化：设置里一直关着、也从没开过记录窗的话，硬盘上连 history.db 都不建
-    trace.configure(settings.history_db())
+    # 库按需初始化：设置里一直关着、也从没开过记录窗的话，连 runs 表都不建
+    trace.configure(settings.db_path())
     info = dict((getattr(exc, "trace", None) or {}) if exc is not None else result.get("trace") or {})
     draft = info.get("draft") or {}
     judge_usage = info.get("judge_usage") or {}
@@ -956,7 +986,18 @@ def tick():
 
 
 if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本文件，没这行就无限套娃开进程
-    multiprocessing.freeze_support()  # 打包成 exe 后 spawn 出来的子进程会重跑一遍 exe，没这行就无限弹界面
+    try:
+        multiprocessing.freeze_support()  # 打包成 exe 后 spawn 出来的子进程会重跑一遍 exe，没这行就无限弹界面
+    except OSError as e:
+        # 采集子进程的兜底：父进程已经没了的时候（打包版被人当成「未响应」关掉、或者直接杀掉），
+        # spawn_main 头一件事是 OpenProcess(父进程 pid)，这时抛 WinError 87，PyInstaller 接着弹一个
+        # 「Failed to execute script 'main'」的框——看着像应用崩了，其实只是这个子进程没爹可挂
+        # （真机 2026-09-29 报过：父进程 13:52:30 被 Windows 当成未响应关掉，几秒前刚起的子进程就弹了它）。
+        # 这种子进程没有任何事可做，安静退出。**别的错照旧往上抛**——那是真出问题了，
+        # 那个弹框反而是唯一能看见它的地方。
+        if getattr(e, "winerror", None) != 87:
+            raise
+        raise SystemExit(0)
     ctypes.windll.user32.SetProcessDPIAware()
     q = multiprocessing.Queue()
     capture_on = multiprocessing.Event()  # 父子进程共用的开关，置位=采集
@@ -976,6 +1017,7 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
                  on_use=mark_used, on_pin_change=set_pin,
                  on_relation_change=set_relation, on_scene_change=set_scene,
                  on_toggle_chatlog=set_chatlog, on_reread=reread_now,
+                 on_make_shortcut=make_shortcut,
                  result_of=lambda t: chats.get(t, {}).get("result"))
     restore_log()  # 先把上次的记录接回来，再摆固定会话、再开采集（顺序有讲究，见函数里）
     if state["pin"]:
@@ -990,6 +1032,9 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
         child = spawn_worker()
     if settings.debug_view():  # 上次开着就直接开回来
         set_debug(True)
+    # 打包版第一次跑：往桌面放个快捷方式。**必须在这儿**——Qt 建 QApplication 时已经
+    # 在主线程初始化过 COM，早了（比如模块顶层）CoCreateInstance 会报「尚未调用 CoInitialize」
+    auto_shortcut()
     if not settings.has_jev_key():
         ov.set_status("请先在设置中配置模型", "warning")
         ov.after(0, ov.open_settings)

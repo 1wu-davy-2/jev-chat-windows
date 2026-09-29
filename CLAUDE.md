@@ -40,14 +40,17 @@ Windows 上挂在微信（4.x，`Weixin.exe`）旁边的回复助手：截自己
    静默窗口（见下），连着发的几条攒成一次问。**唯一的例外是默认关着的「冷场开场白」**
    （`opener`）：开着才多一个触发点——最后一句是自己说的、对方一直没回，等够 `opener_minutes()`
    起草一次开场白。关着的时候这条一字不变，别把它当成默认行为。
-8. **把聊天原文写进磁盘的口子只有两个，都是本机 SQLite、都能关、都能清空**：
-   - `history.db`（`core/trace.py`）——**AI 调用**记录，给流程审计用。默认开（`history`），
-     在「AI 记录」窗里清空。
-   - `chatlog.db`（`core/chatlog.py`）——**聊天记录**本身，界面那串气泡 + 喂模型的上下文。
+8. **把聊天原文写进磁盘的口子只有两个，都在本机同一个 SQLite 文件里、都能关、都能清空**：
+   - `runs` 表（`core/trace.py`）——**AI 调用**记录，给流程审计用。默认**源码跑开、打包版关**
+     （`history`），在「AI 记录」窗里清空。
+   - `messages` 表（`core/chatlog.py`）——**聊天记录**本身，界面那串气泡 + 喂模型的上下文。
      默认**源码跑开、打包版关**（`chatlog`），在「系统设置」里拨、在同一个页签里清空。
-   两个库分开是故意的：开关、清空入口、生命周期各管各的，别合并。
+   两张表合用一个 `jev.db` 只是「字节放哪儿」——开关、清空入口、默认值还是各管各的，别混：
+   **别把两个开关并成一个**，也别让「清空聊天记录」顺手把 AI 记录删了。两个默认值还必须
+   一致（都跟着 `sys.frozen`）：共用一个文件，只要有一个开着文件就建出来了，不一致的话
+   「打包版默认不在硬盘上留库文件」这条就废了。
    加**第三个**写盘口子之前先想清楚这条边界——截图仍然一律不落盘（见 3），
-   两个库记的都是文字，都只在本机，写之前每个字符串都过 `redact_secrets()`。
+   两张表记的都是文字，都只在本机，写之前每个字符串都过 `redact_secrets()`。
 
 ## 常用命令
 
@@ -66,6 +69,7 @@ python core/chatlog.py      # 聊天记录库：写读正序、并语音、90 �
 python -m app.update        # 版本号比较，monkeypatch urlopen，不联网
 python app/ocr.py           # 语音消息过滤正则 + 「重新识别」的对账 reconcile（都不加载 OCR 引擎）
 python app/capture.py       # 消息区定位：输入框顶那根细横线（合成帧，不截图）
+python app/shortcut.py      # 桌面快捷方式：在临时目录真写一个 .lnk 再读回来（不碰用户桌面）
 
 # 端到端冒烟：写死的一段对话跑完整链，需 key + 联网
 set PYTHONPATH=. && python tools/demo.py
@@ -79,8 +83,8 @@ python tools/preview_ui.py --state settings --tab style --screenshot docs/ui_sty
 #   debug / ime / ime-thinking / pet / pet-menu / bar / voice / log /
 #   opener / opener-bar / opener-loading / opener-blank / history / pinned
 # 可用的 --tab：preference / models / style / system（配合 --state settings）
-# （history 会往临时目录写一个演示库，不碰本机那份 history.db；预览里 core.chatlog
-#   整个被 patch 成假的，不会碰本机那份 chatlog.db）
+# （history 会往临时目录写一个演示库，不碰本机那份 jev.db；预览里 core.chatlog
+#   整个被 patch 成假的，同样碰不到本机那份）
 
 # 打包（onedir，产物 dist\jev-chat\ 整个文件夹才是成品）
 build.bat
@@ -92,6 +96,27 @@ pyinstaller --noconfirm --clean jev.spec
 
 CI：推 `v*` tag → `.github/workflows/release.yml` 在 windows-latest 上打包、用 tag 覆盖
 `app/version.py` 的 `VERSION`、压 zip 挂 Release；手动触发只出 artifact。
+
+## 远端（推代码之前先看这条）
+
+**用户不说具体是哪个远端时，一律指 `origin`** = `https://github.com/1wu-davy-2/jev-chat-windows`。
+
+| 远端 | 地址 | 是什么 |
+| --- | --- | --- |
+| `origin` | `github.com/1wu-davy-2/jev-chat-windows` | **默认**，本仓库的 fork，推拉都走它 |
+| `upstream` | `github.com/jev-chat/jev-chat-windows` | 上游原作者，**只读**；要合它的代码得显式写 `upstream` |
+
+**命令里一律把远端名写全**：
+
+```bash
+git push origin main        # 推到自己的 fork
+git fetch origin            # 从自己的 fork 拉
+git merge upstream/main     # 只有明确要合上游时才写 upstream
+```
+
+`main` 以前跟踪的是 `upstream/main`（裸 `git push` 会打到上游去），2026-09-28 已经改成
+`origin/main` 了，现在裸推也安全。但还是写全——写全了就不依赖本机这份 git 配置，
+换台机器、换个克隆照样对。
 
 ## 架构
 
@@ -206,7 +231,8 @@ join 出来的碎片反而难读；加字段就往 `_COLUMNS` 里加一条，**�
 `result["run_id"]`，tick 存进 `chats[title]["run_id"]`；用户点「填入」「复制」时 `mark_used()`
 拿它回填「用了哪条」。三条边界：① 记录是旁路，`trace` 里每个函数都吞异常、返回 None 或空，
 **绝不能影响生成**；② 写库前每个字符串都过 `redact_secrets()`，key 绝不入库；③ 库**按需初始化**
-（`configure()` 同一个路径重复调直接返回），设置里关着、也没开过记录窗的话，硬盘上连库文件都不建。
+（`configure()` 同一个路径重复调直接返回），设置里关着、也没开过记录窗的话，连 `runs` 表都不建
+（库文件本身可能因为聊天记录那个开关开着而在，那是另一张表的事）。
 
 窗口是独立小窗（跟 debugwin 一个路子）：左边一轮一行、右边铺开那一轮的全程。刷新靠比较
 `latest_id()`——只在新记录出现时重建列表，重建时**停在原来那一轮**上（每 3 秒一次重画，
@@ -214,8 +240,12 @@ join 出来的碎片反而难读；加字段就往 `_COLUMNS` 里加一条，**�
 
 **聊天记录**（`core/chatlog.py`）：**一份存储两处用**——界面上那串气泡（`Overlay.feeds`）和喂模型的
 `chats[会话名]["history"]`（deque maxlen=60）本来都只在内存里，重启一起没。现在都从这张表重建。
-它跟 `trace` 是**两个库**（`chatlog.db` / `history.db`）、两个开关（`chatlog` / `history`）、
-两个清空入口，别合并：一个记「AI 调用」给审计，一个记「聊天本身」给界面和上下文。
+它跟 `trace` 是**两张表**（`messages` / `runs`），共用一个 `jev.db`，但两个开关（`chatlog` /
+`history`）、两个清空入口，别混：一个记「AI 调用」给审计，一个记「聊天本身」给界面和上下文。
+合并的只是「字节放哪儿」（以前是 `chatlog.db` / `history.db` 两个文件，两套 configure/clear/size
+管道纯属重复），上面那些「各管各的」一条都没变。**谁开谁建表**——关着的那个连表都不建，
+不是建个空壳子。升级上来的机器上还有老文件，各模块 `configure()` 时调 `_import_legacy()`
+把数据搬进来（见下面第 5 条）。
 
 四条规矩，改这块先看这四条：
 1. **写只有两个口子，都在 `Overlay` 里**：`log_message()` 末尾 `chatlog.append(...)`、
@@ -228,12 +258,19 @@ join 出来的碎片反而难读；加字段就往 `_COLUMNS` 里加一条，**�
 3. **开关关着就一个字都不写，但已经存下的一条都不动**。`chatlog.configure("")` / `close()` 只是
    停写；删数据只有 `clear()` 一条路（设置页那个「清空聊天记录」，带确认框）。同理
    **关着的时候不读**——`count()` / `chats()` / `recent()` 都由 `_ON` 挡着：读一下 sqlite 就会把
-   库文件建出来，那就违背「关着连文件都不建」了（`size()` 例外，它只 `getsize`，不连库）。
+   表建出来，那就违背「关着连表都不建」了（`size()` 例外，它只 `getsize`，不连库；但
+   `size()` 报的是**整个库文件**，里面还有 AI 记录那张表，界面上别把它说成「聊天记录占多少」）。
 4. **清空只清库、不动内存**。清了 `feeds` / `history` 反而会让 `_already_read` 放行，
    屏幕上那几屏被当新消息重读一遍、又写回库里，等于没清干净。
+5. **老库的搬迁只做一次，判据是 `meta` 表里那个标记，不是「表空不空」**。拿后者当判据的话，
+   用户清空一次记录、下次启动又会被搬回来一遍。搬迁在一个事务里，失败整体回滚、标记也不写，
+   下次启动重来；**老文件（`history.db` / `chatlog.db`）一个字节都不动**——删数据得用户自己
+   确认过再做，所以重试是安全的。老库可能比新库少几列（加字段就是往 `_COLUMNS` 里加一条，
+   而它是上个版本建的），只搬两边都有的列，缺的留空。
 
 默认值是 `not sys.frozen`（**源码跑开、打包版关**）——本地调试不想丢记录，装出去的不默认往磁盘
-写聊天原文。留存 `RETENTION_DAYS = 90`，在 `configure()` 里顺手清一次，不另起定时器。
+写聊天原文。留存 `RETENTION_DAYS = 90`，在 `configure()` 里顺手清一次，不另起定时器
+（搬进来的老数据也一起过一遍，别让它们绕过清理）。
 
 **「重新识别」是手动的一遍重读**（面板上「聊天记录」右边那个按钮）。为什么要它：OCR 会吃掉东西
 ——真机上「?」「嗯」这种**单字消息**被整条丢了，还顺带不触发 AI（`new[-1]` 变成了我说的那句，
@@ -316,6 +353,25 @@ join 出来的碎片反而难读；加字段就往 `_COLUMNS` 里加一条，**�
 菜单内容拆在 `_build_pet_menu()` 里而不是塞进 `contextMenuEvent`，是为了 `tools/preview_ui.py
 --state pet-menu` 能摆出来截图（`exec()` 是嵌套事件循环，截图回调进不去）。菜单每次右键现建，
 所以那两项的亮/灰和文字都是当下的状态。
+
+**桌面快捷方式**（`app/shortcut.py`，打包版第一次跑自动建一次）：`.lnk` 没有公开的简单 Win32 API，
+走的是 ctypes 手写的 COM（`IShellLinkW` + `IPersistFile`）。**别改成拉 PowerShell**——没签名的
+exe 去拉脚本是杀软和 EDR 的典型拦截形状，而且每次要等它冷启动。三条容易踩的：
+
+- **vtable 下标按各自接口从 0 数**。`IShellLinkW` 的 SetPath 是 20、SetWorkingDirectory 是 9；
+  `IPersistFile` 的 Save 是 **6**（IUnknown 三个 + IPersist::GetClassID + IsDirty + Load 之后），
+  **不是**接在 IShellLinkW 后面接着数。写错一个就是野指针。
+- **COM 是按线程算的**：A 线程初始化、B 线程调 `CoCreateInstance`，拿到的是「尚未调用
+  CoInitialize」（0x800401F0）；而这儿的失败一律只是返回一句原因，界面上看不见。所以
+  `_ensure_com()` 在每个入口自己保证，别指望调用方记得。Qt 建 QApplication 时已经在主线程
+  OleInitialize 过（也是 STA），所以自动那条放在 `ov` 建好之后调。
+- **桌面路径不能拼 `%USERPROFILE%\Desktop`**：Win10 起很多人被 OneDrive 重定向过，那个目录是空的，
+  得用 `SHGetKnownFolderPath`。
+
+自动建**只做一次**（`settings.shortcut_created()`，存 config.json 的 `shortcut` 键），而且
+**建失败不记这一笔**——下次启动再试，成功了才记，免得一次偶发失败就永远没图标。源码跑不建
+（`sys.executable` 是 python.exe），那一支**不记标记**：同一份 config.json 装了打包版照样该建。
+设置页那个「创建」按钮不看这个键，随时能重建（挪了文件夹、手滑删了都靠它）。
 
 `phase`（idle/scanning/notify/thinking/ready）是**派生**出来的，不是事件流水账：
 `main.py:phase_now()` 是纯函数，`refresh_phase()` 是唯一写者、唯一调用点是 `tick()` 的出口。
@@ -612,5 +668,16 @@ scrollbar 的 `maximum()` 还是旧值，跟底得 `QTimer.singleShot(0, ...)`�
 - **输入框拉高超过面板一半会认错**：上面那条 45% 的线。
 - **PyInstaller 用 onedir**（`jev.spec`）：onefile 有 ~150MB 每次启动都要解压。
   `console=False`，所以 exe 里的 `print` 是看不到的，状态都走界面。
+- **打包版被关掉时，正在启动的采集子进程会弹「Failed to execute script 'main'」**：子进程得先跑完
+  main.py 那一串 import 才走到 `freeze_support()`，这期间父进程要是没了（被 Windows 当成「未响应」
+  关掉、任务管理器杀掉都算），`spawn_main` 头一件事 `OpenProcess(父进程 pid)` 就抛 `WinError 87`
+  （参数错误 = 这个 PID 不存在），PyInstaller 的窗口化 bootloader 接着把它弹成一个框——**看着像
+  应用崩了，其实只是这个子进程没爹可挂**。认它看 traceback 那三帧：`main.py:989` →
+  `pyi_rth_multiprocessing.py` 的 `_freeze_support` → `multiprocessing\spawn.py` 的 `spawn_main`。
+  真机 2026-09-29 报过一次：父进程（09:46 启动的那份）13:52:30 被记成 `AppHangB1` +「已停止与
+  Windows 交互并关闭」，几秒前刚起的子进程弹了这个框，同时新开的一份跑得好好的。
+  `main.py:989` 外面那层 `try/except` 就是治它的：**只吞 winerror 87**，别的 OSError 照旧往上抛
+  ——真出问题时那个框是唯一能看见它的地方。这个框**子进程自己不留任何日志**，回头查只能翻事件日志：
+  `Get-WinEvent -FilterHashtable @{LogName='Application'} | ? Message -match 'jev-chat'`。
 - `app/settings.py` 读 key 时先看进程环境、没有再读注册表：IDE 启动时把环境快照拿走了，
   只靠 `os.environ` 会「保存了下次打开还是没有」。

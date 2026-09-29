@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from app import settings
+from app import settings, shortcut
 from core import chatlog, relations, styles
 
 
@@ -369,7 +369,11 @@ def main() -> int:
     ), patch.multiple(chatlog, count=lambda: len(_MESSAGES), size=lambda: 1_254_000,
                       configure=lambda path: None, close=lambda: None,
                       append=lambda *a, **k: True, merge_voice=lambda *a, **k: False,
-                      rewrite_tail=lambda *a, **k: True, clear=lambda: True):
+                      rewrite_tail=lambda *a, **k: True, clear=lambda: True), patch.multiple(
+        # 桌面快捷方式：预览是源码跑，can_create() 本来会拒（没有 exe 可指），那样截出来的
+        # 按钮是灰的、说明里还挂着一句「打包版才有」。这儿假装能建，让截图跟打包版看到的一样；
+        # create 也一并换掉——真去写 .lnk 就碰用户的桌面了
+        shortcut, can_create=lambda: "", create=lambda: ""):
         from PySide6.QtCore import QPoint, QTimer
         from app.overlay import Overlay
 
@@ -395,13 +399,13 @@ def main() -> int:
             shot.popup(ov.pet.mapToGlobal(QPoint(ov.pet.width() // 2, ov.pet.height() // 2)))
         elif args.state == "history":
             # AI 记录窗：合成两条记录（一条正常、一条起草挂了），写进**临时目录**的库里，
-            # 不碰本机那份 history.db。窗口只读，截完就完事。
+            # 不碰本机那份 jev.db。窗口只读，截完就完事。
             import tempfile
 
             from app.historywin import HistoryWindow
             from core import trace
 
-            trace.configure(os.path.join(tempfile.mkdtemp(prefix="jev-preview-"), "history.db"))
+            trace.configure(os.path.join(tempfile.mkdtemp(prefix="jev-preview-"), "jev.db"))
             for row in reversed(_TRACE_ROWS):  # 列表按 id 倒序摆，最后插的那条在最上面
                 trace.record(row)
             shot = HistoryWindow()

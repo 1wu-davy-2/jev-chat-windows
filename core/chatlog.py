@@ -5,11 +5,16 @@
 `chats[会话名]["history"]`（最近 60 条）也是内存里的，两个一起没。存下来之后**一份存储两处用**：
 气泡直接按它重画，history 从它重建（所以重启后模型还接得上上次聊到哪儿）。
 
-**跟 core/trace.py 是两码事，别合并**：trace 记的是「AI 调用」——每一轮发了什么提示、模型回了
-什么，给流程审计用；这边记的是**聊天本身**，给界面和上下文用。两者的开关、清空入口、库文件
-都各管各的（`chatlog.db` / `history.db`），关掉 AI 记录不影响聊天记录还在。
+**跟 core/trace.py 是两码事，别混**：trace 记的是「AI 调用」——每一轮发了什么提示、模型回了
+什么，给流程审计用；这边记的是**聊天本身**，给界面和上下文用。两张表的开关、清空入口、默认值
+都各管各的，关掉 AI 记录不影响聊天记录还在。
 
-**隐私**：跟 history.db 一样，这是把聊天原文写进磁盘的地方——设置里「聊天会话存储」默认
+**但字节是同一个文件**（`jev.db`，路径由调用方传进来）：以前是两个库（`chatlog.db` /
+`history.db`），两个模块各带一套 configure/clear/size 管道，纯属重复；合起来只是「放哪儿」，
+上面那些「各管各的」一条都没变。各建各的表（这边 `messages`、那边 `runs`），
+**谁开谁建**——所以关着的时候硬盘上连这张表都没有，不是建个空壳子。
+
+**隐私**：跟 trace 一样，这是把聊天原文写进磁盘的地方——设置里「聊天会话存储」默认
 **源码跑开着、打包版关着**（`app/settings.chatlog()`），关掉就一次都不写，设置页里能看占用、
 能一键清空。写库前每个字符串一律过 `redact_secrets()`，绝不落 key。
 
@@ -43,7 +48,14 @@ CREATE TABLE IF NOT EXISTS messages (
     ts INTEGER NOT NULL      -- 落库时刻（epoch 秒），留存天数按它算
 );
 CREATE INDEX IF NOT EXISTS messages_chat ON messages(chat, id DESC);
+-- 库自己的小账本（谁开谁建，trace 也要用）。现在只记「老库搬过来了没有」
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
+
+# 老版本那个库：合并之前聊天记录单独一个文件。升级上来的用户手上还有它，
+# 首次开库把数据搬进 messages（见 _import_legacy），搬完老文件一个字节都不动
+_LEGACY_DB = "chatlog.db"
+_IMPORT_TAG = "imported_chatlog"
 
 # 库路径 + 现在写不写。关掉之后路径**留着**：设置页要拿它算占用（关着也告诉你硬盘上还占多少），
 # size() 也才有得看。空路径 = 从没配过（自测 / tools 里就是这样），写操作空转、读操作返回空
@@ -53,7 +65,7 @@ _LOCK = threading.Lock()  # 写来自 Qt 主线程、读也在主线程，串一
 
 
 def configure(path: str) -> None:
-    """设库路径、建表、顺手清掉过期的。路径空 = 关掉（tools / 自测里跑不会凭空建库）。
+    """设库路径、建表、把老库搬进来、顺手清掉过期的。路径空 = 关掉（tools / 自测里跑不会凭空建库）。
     建表失败也不抛——记录是个旁路，磁盘满、文件被占都不该把主流程拖下水。
 
     同一个路径重复调用直接返回（调用方按需调它）。"""
@@ -69,11 +81,58 @@ def configure(path: str) -> None:
         with _LOCK, closing(_connect()) as c:
             c.executescript(_SCHEMA)
             c.execute("PRAGMA journal_mode=WAL")  # 边写边读不打架；设一次就记在库里了
-            c.execute("delete from messages where ts < ?", (_cutoff(),))
             c.commit()
         _ON = True
     except Exception:
         _DB = ""  # 建不出来就当没配过，别每次写都再失败一遍
+        return
+    _import_legacy()
+    try:  # 留存：搬进来的老数据也一起过一遍，别让它们绕过清理
+        with _LOCK, closing(_connect()) as c:
+            c.execute("delete from messages where ts < ?", (_cutoff(),))
+            c.commit()
+    except Exception:
+        pass
+
+
+def _import_legacy() -> int:
+    """把老版本那个 chatlog.db 里的记录搬进 messages，只搬一次（搬完在 meta 里记一笔）。
+
+    **不能拿「messages 表空不空」当判据**：用户清空一次记录，下次启动又会把老数据搬回来。
+    老库可能比新库少几列，所以只搬两边都有的列、缺的留空。整个过程一个事务，中途失败整体
+    回滚、标记也不写，下次启动重来；老文件一个字节都不动（删数据该由用户自己确认过再做），
+    所以重试是安全的。"""
+    if not _DB or _imported():
+        return 0
+    old = os.path.join(os.path.dirname(_DB), _LEGACY_DB)
+    if os.path.abspath(old) == os.path.abspath(_DB) or not os.path.exists(old):
+        return 0
+    try:
+        with _LOCK, closing(_connect()) as c:
+            c.execute("attach database ? as old", (old,))
+            have = {r[1] for r in c.execute("pragma old.table_info(messages)")}
+            cols = [x for x in ("id", "chat", "who", "text", "name", "stamp", "voice", "ts")
+                    if x in have]
+            if "id" not in cols:  # 没有 messages 表（或者根本不是我们的库）
+                raise sqlite3.OperationalError("老库里没有 messages 表")
+            names = ", ".join(cols)
+            c.execute(f"insert into messages ({names}) select {names} from old.messages")
+            n = int(c.execute("select changes()").fetchone()[0])
+            c.execute("insert or replace into meta (key, value) values (?, ?)",
+                      (_IMPORT_TAG, str(int(time.time()))))
+            c.commit()
+        return n
+    except Exception:
+        return 0
+
+
+def _imported() -> bool:
+    """这次搬迁做过了吗。读不出来一律当「做过了」——宁可漏搬一次，也别每次启动重搬一遍。"""
+    try:
+        with closing(_connect()) as c:
+            return c.execute("select 1 from meta where key=?", (_IMPORT_TAG,)).fetchone() is not None
+    except Exception:
+        return True
 
 
 def close() -> None:
@@ -246,7 +305,7 @@ if __name__ == "__main__":
     assert recent("x") == [] and chats() == [] and count() == 0 and size() == 0
     assert merge_voice("x", "占位", "her", "转写", '3"') is False and clear() is False
 
-    path = os.path.join(tempfile.mkdtemp(prefix="jev-chatlog-"), "chatlog.db")
+    path = os.path.join(tempfile.mkdtemp(prefix="jev-chatlog-"), "jev.db")
     configure(path)
     assert append("白金搬砖小分队", "her", "在吗", "阿杰", "18:40")
     append("白金搬砖小分队", "me", "在")
@@ -295,7 +354,7 @@ if __name__ == "__main__":
     del os.environ["JEV_API_KEY"]
 
     # 留存：超期的开机时清掉，没过期的留着
-    old = os.path.join(tempfile.mkdtemp(prefix="jev-chatlog-old-"), "chatlog.db")
+    old = os.path.join(tempfile.mkdtemp(prefix="jev-chatlog-old-"), "jev.db")
     with sqlite3.connect(old) as c:
         c.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT NOT NULL,"
                   " who TEXT NOT NULL, text TEXT NOT NULL, name TEXT, stamp TEXT, voice TEXT,"
@@ -312,4 +371,22 @@ if __name__ == "__main__":
     # 关掉之后写读都变成空操作，但库文件还在（关开关 != 删数据）
     close()
     assert append("x", "her", "y") is False and count() == 0 and size() > 0
+
+    # 老库导入：合并之前聊天记录是单独一个 chatlog.db，升级上来的用户手上还有它。
+    # 同 trace：只搬一次，判据不能是「messages 空不空」——清空一次记录再重启不能又搬回来
+    legacy_dir = tempfile.mkdtemp(prefix="jev-chatlog-legacy-")
+    old_db = os.path.join(legacy_dir, "chatlog.db")
+    with sqlite3.connect(old_db) as c:
+        c.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                  " chat TEXT NOT NULL, who TEXT NOT NULL, text TEXT NOT NULL, ts INTEGER NOT NULL)")
+        c.execute("INSERT INTO messages (chat, who, text, ts) VALUES ('老会话', 'her', '搬过来的', ?)",
+                  (int(time.time()),))
+    merged = os.path.join(legacy_dir, "jev.db")
+    configure(merged)
+    assert [r[1] for r in recent("老会话")] == ["搬过来的"], "老库的数据要搬进来"
+    assert os.path.exists(old_db), "老文件不许动——删数据得用户自己确认过"
+    clear()
+    close()
+    configure(merged)
+    assert recent("老会话") == [], "清空之后重启，不能又把老数据搬回来一遍"
     print("chatlog ok")

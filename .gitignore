@@ -8,11 +8,16 @@ venv/
 
 # 每个人自己的关系设置，不进仓库（.gitignore 里 # 只能整行注释，写在模式后面会变成模式的一部分）
 config.json
-# AI 记录库：里面是这个人自己的聊天原文，只在本机，绝不提交
+# 本机那个库：runs（AI 调用记录）+ messages（聊天记录）两张表，里面是这个人自己的聊天原文，
+# 只在本机，绝不提交
+jev.db
+jev.db-wal
+jev.db-shm
+# 合并前的老库。程序不会去动它们（数据搬进 jev.db 后原样留着），但升级上来的机器上还在，
+# 照样不能提交
 history.db
 history.db-wal
 history.db-shm
-# 聊天记录库：同上，都是本机自己的聊天原文
 chatlog.db
 chatlog.db-wal
 chatlog.db-shm

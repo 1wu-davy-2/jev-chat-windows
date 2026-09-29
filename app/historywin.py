@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """AI 记录窗：每一轮问了什么、模型回了什么、最后用了哪条，都摆在这儿。
 
-数据全在 core/trace.py 那个本地 SQLite 里（跟 config.json 并排的 history.db），这个窗只读。
+数据全在 core/trace.py 那个本地 SQLite 里（跟 config.json 并排的 jev.db，runs 表），这个窗只读。
 左边一轮一行，右边是选中那轮的完整材料——**包括发出去的提示原文和模型原始返回**，
 所以出问题（起草跑偏、判断卡住、答案莫名其妙）时能翻回来看到底哪一步歪的。
 
@@ -277,10 +277,11 @@ class HistoryWindow(QWidget):
                      or r.get("judge_error") or r.get("rank_error"))
         self.summary.setText(f"共 {len(self._rows)} 轮"
                              + (f"，其中 {failed} 轮有环节没跑成" if failed else "")
-                             + f" · 库 {trace.human_size(trace.size())}")
-        self.footer.setText("记录库：" + trace.human_size(trace.size())
-                            + "　·　关掉设置里「记录 AI 调用」就不再写新的，"
-                              "「清空记录」把已有的全删掉")
+                             + f" · 库文件 {trace.human_size(trace.size())}")
+        # size() 是**整个库文件**（runs 和 messages 两张表合用一个），不只是这边的记录
+        self.footer.setText("库文件：" + trace.human_size(trace.size())
+                            + "（AI 记录和聊天记录合用一个文件）　·　关掉设置里「记录 AI 调用」"
+                              "就不再写新的，「清空记录」把已有的全删掉")
         self._select(keep if keep else (self._rows[0]["id"] if self._rows else 0))
 
     def _item_text(self, row: dict) -> str:

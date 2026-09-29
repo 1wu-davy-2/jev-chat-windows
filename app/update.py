@@ -71,4 +71,6 @@ if __name__ == "__main__":
     with patch("urllib.request.urlopen", _boom):
         assert check_latest("0.0.0-dev") is None  # 开发版：根本不该走到 urlopen，_boom 也证明了这点
 
-    print("app/update.py 自测通过")
+    # 纯 ASCII：CI 的 stdout 是 cp1252（runner 是 en-US），中文 print 会 UnicodeEncodeError。
+    # stderr 不受影响（Python 给它挂了 backslashreplace），所以上面断言里的中文消息没事。
+    print("update ok")

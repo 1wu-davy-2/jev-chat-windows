@@ -20,8 +20,9 @@ from core.relay import DEFAULT_JUDGE_PATH, DEFAULT_THINKING_STYLE, THINKING_STYL
 _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CONFIG = os.path.join(_ROOT, "config.json")
-_HISTORY_DB = os.path.join(_ROOT, "history.db")  # AI 调用记录，见 core/trace.py（已进 .gitignore）
-_CHATLOG_DB = os.path.join(_ROOT, "chatlog.db")  # 聊天记录，见 core/chatlog.py（已进 .gitignore）
+# 一个库文件、两张表：runs（AI 调用记录，core/trace.py）+ messages（聊天记录，core/chatlog.py）。
+# 合成一个文件只是「字节放哪儿」——两张表的开关、清空入口、默认值还是各管各的，别混。
+_DB = os.path.join(_ROOT, "jev.db")  # 已进 .gitignore
 _DEFAULT_CONTEXT = 10
 # 老配置里 relationship 存的是这几个英文（安卓原版传下来的），迁移时折回内置的键
 _LEGACY_RELATION_KEYS = {"romantic partners": "romance", "friends": "friend",
@@ -225,13 +226,13 @@ def opener() -> bool:
     return bool(_read("opener", False))
 
 def history() -> bool:
-    """记不记 AI 调用（每一轮发了什么提示、模型回了什么、最后用了哪条）。默认开，
-    存本机 history.db，只有「AI 记录」窗口读它。关掉就一次都不写。"""
-    return bool(_read("history", True))
+    """记不记 AI 调用（每一轮发了什么提示、模型回了什么、最后用了哪条）。存本机 jev.db 的
+    runs 表，只有「AI 记录」窗口读它。关掉就一次都不写。
 
-def history_db() -> str:
-    """记录库的路径：跟 config.json 并排。路径的算法只在这儿一处（core/trace 不认识 app）。"""
-    return _HISTORY_DB
+    **默认源码跑开着、打包版关着**（跟 chatlog 一个口径）：两个库现在装在同一个文件里，
+    只要有一个开着文件就会建出来，所以默认值必须一致——不然「打包版默认不在硬盘上留库文件」
+    这条就废了。判断依据是 `sys.frozen`（打包后为真），不用额外配置。"""
+    return bool(_read("history", not getattr(sys, "frozen", False)))
 
 def chatlog() -> bool:
     """聊天记录存不存本地（界面那串气泡 + 喂模型的上下文，见 core/chatlog.py）。
@@ -240,9 +241,10 @@ def chatlog() -> bool:
     要存自己去设置里开。判断依据是 `sys.frozen`（打包后为真），不用额外配置。"""
     return bool(_read("chatlog", not getattr(sys, "frozen", False)))
 
-def chatlog_db() -> str:
-    """聊天记录库的路径。跟 history.db 分开：两个开关、两个清空入口，各管各的。"""
-    return _CHATLOG_DB
+def db_path() -> str:
+    """库文件路径：跟 config.json 并排。路径的算法只在这儿一处（core/ 不认识 app）。
+    两张表共用它——core.trace 和 core.chatlog 各建各的表，谁开谁建。"""
+    return _DB
 
 def opener_minutes() -> int:
     """等多少分钟算冷场。1~720，缺失/脏数据一律退默认值。"""
@@ -264,6 +266,19 @@ def thinking() -> bool:
 def check_update() -> bool:
     """启动时要不要去 GitHub 查一次最新版本号：默认开，只出这一次网，设置里能关。"""
     return bool(_read("check_update", True))
+
+def shortcut_created() -> bool:
+    """桌面快捷方式**自动**建过了吗。建过一次就不再自动建——你在桌面把它删了，下次启动
+    也不会又冒出来（那最烦人）。设置页那个「创建桌面快捷方式」按钮不看这个键，随时能重建。"""
+    return bool(_read("shortcut", False))
+
+def save_shortcut_created() -> None:
+    """记一笔「自动建过了」。走 save() 的话会顺带把两把 key 重写进注册表、再广播一次
+    WM_SETTINGCHANGE，为这一个布尔不值当（跟 save_pet_pos 一个道理）。"""
+    data = _load_all()
+    data["shortcut"] = True
+    with open(_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
 
 def debug_view() -> bool:
     """调试视图：另开一个窗口实时画识别框。默认关，开了子进程才往队列里送帧。"""
@@ -308,8 +323,18 @@ def _read_env(env_name: str) -> str:
     return v
 
 def _get_key(env_name: str) -> str:
-    """两把 key 之一。新名字空着就退回老版本按来源存的变量（下次保存会抄进新名字）。"""
-    return _read_env(env_name) or _read_env(LEGACY[env_name])
+    """两把 key 之一。新名字空着就按顺序退回老版本按来源存的变量（下次保存会抄进新名字）。
+
+    LEGACY 里挂的是**一串**老名字（元组），得展开成一个个名字逐个试。以前是把整个元组
+    塞进 _read_env 的，于是变成 os.environ.get(元组) → TypeError: str expected——
+    而且只在「新名字没设」的机器上炸（新名字有值时 or 就短路了，右边根本不求值），
+    所以本机一直没发现，装到别人机器上启动即崩（崩在 Overlay 构造里，连设置页都进不去）。
+    写法跟 core/jev_client._api_key 保持一致。"""
+    for name in (env_name, *LEGACY.get(env_name, ())):
+        v = _read_env(name)
+        if v:
+            return v
+    return ""
 
 def _set_key(env_name: str, value: str) -> None:
     """只写进程环境 + HKCU\\Environment，不写任何文件。"""
@@ -565,13 +590,16 @@ if __name__ == "__main__":
     assert relation_of("李四") == "r1", "默认关系换了，没指定过的会话跟着换"
     assert relation_text("friend") == "我改的朋友"
 
-    # 聊天记录开关：源码跑默认开、打包版默认关；拨过之后按存的来
+    # 两个存储开关：都默认「源码跑开、打包版关」；拨过之后按存的来
     assert chatlog() is True, "自测是源码跑，默认该是开的"
+    assert history() is True, "同上，两个开关的默认值必须一致（见 history() 的说明）"
     save(10, chatlog_on=False)
     assert chatlog() is False and _load_all()["chatlog"] is False
     save(10, chatlog_on=True)
     assert chatlog() is True
-    assert chatlog_db().endswith("chatlog.db") and chatlog_db() != history_db(), "两个库别用同一个文件"
+    assert db_path().endswith("jev.db"), db_path()
+    # 两张表共用一个库文件；自测里 _ROOT 是仓库根，路径必须落在它下面
+    assert os.path.dirname(db_path()) == _ROOT, db_path()
 
     # 自动发送（「绝不自动发送」唯一的例外）：必须默认关，而且别的键写一遍不能把它带开
     assert auto_send() is False, "这个是调试开关，默认必须是关的"
@@ -581,4 +609,23 @@ if __name__ == "__main__":
     assert auto_send() is True and _load_all()["auto_send"] is True
     save(10, pet_enabled_on=False)
     assert auto_send() is True, "改别的开关不能顺手把它关掉"
+
+    # 老名字迁移：新名字空着要**逐个**试老名字——LEGACY 里挂的是一串（元组），不是单个名字。
+    # 以前是把整个元组塞进 _read_env 的，于是变成 os.environ.get(元组) → TypeError:
+    # str expected；而且只在「新名字没设」的机器上炸（有值就被 or 短路了，右边根本不求值），
+    # 本机一直没发现，装出去启动即崩（崩在 Overlay 构造里，连设置页都进不去）。
+    # 下面这个替身卡的就是这件事：_read_env 只许收到 str，收到元组就当场炸。
+    env = {"OPENROUTER_API_KEY": "老名字的判断 key"}
+
+    def _read_env(name):  # noqa: F811 —— 换掉真的那个：它要读注册表，自测不许碰
+        assert isinstance(name, str), f"_read_env 只吃单个名字，收到 {name!r}"
+        return env.get(name, "")
+
+    assert _get_key(JEV_ENV) == "老名字的判断 key", "新名字空着要退回老名字"
+    env["JEV_API_KEY"] = "新名字的判断 key"
+    assert _get_key(JEV_ENV) == "新名字的判断 key", "新名字有值就用新的，别再翻老的"
+    env.clear()
+    assert _get_key(JEV_ENV) == "", "两处都没有就返回空串，界面据此提示去设置里填"
+    env["RELAY_API_KEY"] = "中转的老 key"
+    assert _get_key(LLM_ENV) == "中转的老 key", "起草那把的第二个老名字也要试到"
     print("settings ok")

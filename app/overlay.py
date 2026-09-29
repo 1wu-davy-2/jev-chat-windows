@@ -20,7 +20,7 @@ from qfluentwidgets import (
     TextEdit, Theme, TransparentToolButton, setCustomStyleSheet, setFont, setTheme, setThemeColor,
 )
 
-from app import settings, theme
+from app import settings, shortcut, theme
 from app.pet import HotkeyHost, PetWindow
 from app.theme import (
     FONT_2XL, FONT_DISPLAY, FONT_H1, FONT_LG, FONT_MD, FONT_SM, FONT_XL, FONT_XS,
@@ -744,7 +744,7 @@ class Overlay:
                  on_toggle_debug=None, on_voice_convert=None, on_opener_again=None,
                  on_settings_saved=None, on_open_history=None, on_use=None, on_pin_change=None,
                  on_relation_change=None, on_scene_change=None, on_toggle_chatlog=None,
-                 on_reread=None):
+                 on_reread=None, on_make_shortcut=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。
@@ -758,7 +758,8 @@ class Overlay:
         on_relation_change(会话名, 关系键) → 用户给这个会话挑了关系；on_scene_change 同理，
         挑的是场景模板（第二项为空串 = 跟随关系）。两个都是拨一下立刻写盘、下次生成才用。
         on_toggle_chatlog(开不开) → 「聊天会话存储」那个开关，拨一下立刻生效（父进程配库）。
-        on_reread() → 用户点了「重新识别」，要叫醒子进程把屏幕整个重读一遍（父进程那边发信号）。"""
+        on_reread() → 用户点了「重新识别」，要叫醒子进程把屏幕整个重读一遍（父进程那边发信号）。
+        on_make_shortcut() → 用户点了「创建桌面快捷方式」（写 .lnk 要 COM，界面这边不碰）。"""
         self.app = QApplication.instance() or QApplication([])
         self.app.setWindowIcon(_app_icon())
         setTheme(Theme.LIGHT)
@@ -777,6 +778,7 @@ class Overlay:
         self.on_scene_change = on_scene_change
         self.on_toggle_chatlog = on_toggle_chatlog
         self.on_reread = on_reread
+        self.on_make_shortcut = on_make_shortcut
         self.result_of = result_of
         self._voices = {}  # {会话名: [(x0,y0,x1,y1,时长)]}，语音气泡的位置，转文字要右键它
         self._opener = {}  # {会话名: 对方多少分钟没回}，现在摆的是开场白（不是回复）的会话
@@ -1243,7 +1245,7 @@ class Overlay:
         chatlog_row.addWidget(self.chatlogSwitch)
         box.addLayout(chatlog_row)
         box.addWidget(self._hint(
-            "界面上的聊天记录和 AI 看的上下文都存到本机的 chatlog.db 里，重启之后还在、模型还接得上"
+            "界面上的聊天记录和 AI 看的上下文都存到本机的 jev.db 里，重启之后还在、模型还接得上"
             "上次聊到哪儿。写库前统一脱敏（不存密钥），只留最近 90 天。关掉就不再写，"
             "已经存下的一条都不动——要删点下面那个按钮。"
         ))
@@ -1263,9 +1265,10 @@ class Overlay:
         history_row.addWidget(self.historySwitch)
         box.addLayout(history_row)
         box.addWidget(self._hint(
-            "每一轮问了什么、模型回了什么、你最后用了哪条，都记在本机的 history.db 里，"
+            "每一轮问了什么、模型回了什么、你最后用了哪条，都记在本机的 jev.db 里（runs 表），"
             "点标题栏那个「AI 记录」能翻。存的是聊天原文（不存密钥，写库前统一脱敏）；"
-            "关掉就一次都不写，已有的记录还在，去记录窗里清空。跟上面那个是两个库，互不影响。"
+            "关掉就一次都不写，已有的记录还在，去记录窗里清空。跟上面那个共用同一个文件，"
+            "但是两张表、两个开关，互不影响。"
         ))
         update_row = QHBoxLayout()
         update_row.addWidget(_label("启动时检查更新", FONT_MD), 1)
@@ -1325,6 +1328,23 @@ class Overlay:
         box.addWidget(self._hint(
             "平时桌面上只有宠物，有消息才在它旁边弹候选条，点宠物展开完整面板。"
             "关掉就是原来那样：面板一直开着。"
+        ))
+        # 桌面快捷方式：打包版第一次跑会自动建一个（main.auto_shortcut），这儿是**手动重建**的
+        # 口子——挪了文件夹、或者手滑把桌面图标删了（删了不会再自动冒出来），点一下就行。
+        # 源码跑时按钮灰着：sys.executable 是 python.exe，指过去等于放一个打不开的图标。
+        link_row = QHBoxLayout()
+        link_row.addWidget(_label("桌面快捷方式", FONT_MD), 1)
+        self.shortcutButton = PushButton("创建")
+        self.shortcutButton.setAccessibleName("创建桌面快捷方式")
+        self.shortcutButton.clicked.connect(self._make_shortcut)
+        link_row.addWidget(self.shortcutButton)
+        box.addLayout(link_row)
+        _why = shortcut.can_create()
+        self.shortcutButton.setEnabled(not _why)
+        box.addWidget(self._hint(
+            "在桌面放一个指向本程序的图标，省得每次都翻进文件夹双击 exe。"
+            "打包版第一次跑会自动建一次；你在桌面把它删了不会再冒出来，想重建就点这个。"
+            + (f"（{_why}）" if _why else "")
         ))
         self.systemCard = system
         body.addWidget(system)
@@ -1900,17 +1920,21 @@ class Overlay:
 
     def _sync_chatlog(self):
         """存储那一行的现状。关着的时候**不读库**（读一下 sqlite 就会把库文件建出来，
-        违背「关着就一个字都不往磁盘写」），只按文件大小说话。"""
+        违背「关着就一个字都不往磁盘写」），只按文件大小说话。
+
+        `size()` 报的是**整个库文件**——AI 记录和聊天记录两张表合用一个，所以关着的时候
+        不能说「硬盘上已经存了聊天记录」，只能说文件占多大（见 core/chatlog.py 头上那段）。"""
         size = chatlog.size()
         if not self.chatlogSwitch.isChecked():
             self.chatlogStats.setText(
-                f"已关闭；硬盘上已经存的不动（占着 {chatlog.human_size(size)}）。" if size
+                f"已关闭，不再写新的；已经存的不动（库文件占着 {chatlog.human_size(size)}）。" if size
                 else "已关闭，硬盘上还没存过东西。")
         else:
             self.chatlogStats.setText(
-                f"已存 {chatlog.count()} 条 · {chatlog.human_size(size)}。" if size
+                f"已存 {chatlog.count()} 条 · 库文件 {chatlog.human_size(size)}。" if size
                 else "还没存过东西；有消息就读进来。")
-        self.chatlogClear.setEnabled(self.chatlogSwitch.isChecked() and size > 0)
+        # 亮不亮看**这张表**有没有东西：库文件可能因为 AI 记录开着而在，那是另一张表
+        self.chatlogClear.setEnabled(self.chatlogSwitch.isChecked() and chatlog.count() > 0)
 
     def _chatlog_toggled(self, on):
         """聊天会话存储：拨一下立刻生效 + 落盘（跟调试视图、桌面宠物一个路子）。"""
@@ -2411,6 +2435,12 @@ class Overlay:
         """「重新识别」按钮。干活的在父进程（要叫醒子进程去重读），界面只管叫一声。"""
         if self.on_reread:
             self.on_reread()
+
+    def _make_shortcut(self):
+        """「创建桌面快捷方式」按钮。写 .lnk 走 COM，那摊子事在 app/shortcut.py + main 那边，
+        界面只管叫一声——建成了没有由 main 回写到状态栏。"""
+        if self.on_make_shortcut:
+            self.on_make_shortcut()
 
     def fix_message(self, chat, who, old, new):
         """某条之前读花了，把记录里那条的就地改掉（重新识别对账用，见 app.ocr.reconcile）。

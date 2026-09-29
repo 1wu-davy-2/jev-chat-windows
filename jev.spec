@@ -14,6 +14,7 @@ hiddenimports = [
     "app.version", "app.update", "app.debugwin",  # debugwin 是开了调试视图才 import 的
     "app.theme", "app.pet",  # theme 是纯数据；pet 是桌面宠物窗
     "app.historywin",  # AI 记录窗，点了标题栏那个图标才 import
+    "app.shortcut",    # 桌面快捷方式（ctypes + COM），main 和 overlay 里都是运行时才走到
     "core.engine", "core.draft", "core.jev_client", "core.questions", "core.providers",
     "core.llm", "core.relay", "core.styles", "core.trace",  # trace 是 AI 记录的库（stdlib sqlite3）
     "core.relations",  # 关系（谁是谁 + 按这个关系怎么说话），styles 从它取正文
