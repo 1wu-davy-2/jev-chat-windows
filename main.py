@@ -986,7 +986,18 @@ def tick():
 
 
 if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本文件，没这行就无限套娃开进程
-    multiprocessing.freeze_support()  # 打包成 exe 后 spawn 出来的子进程会重跑一遍 exe，没这行就无限弹界面
+    try:
+        multiprocessing.freeze_support()  # 打包成 exe 后 spawn 出来的子进程会重跑一遍 exe，没这行就无限弹界面
+    except OSError as e:
+        # 采集子进程的兜底：父进程已经没了的时候（打包版被人当成「未响应」关掉、或者直接杀掉），
+        # spawn_main 头一件事是 OpenProcess(父进程 pid)，这时抛 WinError 87，PyInstaller 接着弹一个
+        # 「Failed to execute script 'main'」的框——看着像应用崩了，其实只是这个子进程没爹可挂
+        # （真机 2026-09-29 报过：父进程 13:52:30 被 Windows 当成未响应关掉，几秒前刚起的子进程就弹了它）。
+        # 这种子进程没有任何事可做，安静退出。**别的错照旧往上抛**——那是真出问题了，
+        # 那个弹框反而是唯一能看见它的地方。
+        if getattr(e, "winerror", None) != 87:
+            raise
+        raise SystemExit(0)
     ctypes.windll.user32.SetProcessDPIAware()
     q = multiprocessing.Queue()
     capture_on = multiprocessing.Event()  # 父子进程共用的开关，置位=采集

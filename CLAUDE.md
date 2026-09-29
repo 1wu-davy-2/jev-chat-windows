@@ -658,5 +658,16 @@ scrollbar 的 `maximum()` 还是旧值，跟底得 `QTimer.singleShot(0, ...)`�
 - **输入框拉高超过面板一半会认错**：上面那条 45% 的线。
 - **PyInstaller 用 onedir**（`jev.spec`）：onefile 有 ~150MB 每次启动都要解压。
   `console=False`，所以 exe 里的 `print` 是看不到的，状态都走界面。
+- **打包版被关掉时，正在启动的采集子进程会弹「Failed to execute script 'main'」**：子进程得先跑完
+  main.py 那一串 import 才走到 `freeze_support()`，这期间父进程要是没了（被 Windows 当成「未响应」
+  关掉、任务管理器杀掉都算），`spawn_main` 头一件事 `OpenProcess(父进程 pid)` 就抛 `WinError 87`
+  （参数错误 = 这个 PID 不存在），PyInstaller 的窗口化 bootloader 接着把它弹成一个框——**看着像
+  应用崩了，其实只是这个子进程没爹可挂**。认它看 traceback 那三帧：`main.py:989` →
+  `pyi_rth_multiprocessing.py` 的 `_freeze_support` → `multiprocessing\spawn.py` 的 `spawn_main`。
+  真机 2026-09-29 报过一次：父进程（09:46 启动的那份）13:52:30 被记成 `AppHangB1` +「已停止与
+  Windows 交互并关闭」，几秒前刚起的子进程弹了这个框，同时新开的一份跑得好好的。
+  `main.py:989` 外面那层 `try/except` 就是治它的：**只吞 winerror 87**，别的 OSError 照旧往上抛
+  ——真出问题时那个框是唯一能看见它的地方。这个框**子进程自己不留任何日志**，回头查只能翻事件日志：
+  `Get-WinEvent -FilterHashtable @{LogName='Application'} | ? Message -match 'jev-chat'`。
 - `app/settings.py` 读 key 时先看进程环境、没有再读注册表：IDE 启动时把环境快照拿走了，
   只靠 `os.environ` 会「保存了下次打开还是没有」。
