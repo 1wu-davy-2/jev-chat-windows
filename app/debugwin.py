@@ -12,7 +12,10 @@ from qfluentwidgets import PlainTextEdit, PushButton
 _KINDS = (("me", "#18794e", "绿", "我"), ("her", "#1f6fd0", "蓝", "对方"),
           ("gray", "#8a8a8a", "灰", "过滤掉的灰字"), ("name", "#e08b18", "橙", "当成发言人名"),
           ("image", "#d0342c", "红", "当成图片丢掉"), ("tiny", "#d4b106", "黄", "小字丢掉"),
-          ("voice", "#c026d3", "紫", "语音消息丢掉"))
+          ("voice", "#c026d3", "紫", "语音消息丢掉"),
+          # 撤回提示：自己撤的整条丢，对方撤的照对方说的话收（见 app/ocr.py 的 _is_recall）
+          ("recall_me", "#9a3412", "褐", "自己撤回，丢掉"),
+          ("recall_her", "#0d9488", "青", "对方撤回，算他说了话"))
 _COLOR = {k: c for k, c, _, _ in _KINDS}
 _NAME = {k: n for k, _, _, n in _KINDS}
 _AREA = "#1f6fd0"  # 消息区

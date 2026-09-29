@@ -35,6 +35,37 @@ _DIGITS = re.compile(r"\d{1,3}")
 # 「(3」这类前括号开头的很常见，别误伤（引号那一段可选，因为引号常常也一起丢）。
 _VOICE_ICON = re.compile(r"[)）\]】|｜]{1,2}\s*\d{1,3}\s*[\"”“″＂'′’‘()（）?？!！|｜]{0,2}")
 
+# 「撤回」提示：微信把「谁撤回了消息」画成一条居中的提示，OCR 照样读得出字，于是被当成一条
+# 真消息。真机上报的是自己撤回那条——「你撤回了一条消息重新编辑」按底色被分成了 **her**
+# （它那个白底提示跟对方的白气泡一个颜色），于是顶着「对方刚说」的名义白触发一次判断，
+# 候选条上还写着「对方刚说 你撤回了一条消息重新编辑」，张冠李戴。
+#
+# 两种分开处理（`_is_recall` 返回 "me" / "her" / ""）：
+#   ① 「你撤回了一条消息[重新编辑]」= 我自己撤的，等于屏幕上什么都没发生 → 整条丢掉；
+#   ② 「"A 阿坤" 撤回了一条消息」= 对方撤的，那是「他本来要说、又收回去了」，算他说了话。
+#
+# **必须 fullmatch**：不然对方真发一句「你撤回了一条消息干嘛」就会被当成系统提示整条吃掉——
+# 少一条真消息比多一条假消息难查得多。宁可漏拦，不能错拦。
+_RECALL_ME = re.compile(r"^你\s*(?:撤回|收回)了一条消息\s*(?:重新编辑)?$")
+# 名字段最多 24 个字符（单聊是「对方」，群里是昵称或「"昵称"」），且整条要以它收尾
+_RECALL_HER = re.compile(r"^.{0,24}?(?:撤回|收回)了一条消息$")
+
+
+def _is_recall(text):
+    """这条是不是「撤回」提示：`"me"` = 我自己撤的（丢掉）、`"her"` = 对方撤的（算他说了话）、
+    `""` = 不是。纯函数，不碰像素，自测直接打表验。
+
+    为什么不看底色：提示是居中画的，可它的白底跟对方的白气泡几乎同色，`who_said` 分不出来
+    （真机上就被判成了 her）。只能按文字认，而且认死了要 fullmatch——见上面两个正则的注释。"""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if _RECALL_ME.match(t):
+        return "me"
+    if _RECALL_HER.match(t):
+        return "her"
+    return ""
+
 
 def _bubble_extent(chat, box, bg):
     """把整个气泡的范围扫出来——OCR 框只框住里面的字，气泡本身比它宽得多。
@@ -256,6 +287,21 @@ class Reader:
             m = {"rect": rect, "kind": kind or "", "text": text, "flat": flat, "ink": h,
                  "bg": None if bg is None else tuple(int(v) for v in bg), "final": kind or ""}
             self.last_metrics.append(m)
+            rec = _is_recall(text)
+            if rec == "me":
+                # 自己撤回的：屏幕上等于什么都没发生。不进 raw（不点火、不进上下文），也不进
+                # 聊天记录——记了界面上就多一条「你撤回了一条消息」的假气泡，看着像对方说了话
+                m["final"] = "recall_me"
+                self.last_boxes.append(rect + ("recall_me", text))
+                continue
+            if rec == "her":
+                # 对方撤回的：算他说了句话。**两道颜色关都绕过去**——提示的白底跟对方的白气泡
+                # 同色，who_said 可能判成 her 也可能判成 gray；字号又比气泡小，后面「小字」
+                # 那道也会吃它。所以这两关都不走，直接照 her 落进 raw。
+                m["final"] = "recall_her"
+                self.last_boxes.append(rect + ("recall_her", text))
+                raw.append(("her", None, text, box[0][1], box[2][1], h))
+                continue
             if (_VOICE.fullmatch(text.strip()) or _VOICE_ICON.fullmatch(text.strip())
                     or (_DIGITS.fullmatch(text.strip()) and _has_icon(chat, box, kind, h))):
                 # 不进 raw（它没有正文，触发判断没意义），但位置记下来：
@@ -456,6 +502,63 @@ if __name__ == "__main__":
     # 前括号开头的不认（「（3）」「(3」这种真消息比「)3」常见），带正文的更不认
     for t in ("（3）", "(3", "3)", "好)3", ")3点见", "）3楼", "3", "8"):
         assert not _VOICE_ICON.fullmatch(t.strip()), t
+
+    # 撤回提示：自己撤的整条丢掉（真机上报的就是这条，被当成「对方刚说」白触发一次判断），
+    # 对方撤的算他说了句话
+    for t in ("你撤回了一条消息", "你撤回了一条消息重新编辑", "你撤回了一条消息 重新编辑",
+              " 你撤回了一条消息 ", "你收回了一条消息"):
+        assert _is_recall(t) == "me", t
+    for t in ("对方撤回了一条消息", '"A 阿坤" 撤回了一条消息', "阿坤撤回了一条消息",
+              "A 阿坤 撤回了一条消息", '"张三"撤回了一条消息', "对方收回了一条消息"):
+        assert _is_recall(t) == "her", t
+    # **必须 fullmatch**：对方真发一句带「撤回了一条消息」的话，不能被当成系统提示整条吃掉
+    # （少一条真消息比多一条假消息难查得多），也不能把「撤回了别的什么」当提示
+    for t in ("你撤回了一条消息干嘛", "你撤回了一条消息吗？", "我撤回了一个想法",
+              "撤回", "你撤回", "他撤回了一条消息然后呢", "", "  ",
+              "你撤回了一条消息" + "啊" * 40, "撒回了一条消息"):
+        assert _is_recall(t) == "", repr(t)
+
+    # read() 里的接线（光验正则不够）：撤回提示得真的被放过去/拦下来，而且要绕过那两道颜色关。
+    # 拿 object.__new__ 绕过 __init__，免得为这几条断言把 40MB 的 OCR 引擎加载起来
+    def _reader(res, lh=13.0):
+        r = object.__new__(Reader)
+        r.ocr = lambda img, **kw: (res, None)
+        r.lh = lh
+        r.seen = []
+        r.last_boxes, r.last_voice, r.last_voice_open, r.seen_voice = [], [], [], []
+        r.last_ms, r.last_metrics = 0, []
+        return r
+
+    def _frame(ink=13, w=400, h=300):
+        """白底 + 框中间一条**细**深色横带当字：众数色 = 白（flat 过半）、墨高 = ink。
+        带子不能填满框——填满了众数色就变成深色，墨高只剩上下两道白边那两行，
+        于是被「小字」那道当成 tiny 吃掉（第一版就这么写错了）。"""
+        f = np.full((h, w, 3), 255, np.uint8)
+        f[20:20 + ink, 10:200] = 40  # 框是 y 10~40，带子只占中间 13 行
+        return f
+
+    _box = [(10, 10), (200, 10), (200, 40), (10, 40)]
+    _white = (255, 255, 255)
+
+    # 自己撤回的：整条不进结果——不点火、不进上下文、也不记聊天记录
+    r = _reader([(_box, "你撤回了一条消息重新编辑", 0.99)])
+    assert r.read(_frame(), _white) == [], "自己撤回的不能被当成一条消息"
+    assert r.last_boxes[-1][4] == "recall_me", r.last_boxes
+    assert r.last_metrics[-1]["final"] == "recall_me", r.last_metrics
+
+    # 对方撤回的：算 her 说了句话。下面这两条都得成立——
+    # ① 走 readonly 的 her 分支（不是被当灰字/小字丢掉）
+    r = _reader([(_box, '"A 阿坤" 撤回了一条消息', 0.99)])
+    assert r.read(_frame(), _white) == [("her", None, '"A 阿坤" 撤回了一条消息', 10)], "对方撤回的要留下"
+    assert r.last_boxes[-1][4] == "recall_her", r.last_boxes
+    # ② 系统提示本来就比气泡字小（lh 抬到 40，墨高 13 够不着 0.6*lh），「小字」那关也不许吃它
+    r = _reader([(_box, "对方撤回了一条消息", 0.99)], lh=40.0)
+    assert r.read(_frame(), _white) == [("her", None, "对方撤回了一条消息", 10)], \
+        "不能被「小字」那道吃掉"
+
+    # 真消息照旧：普通气泡还是一条 her（别把新加的那道拦宽了）
+    r = _reader([(_box, "在吗", 0.99)])
+    assert r.read(_frame(), _white) == [("her", None, "在吗", 10)]
 
     # 「重新识别」的放大重读：坐标要能折回原尺度（框是放大后给的，下游一律按原图算）
     assert _upscale(np.zeros((10, 20, 3), np.uint8), 1).shape == (10, 20, 3)
