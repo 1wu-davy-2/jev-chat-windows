@@ -66,6 +66,7 @@ python core/styles.py       # 场景模板：选项顺序、挑了用挑的那�
 python app/settings.py      # 关系模型：老配置迁移、存盘不丢别的键、按会话读回（写临时目录，不碰本机配置）
 python core/trace.py        # AI 记录库：写读回填清空、类型转换、脱敏、没配库时不建文件
 python core/chatlog.py      # 聊天记录库：写读正序、并语音、90 天留存、脱敏、关掉后不写也不建文件
+python core/paste.py        # 导入：微信复制格式的解析、隐形昵称、正文带空行、who 映射
 python -m app.update        # 版本号比较，monkeypatch urlopen，不联网
 python app/ocr.py           # 语音消息过滤正则 + 「重新识别」的对账 reconcile（都不加载 OCR 引擎）
 python app/capture.py       # 消息区定位：输入框顶那根细横线（合成帧，不截图）
@@ -81,7 +82,7 @@ python tools/preview_ui.py --state settings --screenshot docs/ui_settings.png
 python tools/preview_ui.py --state settings --tab style --screenshot docs/ui_style.png
 # 可用的 --state：ready / waiting / loading / error / degraded / setup / settings / paused /
 #   debug / ime / ime-thinking / pet / pet-menu / bar / voice / log /
-#   opener / opener-bar / opener-loading / opener-blank / history / pinned
+#   opener / opener-bar / opener-loading / opener-blank / history / pinned / import
 # 可用的 --tab：preference / models / style / system（配合 --state settings）
 # （history 会往临时目录写一个演示库，不碰本机那份 jev.db；预览里 core.chatlog
 #   整个被 patch 成假的，同样碰不到本机那份）
@@ -271,6 +272,41 @@ join 出来的碎片反而难读；加字段就往 `_COLUMNS` 里加一条，**�
 默认值是 `not sys.frozen`（**源码跑开、打包版关**）——本地调试不想丢记录，装出去的不默认往磁盘
 写聊天原文。留存 `RETENTION_DAYS = 90`，在 `configure()` 里顺手清一次，不另起定时器
 （搬进来的老数据也一起过一遍，别让它们绕过清理）。
+
+**「导入」是把微信复制出来的聊天记录粘进来当上下文**（面板上「导入」按钮，在「聊天记录」和
+「重新识别」中间）。目的是**仿照说话的语气**——语气只能从聊天记录本身来，所以导入的会
+**同时进三处**：`chats[会话]["history"]`（喂模型）、`Overlay.feeds`（界面气泡）、`chatlog`（库）。
+跟 `apply_reread()` 是同一类入口，少写一处都不行：只写 feeds 的话模型看不见、用户要的
+「仿照语气」不成立；只写 history 的话界面上是空的、重启也读不回来。
+
+解析在 `core/paste.py`（纯字符串，有自测）。微信复制出来的形状是**三行一段、段间空行**：
+昵称 / 时间戳 / 正文。四条容易踩的：
+
+1. **隐形昵称**。真机上见过昵称是五个 `U+3164`（HANGUL FILLER）——它的 Unicode 类别是
+   **`Lo`（字母）不是空白**，所以 `.strip()` 去不掉它、`if not name.strip()` 也判不出它空。
+   `is_blank()` 因此**故意只认真空白类别**：把 `U+3164` 当空行的话昵称整行会被切掉，
+   时间戳顶到第一行，后面全解析不出来。显示另走 `visible()`（把这类字符换成 `·`）。
+   **光显示成 `·` 不够**——几个选项长得一模一样，用户根本挑不出「哪个是我」，
+   所以 `needs_label()` 判出「一个可见字符都没有」的，弹窗里就地摆一个改名输入框
+   （`_ImportBox._rebuild_remarks`），打的名字**实时刷进下拉框**（`_sync_names` 只改文字、
+   **不重建**下拉，重建会把正在打字的输入框弄失焦）。起好的名按 `{会话名: {原昵称: 名字}}`
+   存 `config.json` 的 `chat_remarks`，下次导入同一个会话直接套上。
+   **两层是因为不能只按原昵称存**——两个人可能用同一串隐形字符，跨会话就串味了。
+   落盘走 `save_chat_remark` 单键写（不惊动 `save()` 那套注册表重写），但 `save()` 里
+   **必须带过去**，否则点一次「保存设置」名字就没了（`pet_pos` 就这么丢过）。
+2. **正文里本来就可能带空行**，切歪了的那段要**回填给上一条**当正文续行，不能当新消息。
+3. **昵称 → who 由用户在下拉里挑**，脚本猜不出来（同一个人在不同人眼里角色不同）。
+   `name` 只在群聊里给（单聊时对方的昵称可能是一串隐形字符，喂给模型反而懵）。
+4. 时间戳归一成 `MM-DD HH:MM`——导入的记录跨天，只留 `HH:MM` 跟今天说的话分不出来。
+
+**导入的正文里可能夹着 key**（真机案例：粘进来的对话里有一把中转的 `sk-…`）。落盘和进上下文
+之前都会过 `redact_secrets()`，其中**按形状**那一道就是为这种「别人的 key」加的——
+原来那一步只按值替换 `ENV_VARS` 里本机配过的几把，别人的 key 一声不吭就放行了。
+
+「替换现有记录」勾上才清旧记录（`chatlog.clear_chat`，只清这一个会话，跟设置页那个
+清空全库的 `clear()` 分开）。**代价要认**：清了 `feeds`/`history` 会让 `_already_read` 放行，
+微信屏幕上那几屏下次采集时会重新进来一次——这是「替换」本身的意思，不是 bug
+（跟设置页那个「清空聊天记录」**故意不动内存**正好相反，别把两处的道理弄混）。
 
 **「重新识别」是手动的一遍重读**（面板上「聊天记录」右边那个按钮）。为什么要它：OCR 会吃掉东西
 ——真机上「?」「嗯」这种**单字消息**被整条丢了，还顺带不触发 AI（`new[-1]` 变成了我说的那句，

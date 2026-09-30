@@ -297,6 +297,22 @@ def clear() -> bool:
         return False
 
 
+def clear_chat(chat: str) -> bool:
+    """只清一个会话（导入时勾了「替换现有记录」走这儿）。
+
+    跟 clear() 分开是**故意的**：那个是设置页的「清空聊天记录」，一按全没；
+    这个是导入时顺手清一个会话，不该顺手把别的会话也带走。"""
+    if not _ON or not chat:
+        return False
+    try:
+        with _LOCK, closing(_connect()) as c:
+            c.execute("delete from messages where chat = ?", (_s(chat),))
+            c.commit()
+        return True
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
     # 自测（不联网、不碰真库）：临时目录里建一个，写读、并语音、留存清理、清空。
     import tempfile
@@ -352,6 +368,22 @@ if __name__ == "__main__":
     assert "sk-secret-123456" not in recent("x")[0][1], recent("x")[0][1]
     assert "[REDACTED]" in recent("x")[0][1]
     del os.environ["JEV_API_KEY"]
+
+    # 形状兜底：**本机没配过的** key 也要抹掉。导入聊天记录是最常见的情形——
+    # 粘进来那段对话里带的可能是别人的 key，按值那一步（上面）查不到，会一声不吭放行
+    append("x", "her", "我的 sk-4cz3A03TGwVyMI0fyfNxe3PFCdy4bLItbC5CPoH2SAnpBTQI 你拿去用")
+    got = recent("x")[-1][1]
+    assert "sk-4cz3A0" not in got, got
+    assert "[REDACTED]" in got, got
+    # 正常中文和太短的 sk- 不能误伤
+    append("x", "her", "晚上吃啥 sk-abc")
+    assert recent("x")[-1][1] == "晚上吃啥 sk-abc", recent("x")[-1][1]
+
+    # 按会话清：只动那一个，别的会话不碰（导入时勾「替换现有记录」走这条）
+    assert recent("白金搬砖小分队"), "前提：这个会话里有东西"
+    assert clear_chat("白金搬砖小分队") and recent("白金搬砖小分队") == []
+    assert recent("另一个会话"), "别的会话不该被顺手带走"
+    assert clear_chat("") is False and clear_chat("根本没这个会话") is True
 
     # 留存：超期的开机时清掉，没过期的留着
     old = os.path.join(tempfile.mkdtemp(prefix="jev-chatlog-old-"), "jev.db")

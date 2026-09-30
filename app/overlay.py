@@ -28,7 +28,7 @@ from app.theme import (
     RADIUS_XL, SHADOW_PAD,
 )
 from app.version import VERSION
-from core import chatlog, jev_client, llm, providers, relations, relay, styles
+from core import chatlog, jev_client, llm, paste, providers, relations, relay, styles
 from core.questions import CHOICE_LABELS
 
 _LOG_LINES = 300
@@ -111,6 +111,142 @@ class _ConfirmBox(MessageBoxBase):
         self.viewLayout.addWidget(_label(text, FONT_MD))
         self.yesButton.setText("确定")
         self.cancelButton.setText("取消")
+
+
+class _ImportBox(MessageBoxBase):
+    """导入聊天记录：把微信「复制」出来的那几段文本粘进来，解析成消息行。
+
+    粘进来的是**别人的**对话，里面可能带着 key（真机案例：导入的对话里夹着一把中转的
+    `sk-…`）。这儿只管解析和让用户挑「哪个是我」——脱敏不在这一层做，在 `chatlog` 那个
+    唯一的写库口子上（见 CLAUDE.md 硬约束 6）。
+
+    解析是**边打边做**的：`textChanged` 每动一下就重解析一次，好让「解析出 N 条」和那个
+    下拉框实时跟上。纯字符串操作，几百条也就毫秒级，不用防抖。"""
+
+    def __init__(self, parent, chat):
+        super().__init__(parent)
+        self._rows = []
+        self._names = []
+        self._skipped = 0
+        self._chat = chat
+        # 上次给这个会话起过的名字，这次直接套上，不用重填
+        self._saved = settings.chat_remarks(chat)
+        self._remarkEdits = {}  # {原昵称: LineEdit}，只装「认不出来」的那些
+        self.titleLabel = SubtitleLabel(f"导入到「{chat}」", self)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(_label(
+            "在微信里选中几条消息 → 复制 → 粘到下面。格式是「昵称 / 时间 / 正文」，段间空一行。",
+            FONT_XS, _MUTED))
+        self.textEdit = TextEdit(self)
+        self.textEdit.setPlaceholderText(
+            "昵称\n2026年09月29日 13:58\n晚上吃啥\n\n另一个昵称\n2026年09月29日 13:58\n火锅鸡吧")
+        self.textEdit.setMinimumHeight(170)
+        self.textEdit.setMinimumWidth(430)
+        self.viewLayout.addWidget(self.textEdit)
+
+        row = QHBoxLayout()
+        row.setSpacing(GAP_SM)
+        row.addWidget(_label("哪个是我", FONT_SM))
+        self.meBox = ComboBox()
+        self.meBox.setMinimumWidth(200)
+        row.addWidget(self.meBox, 1)
+        self.viewLayout.addLayout(row)
+
+        # 认不出的昵称（全隐形字符）给一个改名的入口，摆在「哪个是我」**下面**——
+        # 得先知道谁是谁，上面那个下拉才挑得出来。没有这种昵称时这一片是空的，不占地方。
+        self.remarkBox = QVBoxLayout()
+        self.remarkBox.setSpacing(GAP_XS)
+        self.viewLayout.addLayout(self.remarkBox)
+
+        self.replaceBox = CheckBox("替换这个会话现有的聊天记录（不勾就是接在后面）")
+        self.viewLayout.addWidget(self.replaceBox)
+
+        self.summary = _label("把聊天记录粘进来就会自动解析。", FONT_XS, _MUTED)
+        self.summary.setWordWrap(True)
+        self.viewLayout.addWidget(self.summary)
+
+        self.yesButton.setText("导入")
+        self.cancelButton.setText("取消")
+        self.yesButton.setEnabled(False)
+        self.textEdit.textChanged.connect(self._reparse)
+
+    def _label_of(self, raw):
+        """这个昵称显示成什么：用户起的名字优先；没起名就按 `visible()` 把隐形字符
+        画成 `·`——**不能显示原文**，那是一串空白，下拉框里几个选项会长得一模一样。"""
+        edit = self._remarkEdits.get(raw)
+        typed = edit.text().strip() if edit is not None else ""
+        return typed or self._saved.get(raw) or paste.visible(raw)
+
+    def _sync_names(self):
+        """改名之后只刷下拉框的文字，**不重建**——重建会把正在打字的那个输入框弄失焦
+        （每敲一个字符都会走到这儿）。"""
+        for i in range(self.meBox.count()):
+            self.meBox.setItemText(i, self._label_of(self.meBox.itemData(i)))
+        self._update_summary()
+
+    def _update_summary(self):
+        bits = []
+        if self._rows:
+            bits.append(f"解析出 {len(self._rows)} 条")
+        if self._names:
+            bits.append("发言者：" + "、".join(self._label_of(n) for n in self._names))
+        if self._skipped:
+            bits.append(f"{self._skipped} 段认不出来，跳过")
+        self.summary.setText(" · ".join(bits)
+                             or "还没解析出内容——检查一下是不是「昵称 / 时间 / 正文」的格式。")
+
+    def _rebuild_remarks(self, names):
+        """给「认不出来」的昵称摆一排改名输入框。只在集合变了的时候重建。"""
+        for i in reversed(range(self.remarkBox.count())):
+            item = self.remarkBox.takeAt(i)
+            holder = item.widget()
+            if holder is not None:
+                holder.deleteLater()  # 光 removeWidget 不会真删，留在那儿等 GC 会漏一片
+        self._remarkEdits = {}
+        for raw in names:
+            holder = QWidget()
+            line = QHBoxLayout(holder)
+            line.setContentsMargins(0, 0, 0, 0)
+            line.setSpacing(GAP_SM)
+            line.addWidget(_label(f"「{paste.visible(raw)}」认不出是谁，起个名", FONT_XS, _MUTED))
+            edit = LineEdit()
+            edit.setPlaceholderText("比如：我 / 阿杰")
+            edit.setText(self._saved.get(raw, ""))
+            # 先填字再接信号：setText 也会发 textChanged，那会儿下拉框还没建好
+            edit.textChanged.connect(self._sync_names)
+            line.addWidget(edit, 1)
+            self._remarkEdits[raw] = edit
+            self.remarkBox.addWidget(holder)
+
+    def _reparse(self):
+        rows, names, skipped = paste.parse(self.textEdit.toPlainText())
+        self._rows, self._skipped = rows, skipped
+        # 只在发言者变了的时候重建下拉。每敲一个字都重建的话，用户刚选好的「哪个是我」
+        # 会被顶回第一项——正文里随便加个字都会触发 textChanged。
+        if names != self._names:
+            keep = self.meBox.currentData()
+            self._names = names
+            self._rebuild_remarks([n for n in names if paste.needs_label(n)])
+            self.meBox.blockSignals(True)
+            self.meBox.clear()
+            for n in names:
+                self.meBox.addItem(self._label_of(n), userData=n)
+            if keep in names:
+                self.meBox.setCurrentIndex(names.index(keep))
+            self.meBox.blockSignals(False)
+        self._update_summary()
+        self.yesButton.setEnabled(bool(rows) and self.meBox.currentIndex() >= 0)
+
+    def result_rows(self):
+        """`(rows, 哪个是我, 要不要替换, 起过的名字)`。
+
+        rows 的昵称已经换成用户起的名字了——调用方直接喂 `paste.to_messages` 就行。
+        第四个是 `{原昵称: 名字}`，调用方拿它落盘，下次导入不用重填。"""
+        labels = {raw: e.text().strip() for raw, e in self._remarkEdits.items()}
+        rows = [(labels.get(n) or self._saved.get(n) or n, t, s) for n, t, s in self._rows]
+        me = self.meBox.currentData() or ""
+        return rows, (labels.get(me) or self._saved.get(me) or me), \
+            self.replaceBox.isChecked(), {k: v for k, v in labels.items() if v}
 
 
 def _label(text="", size=14, color=None, bold=False, parent=None):
@@ -744,7 +880,7 @@ class Overlay:
                  on_toggle_debug=None, on_voice_convert=None, on_opener_again=None,
                  on_settings_saved=None, on_open_history=None, on_use=None, on_pin_change=None,
                  on_relation_change=None, on_scene_change=None, on_toggle_chatlog=None,
-                 on_reread=None, on_make_shortcut=None):
+                 on_reread=None, on_make_shortcut=None, on_import=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。
@@ -779,6 +915,7 @@ class Overlay:
         self.on_toggle_chatlog = on_toggle_chatlog
         self.on_reread = on_reread
         self.on_make_shortcut = on_make_shortcut
+        self.on_import = on_import
         self.result_of = result_of
         self._voices = {}  # {会话名: [(x0,y0,x1,y1,时长)]}，语音气泡的位置，转文字要右键它
         self._opener = {}  # {会话名: 对方多少分钟没回}，现在摆的是开场白（不是回复）的会话
@@ -1128,6 +1265,16 @@ class Overlay:
         self.historyButton.clicked.connect(self._toggle_history)
         self.historyButton.setAccessibleName("展开或收起聊天记录")
         log_row.addWidget(self.historyButton, 1)
+        # 导入：把微信里「复制」出来的聊天记录粘进来。用户要的是「仿照说话的语气」——
+        # 语气只能从聊天记录本身来，所以导入的会**同时**进 feeds、history 和库
+        # （三处一起写，见 main.import_history）。
+        self.importButton = PushButton("导入")
+        self.importButton.clicked.connect(self._import)
+        self.importButton.setAccessibleName("导入聊天记录")
+        self.importButton.setToolTip(
+            "在微信里选中几条消息复制，粘进来当聊天记录。\n"
+            "导入的对话会进喂给模型的上下文，后面起草会参考这段的语气。")
+        log_row.addWidget(self.importButton, 0)
         # 重新识别：把微信里现在这几屏**整个重读一遍**，跟下面的记录对账——漏掉的补进来、
         # 之前读花了的就地改掉（真机上出现过「?」「嗯」这种单字被 OCR 吃掉、当没说过）。
         # 采集只在画面变过才交帧，点它的时候画面多半早静止了，所以走 Capture 留的那份最近帧
@@ -2436,6 +2583,25 @@ class Overlay:
         if self.on_reread:
             self.on_reread()
 
+    def _import(self):
+        """「导入」按钮。弹窗收文本、解析、挑「哪个是我」，然后把活交给父进程。
+
+        写库写上下文都在父进程（`main.import_history`）——这儿只有界面，拿不到
+        `chats[会话]["history"]`，而那份才是喂模型的东西。"""
+        if not self._shown:
+            self.set_status("导入：先切到一个会话，再导。", "warning")
+            return
+        box = _ImportBox(self, self._shown)
+        if not box.exec():
+            return
+        rows, me, replace, labels = box.result_rows()
+        # 用户给隐形昵称起的名字存下来，下次导入同一个会话直接套上（只在点了「导入」之后存，
+        # 取消不该留下痕迹）。落盘走 save_chat_remark 单键写，不惊动 save() 那套注册表重写。
+        for raw, label in labels.items():
+            settings.save_chat_remark(self._shown, raw, label)
+        if self.on_import:
+            self.on_import(self._shown, rows, me, replace)
+
     def _make_shortcut(self):
         """「创建桌面快捷方式」按钮。写 .lnk 走 COM，那摊子事在 app/shortcut.py + main 那边，
         界面只管叫一声——建成了没有由 main 回写到状态栏。"""
@@ -2518,6 +2684,23 @@ class Overlay:
         if hers:
             self.hers[chat] = hers[-1]
         self._add_chat(chat)
+
+    def reset_feed(self, chat):
+        """清空一个会话的记录（导入时勾了「替换现有记录」才走这儿）。
+
+        **只动内存**——库里那份由调用方单独清（`chatlog.clear_chat`）。这个类里凡是碰库的
+        都从 `log_message` 那条路走，别在这儿开第二个口子（CLAUDE.md「聊天记录」第 1 条）。
+
+        注意它跟设置页那个「清空聊天记录」**方向是反的**：那个故意不动内存，理由是清了
+        `feeds`/`history` 会让 `_already_read` 放行、屏幕上那几屏被当新消息重读一遍。
+        这儿反过来，是非清不可——用户就是要拿导入的那段顶掉现有的。代价一样：屏幕上的
+        实时消息下次采集时会重新进来，那是「替换」这个动作本身的意思，不是 bug。"""
+        self.feeds.pop(chat, None)
+        self.counts.pop(chat, None)
+        self.hers.pop(chat, None)
+        if chat == self._shown:
+            self._render_feed()
+            self._history_title()
 
     def log_message(self, who, text, name="", timestamp=None, chat=None, voice=""):
         """按会话存一份（内存 + 本地库）；只有正在看的那个会往显示区里写。

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import time
 import urllib.error
@@ -34,15 +35,39 @@ class JevError(Exception):
         self.status = status
 
 
+# 各家 key 的固定形状，长的写在前面（alternation 从左往右试，写反了 sk- 会把 sk-or-v1- 截胡）。
+# 结尾那个 (?![A-Za-z0-9_\-]) 是防着贪婪匹配把后面粘着的字一起吃进来。
+# 只认**有前缀**的：没有前缀的裸 token 认不了，硬认会把正常句子也抹了。
+_KEY_SHAPES = re.compile(
+    r"""(?x)
+    \b(?:
+        sk-or-v1-[A-Za-z0-9]{32,}        # OpenRouter
+      | sk-ant-[A-Za-z0-9_\-]{20,}       # Anthropic
+      | sk-[A-Za-z0-9_\-]{16,}           # OpenAI / DeepSeek / 各家 OpenAI 兼容中转
+      | AIza[A-Za-z0-9_\-]{30,}          # Google
+      | gsk_[A-Za-z0-9]{40,}             # Groq
+    )(?![A-Za-z0-9_\-])""")
+
+
 def redact_secrets(text: str) -> str:
-    """Strip every live key from any string before print or disk write."""
+    """把字符串里能认出来的 key 全部抹掉，再打印 / 再落盘。
+
+    两道，**叠加**关系不是替换：
+
+    1. **按值**——本机配置过的那几把（`ENV_VARS` 里的），整串替换。最准，但只认得自己的。
+    2. **按形状**——各家 key 的固定前缀。第一道漏的就是这类：用户从聊天记录里**导入**一段
+       对话进来，里面可能是**别人的** key（真机上出现过：导入的对话里带着一把中转的 `sk-…`），
+       env 里查不到，第一道一声不吭就放行了。
+
+    改这儿先跑 `python core/chatlog.py`（自测里有正反例，不用联网也不碰真库）。
+    """
     if not isinstance(text, str):
         text = str(text)
     for env in ENV_VARS:
         key = os.environ.get(env) or ""
         if key:
             text = text.replace(key, "[REDACTED]")
-    return text
+    return _KEY_SHAPES.sub("[REDACTED]", text)
 
 
 def _status_of(exc: Exception) -> int | None:

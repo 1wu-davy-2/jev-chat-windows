@@ -445,6 +445,9 @@ def save(context_n: int | None = None, *,
         # 配置重写一遍，漏了哪个键就等于把它删了——以前漏了 pet_pos，点一次「保存设置」
         # 宠物下次就跳回默认角落。
         "pet_pos": _load_all().get("pet_pos"),
+        # 「认不出的昵称起的名」也不归这儿管（导入时走 save_chat_remark 单独写），同样
+        # **必须原样带过去**——理由同上，漏了就等于把用户起的名字删了。
+        "chat_remarks": _load_all().get("chat_remarks"),
     }
     with open(_CONFIG, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
@@ -503,6 +506,51 @@ def save_chat_relation(name: str, relation: str) -> None:
 def save_chat_scene(name: str, scene: str) -> None:
     """只更新「这个会话挑了哪一型场景模板」（空串 = 跟随关系），别的字段原样带过去。"""
     _save_spot("chat_scenes", name, scene)
+
+
+def chat_remarks(chat: str) -> dict:
+    """这个会话里「认不出的昵称 → 用户给它起的名字」那张表。
+
+    为什么要有：微信昵称可以是一串**看不见的字符**（真机上见过五个 U+3164，它的 Unicode
+    类别是 Lo 不是空白，`strip()` 去不掉）。导入聊天记录时下拉框里全显示成 `·····`，
+    用户分不出谁是谁，更挑不出「哪个是我」；存进库、喂给模型的 `name` 也是那串隐形字符。
+    让用户起个名，这张表记下来，下次导入同一个会话直接套上，不用重填。
+
+    形状是两层的 `{会话名: {原昵称: 名字}}`——不能只按原昵称存，两个人可能都用同一串
+    隐形字符，跨会话撞上就串味了。"""
+    data = _load_all()
+    all_ = data.get("chat_remarks")
+    if not isinstance(all_, dict):
+        return {}
+    per = all_.get(str(chat))
+    if not isinstance(per, dict):
+        return {}
+    return {str(k): str(v) for k, v in per.items() if str(v).strip()}
+
+
+def save_chat_remark(chat: str, raw: str, label: str) -> None:
+    """记一条「这个隐形昵称叫什么」（空 label = 删掉这格，跟 `_save_spot` 一个口径）。
+
+    别的字段原样带过去：走 save() 的话每次都要把两把 key 重写一遍注册表、再广播一次
+    WM_SETTINGCHANGE，为这个不值当（跟 save_chat_pin / save_pet_pos 一个道理）。"""
+    if not chat or not raw:
+        return
+    data = _load_all()
+    all_ = data.get("chat_remarks")
+    all_ = dict(all_) if isinstance(all_, dict) else {}
+    per = all_.get(str(chat))
+    per = dict(per) if isinstance(per, dict) else {}
+    if str(label).strip():
+        per[str(raw)] = str(label).strip()
+    else:
+        per.pop(str(raw), None)
+    if per:
+        all_[str(chat)] = per
+    else:
+        all_.pop(str(chat), None)  # 一格都不剩就把这个会话也去掉，别留空壳
+    data["chat_remarks"] = all_
+    with open(_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
 
 
 def save_pet_pos(x: int, y: int) -> None:
@@ -572,6 +620,31 @@ if __name__ == "__main__":
     save_chat_scene("张三", "friend")
     assert relation_of("张三") == "workplace" and scene_of("张三") == "friend"
     assert scene_text("张三") == rel.TEXTS["friend"], "挑了场景就用那一型的正文"
+
+    # 隐形昵称起的名字：按「会话 + 原昵称」两层存——同一个隐形昵称在别的会话里可能是
+    # 另一个人，只按原昵称存会串味
+    BLANK = "ㅤ" * 5
+    assert chat_remarks("张三") == {}, "没起过名就是空的"
+    save_chat_remark("张三", BLANK, "阿杰")
+    save_chat_remark("张三", "ya", "我")
+    save_chat_remark("李四", BLANK, "别人")
+    assert chat_remarks("张三") == {BLANK: "阿杰", "ya": "我"}, chat_remarks("张三")
+    assert chat_remarks("李四") == {BLANK: "别人"}, "同一个昵称在别的会话里是另一格"
+    assert chat_remarks("王五") == {}
+    # 空名字 = 删掉这格；删光了连会话那层也去掉，不留空壳
+    save_chat_remark("张三", "ya", "")
+    assert chat_remarks("张三") == {BLANK: "阿杰"}, chat_remarks("张三")
+    save_chat_remark("张三", BLANK, "")
+    assert chat_remarks("张三") == {} and "张三" not in (_load_all().get("chat_remarks") or {})
+    assert chat_remarks("李四") == {BLANK: "别人"}, "删张三那格不该动到李四"
+    save_chat_remark("", BLANK, "x")  # 没会话名，什么都不做
+    assert _load_all().get("chat_remarks") == {"李四": {BLANK: "别人"}}
+
+    # **存一次 save() 不能把备注弄丢**（整个 config 重写，漏了哪个键就等于删了它——
+    # pet_pos 就这么丢过一次）
+    save_chat_remark("张三", BLANK, "阿杰")
+    save(13)
+    assert chat_remarks("张三") == {BLANK: "阿杰"}, "save() 该把 chat_remarks 原样带过去"
     assert relation_of("李四") == "friend", "认不出的键要退回默认，不能是个没名字的型"
     assert relation_of("王五") == "friend" and scene_of("王五") == ""
     assert _load_all()["pet_pos"] == [11, 22]

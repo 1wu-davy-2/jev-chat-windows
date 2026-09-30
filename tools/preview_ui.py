@@ -21,7 +21,8 @@ from core import chatlog, relations, styles
 
 _STATES = ("ready", "waiting", "loading", "error", "degraded", "setup", "settings", "paused",
            "debug", "ime", "ime-thinking", "pet", "pet-menu", "bar", "voice", "log",
-           "opener", "opener-bar", "opener-loading", "opener-blank", "history", "pinned")
+           "opener", "opener-bar", "opener-loading", "opener-blank", "history", "pinned",
+           "import")
 
 # 调试视图预览用的真微信截图（只读进内存，不改不存）；没有就退一张空画面
 _FRAME = Path("/private/tmp/claude-501/-Users-lpitiless-Documents-project-wechatjev"
@@ -150,6 +151,15 @@ _OPENER_BLANK = {**_OPENER, "blank": True, "waited": 0,
                  "best_reply": "嗨，在忙啥呢"}
 _BLANK_CHAT = "新朋友"  # 演示里那个「一句话都没说过」的会话
 
+# 「导入」弹窗预览用的一段**合成**微信复制格式。故意带上一个全是 U+3164 的昵称——
+# 真机上真见过（见 core/paste.py 的 _FILLERS），下拉框里要显示成 `·····` 而不是一片白。
+_IMPORT_DEMO = (
+    "ㅤㅤㅤㅤㅤ\n2026年09月29日 13:58\n晚上吃啥\n\n"
+    "阿杰\n2026年09月29日 13:58\n火锅鸡吧 地锅鸡上次吃了有点咸\n\n"
+    "ㅤㅤㅤㅤㅤ\n2026年09月29日 13:59\n行 我再点杯蜜雪冰城\n\n"
+    "阿杰\n2026年09月29日 13:59\n蜜雪点啥 顺便帮我带一杯\n"
+)
+
 # 「AI 记录」页预览用的两条：一条走完全程的回复、一条起草就挂掉的开场白。
 # 形状跟 main.record_run 写进库的一模一样，dict/list 由 core.trace 自己转 JSON。
 _TRACE_ROWS = (
@@ -256,7 +266,9 @@ def main() -> int:
                      "pet_pos": None,
                      "relay_base_url": "https://中转站.example" if args.relay else "",
                      "relay_judge_path": "/v1/systemone",
-                     "relay_thinking_style": "thinking"}
+                     "relay_thinking_style": "thinking",
+                     # 导入时给隐形昵称起的名：{会话名: {原昵称: 名字}}，只活在内存里
+                     "chat_remarks": {}}
 
     def demo_relations():
         return demo_settings["relations"]
@@ -270,6 +282,17 @@ def main() -> int:
         return styles.resolve(demo_settings["chat_scenes"].get(str(chat or ""), ""),
                               relation=demo_relation_of(chat),
                               relation_texts=d["texts"], customs=d["customs"])
+
+    def demo_chat_remarks(chat):
+        """导入时给隐形昵称起的名，按会话存——跟 settings.chat_remarks 一个形状。"""
+        return dict(demo_settings["chat_remarks"].get(str(chat or ""), {}))
+
+    def demo_save_chat_remark(chat, raw, label):
+        per = demo_settings["chat_remarks"].setdefault(str(chat or ""), {})
+        if str(label or "").strip():
+            per[str(raw)] = str(label).strip()
+        else:
+            per.pop(str(raw), None)
 
     def save_demo_settings(context_n=None, *, jev_provider_text=None, relation_model=None,
                            jev_key_text=None, jev_model_text=None, draft_provider_text=None,
@@ -345,6 +368,9 @@ def main() -> int:
         scene_text=demo_scene_text,
         save_chat_relation=lambda name, key: demo_relations()["chats"].update({name: key}),
         save_chat_scene=lambda name, key: demo_settings["chat_scenes"].update({name: key}),
+        # 导入时给隐形昵称起的名：也只存在内存里那份 demo 设置里，不碰真实 config.json
+        chat_remarks=demo_chat_remarks,
+        save_chat_remark=demo_save_chat_remark,
         context=lambda: demo_settings["context"],
         jev_provider=lambda: demo_settings["jev_provider"],
         jev_model=lambda: demo_settings["jev_model"],
@@ -375,7 +401,7 @@ def main() -> int:
         # create 也一并换掉——真去写 .lnk 就碰用户的桌面了
         shortcut, can_create=lambda: "", create=lambda: ""):
         from PySide6.QtCore import QPoint, QTimer
-        from app.overlay import Overlay
+        from app.overlay import Overlay, _ImportBox
 
         def simulate_fill(text):
             # 等 Overlay 自身的点击反馈结束后，再显示明确的演示提示。
@@ -397,6 +423,14 @@ def main() -> int:
             ov.set_chat(_CHAT)  # 有会话「会话模式」那一项才是亮着的
             shot = ov._build_pet_menu()
             shot.popup(ov.pet.mapToGlobal(QPoint(ov.pet.width() // 2, ov.pet.height() // 2)))
+        elif args.state == "import":
+            # 「导入」弹窗。跟 pet-menu 一个道理：不走 exec()（嵌套事件循环，截图回调
+            # 永远轮不到），只 show() 把对话框摆出来，grab 的就是它自己。
+            # 喂进去的那段是合成的，格式跟微信复制出来的一模一样。
+            box = _ImportBox(ov.win, _CHAT)
+            box.textEdit.setPlainText(_IMPORT_DEMO)
+            box.show()
+            shot = box
         elif args.state == "history":
             # AI 记录窗：合成两条记录（一条正常、一条起草挂了），写进**临时目录**的库里，
             # 不碰本机那份 jev.db。窗口只读，截完就完事。

@@ -24,7 +24,7 @@ from app.fill import fill, press_enter
 from app.ocr import reconcile, similar
 from app.overlay import Overlay
 from app.version import VERSION
-from core import chatlog, trace
+from core import chatlog, paste, trace
 from core.engine import analyze, analyze_opener
 
 # {会话名: {history, result, rev, target, senders}}：每个会话各自的上下文、上次结果和版本号，互不串味
@@ -479,6 +479,44 @@ def apply_reread(title, screen, dropped=(), stats=None):
                   flat, ink))
     if len(missed) > 6:
         ov.log(f"重新识别 · 另有 {len(missed) - 6} 条被丢掉的，没全列")
+
+
+def import_history(title, rows, me, replace):
+    """界面上的「导入」：用户从微信复制来的那段聊天记录，写进这套记录里。
+
+    **三处一起写，少一处都不行**（跟 apply_reread 是同一个道理）：
+      - `chats[title]["history"]` —— 喂模型的上下文。少了它，「仿照说话的语气」就不成立，
+        用户导进来只是给界面看的
+      - `Overlay.feeds` —— 界面那串气泡。走 `log_message`，它顺带把库也写了
+      - `chatlog` —— 落盘。`log_message` 末尾调 `chatlog.append`，那是全工程仅有的两个
+        写库口子之一（别在这函数里再开一个）
+
+    `replace` 勾上时先把这三处的旧记录清掉（库走 `chatlog.clear_chat`，只清这一个会话）。
+
+    注意导入的正文里可能夹着 key（真机案例：那段对话里有一把中转的 `sk-…`）——落盘和
+    进上下文之前都会过 `redact_secrets`，其中**按形状**那一道就是为这种「别人的 key」加的。
+    """
+    if not title:
+        ov.set_status("导入：当前没有在看会话", "warning")
+        return
+    msgs = paste.to_messages(rows, me, keep_name=True)
+    if not msgs:
+        ov.set_status("导入：没解析出消息", "warning")
+        return
+    chat = chat_of(title)
+    if replace:
+        chat["history"].clear()
+        ov.reset_feed(title)
+        chatlog.clear_chat(title)
+    for who, text, name, stamp in msgs:
+        chat["history"].append((who, text, name))
+        ov.log_message(who, text, name or "", stamp, chat=title)
+    # 导进来的东西不该立刻触发一次模型调用——用户是在整理记录，不是来了新消息
+    chat["rev"] = chat.get("rev", 0) + 1
+    ov.set_status(f"导入：{len(msgs)} 条已写入「{title}」"
+                  + ("（替换了原有记录）" if replace else ""), "success")
+    ov.log(f"导入 · {len(msgs)} 条 · 发言者我={paste.visible(me) or '（空）'}"
+           + (" · 已替换原有记录" if replace else ""))
 
 
 def set_chatlog(on):
@@ -1017,7 +1055,7 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
                  on_use=mark_used, on_pin_change=set_pin,
                  on_relation_change=set_relation, on_scene_change=set_scene,
                  on_toggle_chatlog=set_chatlog, on_reread=reread_now,
-                 on_make_shortcut=make_shortcut,
+                 on_make_shortcut=make_shortcut, on_import=import_history,
                  result_of=lambda t: chats.get(t, {}).get("result"))
     restore_log()  # 先把上次的记录接回来，再摆固定会话、再开采集（顺序有讲究，见函数里）
     if state["pin"]:
