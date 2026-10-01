@@ -37,6 +37,12 @@ cankao/goutoujunshi/
 cankao/goutoujunshi-jev/
 cankao/goutoujunshi-jev-chat/
 cankao/wenyan/
+cankao/jev-chat-jarvis/
+# 知识库 + 分条发送那一批（2026-09-30 克隆）
+cankao/astrbot/
+cankao/cowagent/
+cankao/langbot/
+cankao/kourichat/
 
 # grok-ui：Grok 生成的设计稿原型（React + Tailwind），只当 UI 重构的参考，不是本项目的运行时代码
 # 只忽略构建产物和 Grok 的工作区脚手架；src/ public/ screenshots/ 这些设计本体照常提交
