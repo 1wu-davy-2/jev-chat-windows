@@ -104,14 +104,16 @@ _GROUP = "白金搬砖小分队"
 _SENDERS = ("阿杰", "陈与小金")  # 最近说话的排最前，跟 main.py 那边一个口径
 
 _RESULT = {
+    # 第二条（推荐那条）故意写成**多轮**的：几句连着发的消息在候选里用 \n 分隔，卡片上摆成
+    # 两行、标「连发 2 条」、按钮写「填入 1/2」——预览和截图要能看出这个形状（见 core/draft.lines）
     "candidates": [
         "周六六点没问题，上次那家见～",
-        "可以呀，周六六点在上次那家见！我也有点馋了 😋",
+        "可以呀，周六六点在上次那家见\n我早点到，占个靠窗的位子",
         "好呀，就周六六点！需要我先订个位吗？",
     ],
     # 推荐故意放在第二项，方便检查视觉排序和按钮对应关系。
     "best_index": 1,
-    "best_reply": "可以呀，周六六点在上次那家见！我也有点馋了 😋",
+    "best_reply": "可以呀，周六六点在上次那家见\n我早点到，占个靠窗的位子",
     "scores": [0.21, 0.66, 0.13],
     "answers": {
         "literal_question": {"type": "noul", "noul": 0.98},
@@ -225,13 +227,15 @@ def main() -> int:
                         help="设置页停在哪个页签（配合 --state settings）")
     parser.add_argument("--relay", action="store_true",
                         help="演示第三方中转那组字段（地址 / 判断接口路径 / 思考开关的传法）")
+    parser.add_argument("--round", type=int, default=0, metavar="N",
+                        help="多轮候选翻到第 N 条（从 1 数；演示数据里「推荐回复」那条才是多轮的）")
     args = parser.parse_args()
     target = Path(args.screenshot).expanduser() if args.screenshot else None
 
     # 演示里：判断走 OpenRouter，起草走 DeepSeek 官网；全程就两把 key，都当「已配置」。
     # --relay 换成两边都走第三方中转，把那一组字段露出来（地址是编的，不会联网）。
     configured = "" if args.state == "setup" else "demo-key"
-    demo_settings = {"context": 30,
+    demo_settings = {"context": 30, "reply_rounds": 2,
                      # 关系模型：默认朋友；_CHAT 单独指定成「同事」（面板上那个下拉要看出是**按会话**的）；
                      # 内置那型有一条改过的、外加一条自建的，设置页两种状态都截得到
                      "relations": {"default": "friend",
@@ -302,9 +306,11 @@ def main() -> int:
                            relay_base_url_text=None, relay_judge_path_text=None,
                            relay_thinking_style_text=None, pet_enabled_on=None,
                            opener_on=None, opener_minutes_n=None, history_on=None,
-                           chatlog_on=None, auto_send_on=None):
+                           chatlog_on=None, auto_send_on=None, rounds_n=None):
         if context_n is not None:
             demo_settings["context"] = context_n
+        if rounds_n is not None:
+            demo_settings["reply_rounds"] = rounds_n
         if opener_minutes_n is not None:
             demo_settings["opener_minutes"] = opener_minutes_n
         if relation_model is not None:
@@ -372,6 +378,7 @@ def main() -> int:
         chat_remarks=demo_chat_remarks,
         save_chat_remark=demo_save_chat_remark,
         context=lambda: demo_settings["context"],
+        reply_rounds=lambda: demo_settings["reply_rounds"],
         jev_provider=lambda: demo_settings["jev_provider"],
         jev_model=lambda: demo_settings["jev_model"],
         draft_provider=lambda: demo_settings["draft_provider"],
@@ -467,6 +474,8 @@ def main() -> int:
             ov.show(_DEGRADED if degraded else _RESULT)
             if not degraded:  # degraded 那句状态栏是 show() 自己写的，别盖掉
                 ov.set_status("演示模式：已生成 3 条建议，点击填入仅模拟操作。", kind="success")
+            if args.round > 1:  # 翻到第 N 条看看长什么样（--round 2 就是第二句）
+                ov._set_round(args.round - 1)
             ov.set_update("9.9.9", "https://github.com/jev-chat/jev-chat-windows/releases/latest")
             if args.state == "loading":
                 ov.set_busy(True)

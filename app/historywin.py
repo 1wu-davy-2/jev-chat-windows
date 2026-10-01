@@ -74,6 +74,12 @@ def _blank(text) -> str:
     return text if text.strip() else "—"
 
 
+def _inline(text) -> str:
+    """候选里的换行换成 ⏎。那是「回复轮数」> 1 时**连着发的几条**（见 core/draft.lines），
+    直接让它换行的话，缩进和后面的百分比会跟下一条候选糊在一起分不清谁是谁。"""
+    return str(text or "").replace("\n", " ⏎ ")
+
+
 def _head(title: str, row: dict, side: str) -> str:
     """一节的开头那行：「══ 起草（deepseek / deepseek-flash · 3.2s · 输入 812 / 输出 96 tok）══」。
     token、思考模式这些不一定有，缺了就不写，别摆个 0 出来。"""
@@ -123,7 +129,7 @@ def _lines(row: dict) -> list[str]:
     cands = _loads(row.get("candidates"), [])
     if cands:
         out += ["", f"── 出口过滤之后的候选（{len(cands)} 条）──"]
-        out += [f"  {i}. {c}" for i, c in enumerate(cands, 1)]
+        out += [f"  {i}. {_inline(c)}" for i, c in enumerate(cands, 1)]
     dropped = _loads(row.get("draft_dropped"), [])
     if dropped:
         out += ["", f"── 被出口过滤扔掉的（{len(dropped)} 条：重复、或跟对方原话一模一样）──"]
@@ -154,14 +160,15 @@ def _lines(row: dict) -> list[str]:
     mark = "（推荐）" if row.get("ranked") else "（没排序，按起草顺序摆的）"
     for i, c in enumerate(cands):
         pct = f"  {round(float(scores[i]) * 100)}%" if i < len(scores) and scores[i] else ""
-        out.append(f"  {i + 1}. {c}{pct}" + (mark if i == row.get("best_index") else ""))
+        out.append(f"  {i + 1}. {_inline(c)}{pct}" + (mark if i == row.get("best_index") else ""))
     out += ["", "══ 人最后用了哪条 ══"]
     if row.get("used_action"):
         # 认不出的动作原样打出来，别再退回「复制」——那会把「自动发送」说成复制（加新动作时
         # 记得往 _USED_LABELS 里加一条，不然就是这句兜底在显示 raw 值）
         out.append(f"  {_clock(row.get('used_at'))} "
                    + _USED_LABELS.get(row["used_action"], row["used_action"])
-                   + f"第 {(row.get('used_index') or 0) + 1} 条：{_blank(row.get('used_text'))}")
+                   + f"第 {(row.get('used_index') or 0) + 1} 条："
+                   + _inline(_blank(row.get("used_text"))))
     else:
         out.append("  （没用这一轮的候选——自己手打的，或者这轮被后来的消息顶掉了）")
     return out

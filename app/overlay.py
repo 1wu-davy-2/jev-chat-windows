@@ -28,7 +28,7 @@ from app.theme import (
     RADIUS_XL, SHADOW_PAD,
 )
 from app.version import VERSION
-from core import chatlog, jev_client, llm, paste, providers, relations, relay, styles
+from core import chatlog, draft, jev_client, llm, paste, providers, relations, relay, styles
 from core.questions import CHOICE_LABELS
 
 _LOG_LINES = 300
@@ -413,21 +413,86 @@ class _MainWindow(QWidget):
         self._relayout(event.size().width(), event.size().height())
 
 
+class _RoundTabs(QWidget):
+    """面板顶部的轮次切换：多轮候选才出现，点数字翻看第几条。
+
+    **三张卡片一起翻**——切换按钮在面板顶部（「对方最近说」那一行右边），不是每张卡片各管各的
+    （2026-10-01 定的）。轮数不够的候选摆它最后一条：不空着，也不重复摆一遍。
+    没有多轮候选时整块藏起来，单条候选的面板跟以前一模一样——**除非**设置里开着多轮而这一轮
+    AI 全给的是一句，那时摆一句 hint（「AI 建议回复一轮」）：不摆的话那块空着，用户分不清是
+    AI 判断不用多轮、还是这个功能没生效。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.on_pick = None  # 点了第几条（从 0 起）
+        self._count = 0
+        self._current = 0
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(GAP_XS)
+        self.buttons = []
+        for i in range(settings.ROUNDS_MAX):  # 候选最多几条，跟设置里那个控件同一个上限
+            button = QPushButton(str(i + 1), self)
+            button.setFixedSize(20, 20)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setAccessibleName(f"看第 {i + 1} 条")
+            button.clicked.connect(lambda _=False, n=i: self.pick(n))
+            row.addWidget(button)
+            self.buttons.append(button)
+        self.hint = _label("", FONT_XS, _MUTED)
+        row.addWidget(self.hint)
+        self.hide()
+
+    def pick(self, n):
+        if n != self._current and self.on_pick:
+            self.on_pick(n)
+
+    def set_rounds(self, count, current, hint=""):
+        """count = 最长的那个候选有几条。<= 1 时：hint 非空就摆 hint，空就整块藏起来。"""
+        self._count, self._current = count, current
+        if count <= 1:
+            for button in self.buttons:
+                button.hide()
+            self.hint.setText(hint)
+            self.hint.setVisible(bool(hint))
+            self.setVisible(bool(hint))
+            return
+        self.hint.hide()
+        for i, button in enumerate(self.buttons):
+            button.setVisible(i < count)
+            on = i == current
+            bg = theme.SAGE if on else "transparent"
+            button.setStyleSheet(
+                f"QPushButton {{ background: {bg}; border: none; border-radius: {RADIUS_SM}px; "
+                f"color: {theme.PAPER if on else _MUTED}; font-weight: 600; }}"
+                f"QPushButton:hover {{ background: {theme.SAGE if on else theme.CREAM}; }}"
+            )
+        self.show()
+
+
 class _ReplyCard(_Surface):
     def __init__(self, owner, index, recommended=False, number=1, score=None):
         super().__init__(accent=recommended)
+        self.owner = owner
+        self.index = index
         box = QVBoxLayout(self)
         self.box = box
         box.setSpacing(GAP_SM)
+        # 「回复轮数」> 1 时一个候选可能是几句**连着发**的消息（之间用 \n 分隔，见 core/draft.lines）：
+        # 标题里标一句「连发 N 条」，正文只摆当前这一轮（翻页在面板顶部的 _RoundTabs），
+        # 按钮写「填入 1/N」
+        self.parts = draft.lines(owner.cands[index]) or [owner.cands[index]]
         top = QHBoxLayout()
         label = "推荐回复" if recommended else f"备选 {number}"
+        if len(self.parts) > 1:
+            label += f" · 连发 {len(self.parts)} 条"
         if score is not None:
             label += f" · {round(score * 100)}%"
         top.addWidget(_label(label, FONT_XS, _ACCENT if recommended else _MUTED, True))
         self.copyButton = _tool(FIF.COPY, "复制这条回复", lambda: owner._copy(index), self)
         top.addWidget(self.copyButton)
         box.addLayout(top)
-        self.text = _label(owner.cands[index], FONT_LG)
+        self.text = _label("", FONT_LG)  # 内容由 set_round 填：只摆当前那一轮
         self.text.setTextInteractionFlags(Qt.TextSelectableByMouse)
         box.addWidget(self.text)
         bottom = QHBoxLayout()
@@ -438,10 +503,20 @@ class _ReplyCard(_Surface):
         bottom.addWidget(self.fillButton)
         box.addLayout(bottom)
         self.set_compact(owner._compact)
+        self.set_round(owner._round_view)
 
     def set_available(self, enabled):
         self.fillButton.setEnabled(enabled)
         self.copyButton.setEnabled(enabled)
+
+    def set_round(self, n):
+        """摆第 n 条（从 0 起；超出就摆最后一条），按钮文字跟着走。
+
+        几条**不再堆在一页上**：多轮候选只显示当前这一轮，翻看在面板顶部（三个候选一起翻）。
+        单条候选（绝大多数）永远是「填入」，跟以前一模一样。"""
+        n = min(n, len(self.parts) - 1)
+        self.text.setText(self.parts[n])
+        self.fillButton.setText(f"填入 {n + 1}/{len(self.parts)}" if len(self.parts) > 1 else "填入")
 
     def set_compact(self, compact):
         self.box.setContentsMargins(*(GAP_MD, GAP_SM, GAP_MD, GAP_SM) if compact
@@ -666,8 +741,9 @@ class _CandidateBar(QWidget):
 
     def set_items(self, items, suggest, phase, heard="", voice="", opener=False, blocked=False,
                   blank=False):
-        """items: [(候选原始下标, 序号, 正文, 百分比或 None, 是否推荐)]；voice 非空 = 这条会话
-        有语音消息，这时把「转文字」那一块顶上来，候选行让位。
+        """items: [(候选原始下标, 序号, 正文, 百分比或 None, 是否推荐, meta 后缀)]；voice 非空 =
+        这条会话有语音消息，这时把「转文字」那一块顶上来，候选行让位。
+        末项是给多轮候选标「连发 N 条」用的（条子只有一行宽，摆不下第二句），空串就是不标。
 
         下标要带着走：行是按显示位置摆的，但点下去填的必须是那条候选本身。
 
@@ -713,12 +789,12 @@ class _CandidateBar(QWidget):
         self.againButton.setVisible(ready and opener)
         for i, row in enumerate(self.rows):
             if ready and i < len(items):
-                index, number, text, score, recommended = items[i]
+                index, number, text, score, recommended, extra = items[i]
                 # 用 number（1 起）不用行号：行号从 0 数，跟左边那个序号方块对不上
                 meta = ("推荐回复" if recommended else f"备选 {number}")
                 if score is not None:
                     meta += f" · {round(score * 100)}%"
-                row.set_content(index, text, meta, number, recommended)
+                row.set_content(index, text, meta + extra, number, recommended)
                 row.show()
             else:
                 row.hide()
@@ -986,6 +1062,12 @@ class Overlay:
         self._shown = ""  # 界面上正在看的会话（浏览、固定时和上面不一样）
         self._pinned = ""  # 固定盯着哪个会话（"" = 跟随微信切）。父进程那份是准的，这里只是镜像
         self._ordered = []  # [(candidates 里的原始索引, 百分比, 是否推荐)]，按推荐顺序排好
+        # 现在翻到第几条（从 0 数）：「回复轮数」> 1 时三张卡片一起翻，见 _RoundTabs
+        self._round_view = 0
+        # {候选原始下标: 这条已经填过几条}（0/缺 = 没填过）。只服务一件事：候选作废之后
+        # 判断「这条多轮还没填完」——自己刚填进去那条被 OCR 读回来会让候选作废，
+        # 不认这个的话「点一次填一条」到第二条就点不动了。**作废时不清**，新一批候选才清
+        self._fill_round = {}
         self._answers = {}  # 上一次判断的 7 道题答案，候选条和面板共用
         self._errorDetail = ""  # 最近一次失败的原文，「查看详情」里显示它
         self._phase = "idle"  # 流水线状态，由 main.py 派生后经 set_phase() 推进来
@@ -1241,7 +1323,14 @@ class Overlay:
         context_box.setSpacing(GAP_XS)
         # 开场白下这里摆的是「上次聊到哪儿」而不是刚收到的话，见 show()
         self.contextTitle = _label("对方最近说", FONT_XS, _MUTED)
-        context_box.addWidget(self.contextTitle)
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.addWidget(self.contextTitle, 1)
+        # 多轮候选的翻页按钮就摆在这一行右边（没有多轮候选时整块藏起来）
+        self.roundTabs = _RoundTabs(self.context)
+        self.roundTabs.on_pick = self._set_round
+        title_row.addWidget(self.roundTabs, 0, Qt.AlignRight)
+        context_box.addLayout(title_row)
         self.latest = _label("", FONT_MD, theme.INK)
         self.latest.setTextInteractionFlags(Qt.TextSelectableByMouse)
         context_box.addWidget(self.latest)
@@ -1394,7 +1483,19 @@ class Overlay:
         context_label.setBuddy(self.contextBox)
         box.addWidget(self.contextBox)
         box.addWidget(self._hint(
-            "生成和判断时看最近这么多条消息。太少会丢上下文，太多会稀释重点，建议 6–12。"
+            "生成和判断时看最近这么多条消息。太少会丢上下文，太多会稀释重点。"
+        ))
+        rounds_label = _label("回复轮数", FONT_MD)
+        box.addWidget(rounds_label)
+        self.roundsBox = SpinBox()
+        self.roundsBox.setRange(1, 3)
+        self.roundsBox.setLocale(QLocale.c())  # 跟上面同理：Qt 的 zh_CN 会把数字显示成杭州码子
+        self.roundsBox.setAccessibleName("一个候选最多连着发几条消息")
+        rounds_label.setBuddy(self.roundsBox)
+        box.addWidget(self.roundsBox)
+        box.addWidget(self._hint(
+            "一个候选里最多连着发几条消息。1 = 一句一回；大于 1 时模型会把「接着想说的那句」"
+            "也写进同一个候选，填入时点一次填一条，发出去再点下一条。"
         ))
         target_row = QHBoxLayout()
         target_row.addWidget(_label("群聊指定回复对象", FONT_MD), 1)
@@ -1878,6 +1979,7 @@ class Overlay:
         self._relShown = ""
         self._fill_rel_boxes(model["default"], model["default"])
         self.contextBox.setValue(settings.context())
+        self.roundsBox.setValue(settings.reply_rounds())
         self.targetSwitch.setChecked(settings.reply_target())
         self.openerBox.setValue(settings.opener_minutes())
         self.openerSwitch.setChecked(settings.opener())
@@ -1958,6 +2060,7 @@ class Overlay:
                 return
         try:
             settings.save(self.contextBox.value(),
+                          rounds_n=self.roundsBox.value(),
                           relation_model=relation_model,
                           jev_provider_text=jev_provider,
                           jev_key_text=self.jev.keyEdit.text().strip() or None,
@@ -2237,7 +2340,7 @@ class Overlay:
             self.on_use(index, action)
 
     def _fill(self, index):
-        if self._busy or not self._current or index >= len(self.cands):
+        if self._busy or not self._shown or index >= len(self.cands):
             return
         if self._shown != self._chat:
             # 微信屏幕上开着的不是面板里这个会话，按下去会把话打进另一个人的输入框。
@@ -2245,9 +2348,19 @@ class Overlay:
             # 固定那个会话的候选，微信可能早切走了。复制不受影响（剪贴板不发给谁）。
             self.set_status(self._offline_note(), "warning")
             return
+        if not self._fillable(index):
+            return  # 候选已经作废、又不在多轮中间：这条旧建议不再往输入框里送
+        # 「回复轮数」> 1 时这一条候选是几句连着发的消息：填的是**现在翻到的那一条**，
+        # 填完自动翻到下一轮，发出去再点一下就是下一条。**不跨轮跳**：fill() 是追加到输入框
+        # 末尾的，上一条还没发出去就接着填下一条，两条会串成一条。
+        parts = draft.lines(self.cands[index]) or [self.cands[index]]
+        n = min(self._round_view, len(parts) - 1)
         try:
-            self.on_fill(self.cands[index])
+            self.on_fill(parts[n])
             self._used(index, "fill")
+            # 记下「这条填到第几条」：候选接下来多半会因为这条被读回来而作废，
+            # 到时候靠它认出「还有下一句没发」并放行（见 _fillable）
+            self._fill_round[index] = n + 1
         except Exception as e:
             # 状态栏保持友好文案；真实原因和压缩堆栈进聊天记录，认得出是哪一步炸的
             import traceback
@@ -2255,7 +2368,26 @@ class Overlay:
             self.log(f"[填入失败] {type(e).__name__}: {e}")
             self.log(f"[填入失败堆栈] {' '.join(traceback.format_exc().split())[:300]}")
             return
-        self.set_status("已尝试填入，请确认内容后发送。", "success")
+        if len(parts) > 1 and n + 1 < self._round_max():
+            self._set_round(n + 1)  # 还有下一句：自动翻过去，用户接着点「填入」就行
+            self.set_status(f"已填入第 {n + 1}/{len(parts)} 条，发出去后再点「填入」接着下一条。",
+                            "success")
+        else:
+            self.set_status("已尝试填入，请确认内容后发送。", "success")
+
+    def _round_max(self):
+        """这批候选里最长的那条有几条消息 = 顶部翻页按钮有几个。"""
+        return max((len(draft.lines(c)) for c in self.cands), default=1) or 1
+
+    def _set_round(self, n):
+        """翻到第 n 条（从 0 起）：三张卡片和候选条一起翻，顶部的按钮跟着高亮。
+
+        按钮在面板顶部（_RoundTabs），**三个候选一起翻**——不是每张卡片各管各的。"""
+        self._round_view = n
+        for card in self.cards:
+            card.set_round(n)
+        self.roundTabs.set_rounds(self._round_max(), n)
+        self._sync_bar()
 
     def _copy(self, index):
         if self._busy or not self._current or index >= len(self.cands):
@@ -2264,16 +2396,29 @@ class Overlay:
         self._used(index, "copy")
         self.set_status("回复已复制，可粘贴并修改。", "success")
 
-    def _fillable(self):
+    def _fillable(self, index=None):
         """现在能不能把候选填进去：有候选、不在生成中，而且**微信屏幕上开着的正是面板里这个会话**。
 
         最后一条是固定模式带出来的：微信切走之后候选还摆在面板上，按钮看着能点，一点却打进
-        别人的输入框。填不了的时候按钮就灰着（_sync_fillable），点候选条那条路走 _fill 里那道拦。"""
-        return bool(self._current) and not self._busy and bool(self._shown) and self._shown == self._chat
+        别人的输入框。填不了的时候按钮就灰着（_sync_fillable），点候选条那条路走 _fill 里那道拦。
+
+        index 非空 = 按那一张卡片算：候选已经作废（标题变「上次建议」）但**这条多轮还没填完**的
+        放行。自己刚填进去的那条会被 OCR 读回来当成新消息，一路走到 invalidate_replies——
+        不放行的话「点一次填一条」到第二条就点不动了（真机上报过：Ctrl+1 第二次没反应）。
+        判据是「这条填过、而且还没填到最后一条」，不是「全局翻到了第几轮」：
+        不然单条候选那张也跟着放行，作废的旧建议又能填了。"""
+        if self._busy or not self._shown or self._shown != self._chat:
+            return False
+        if self._current:
+            return True
+        if index is None or index >= len(self.cands):
+            return False
+        parts = draft.lines(self.cands[index]) or [self.cands[index]]
+        return 0 < self._fill_round.get(index, 0) < len(parts)
 
     def _sync_fillable(self):
         for card in self.cards:
-            card.set_available(self._fillable())
+            card.set_available(self._fillable(card.index))
 
     def _offline_note(self):
         """微信开着的不是面板里这个会话，说清楚为什么填不了、怎么才能填。
@@ -2370,7 +2515,9 @@ class Overlay:
         if self.cands:
             self.updated.setText("上次建议")
         for card in self.cards:
-            card.set_available(False)
+            # 按卡片算，不是一律灰掉：多轮填到一半的那张要留着能点（见 _fillable）。
+            # _round_view 不清——它正是「填到一半」的唯一凭据
+            card.set_available(self._fillable(card.index))
         # 候选条跟着清空：新消息一来，旧候选就不该再摆在宠物旁边了
         self._ordered = []
         self._opener.pop(self._shown, None)  # 这批开场白不算数了，「换一批」跟着收掉
@@ -2430,8 +2577,14 @@ class Overlay:
 
     def _sync_bar(self):
         """把紧凑候选条刷成和面板一致。两边共用 self.cands / self._ordered，不新增数据流。"""
-        items = [(index, position + 1, self.cands[index], score, recommended)
-                 for position, (index, score, recommended) in enumerate(self._ordered)]
+        items = []
+        for position, (index, score, recommended) in enumerate(self._ordered):
+            parts = draft.lines(self.cands[index]) or [self.cands[index]]
+            # 条子只有一行宽：多轮的候选摆**当前翻到的那条**（跟面板一致），meta 里标一句
+            # 「连发 N 条」，其余几条去面板上翻
+            items.append((index, position + 1, parts[min(self._round_view, len(parts) - 1)],
+                          score, recommended,
+                          f" · 连发 {len(parts)} 条" if len(parts) > 1 else ""))
         # 开场白：头上那句不能再用「对方刚说 X」（那挂的是上一条对方的文字消息，摆在这儿
         # 像是刚收到的），改成「对方还没回 + 隔了多久」。生成中那次也算——见 set_busy。
         # 只在 thinking/ready 两态这么摆：notify 是「对方刚来消息」，那会儿说「还没回」就是撒谎。
@@ -2457,6 +2610,18 @@ class Overlay:
             heard = self.hers.get(self._shown) or ("" if self._pinned else self.hers.get(self._chat)) or ""
         self.bar.set_items(items, self._suggest_text() if items else "", self._phase, heard,
                            self._voice_text(), opener=opener, blocked=frozen, blank=blank)
+        # 顶部的翻页按钮也跟着刷（它是候选级的，跟候选条同一个节奏：候选空了就藏起来）。
+        # 放在这儿是因为 _sync_bar 已经是「面板状态变了就刷一遍」的出口
+        self.roundTabs.set_rounds(self._round_max(), self._round_view, self._round_hint())
+
+    def _round_hint(self):
+        """设置里开着多轮（> 1）、但这一轮 AI 全给的是一句时，那一块摆这句。
+
+        空着的话用户没法判断是 AI 觉得不用连着说、还是新功能压根没生效（2026-10-01 提的）。
+        设置是 1 时不摆——那会儿「一轮」本来就是常态，没什么可说的。"""
+        if not self.cands or self._round_max() > 1:
+            return ""
+        return "AI 建议回复一轮" if settings.reply_rounds() > 1 else ""
 
     def set_phase(self, phase):
         """main.py 派生出来的流水线状态。同态重复调用是空操作，否则每 50ms 重放一次会闪。"""
@@ -3068,6 +3233,8 @@ class Overlay:
             self.updated.setText("")
             self._opener.pop(self._shown, None)
             self._empty_text()
+            self._round_view = 0  # 没候选了，翻页按钮跟着收掉（_round_max 也回到 1）
+            self.roundTabs.set_rounds(1, 0)
         if self._shown != self._chat:
             self.invalidate_replies()
             self.set_status(self._offline_note())
@@ -3082,6 +3249,10 @@ class Overlay:
         self.set_busy(False)
         self._current = bool(self.cands)
         self._clear_cards()
+        # 新的一批候选：从第一轮看起、谁都没填过。**必须在建卡片之前清**——
+        # _ReplyCard 构造时就会读它决定摆第几条、按钮写「填入 1/3」还是别的
+        self._round_view = 0
+        self._fill_round = {}
         self._note_trouble(result.get("trouble"))  # 这次成了/没成，都把上一次的报错收掉
         best = result.get("best_index", 0)
         if not result.get("ranked", True):  # 老结果没这个键，按「排过序」处理

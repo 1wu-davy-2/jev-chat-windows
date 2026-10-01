@@ -24,7 +24,7 @@ from app.fill import fill, press_enter
 from app.ocr import reconcile, similar
 from app.overlay import Overlay
 from app.version import VERSION
-from core import chatlog, paste, trace
+from core import chatlog, draft, paste, trace
 from core.engine import analyze, analyze_opener
 
 # {会话名: {history, result, rev, target, senders}}：每个会话各自的上下文、上次结果和版本号，互不串味
@@ -240,6 +240,11 @@ def target_of(title):
     return chat["senders"][0] if chat["senders"] else None
 
 
+# 连发多条时，两条之间的间隔。第一条的回车得等微信处理完（消息发出去、输入框清空），
+# 上一条还没落地就往里粘下一条的话，两条会挤进同一个输入框、被当成一条发出去。
+_SEND_GAP = 0.25
+
+
 def fill_reply(text, send=False):
     """把文字填进微信输入框。`send=True` 时填完再敲一下回车，把消息真发出去。
 
@@ -277,7 +282,10 @@ def auto_send_reply(title, r):
     ④ 采集没停——暂停就是「先别管我」，跟冷场开场白那条一个口径。
 
     异常一律吞掉只记日志：这是旁路，不能因为我这儿出岔子把 tick 带崩。
-    发完刻意把话说死「可在微信里撤回」，别让状态栏读起来像「已经处理妥当、不用管了」。"""
+    发完刻意把话说死「可在微信里撤回」，别让状态栏读起来像「已经处理妥当、不用管了」。
+
+    「回复轮数」> 1 时这条候选是几句连发的消息，**逐条填、逐条回车**（微信里就是挨着的几个
+    气泡，跟人手动连发一样）——发送仍然只走 press_enter 那一个口，只是多按几次。"""
     if not settings.auto_send():
         return
     if r.get("opener"):
@@ -295,15 +303,24 @@ def auto_send_reply(title, r):
     if not (0 <= index < len(cands)) or not cands[index].strip():
         ov.log("[自动发送] 这一轮没有可发的候选")
         return
+    parts = draft.lines(cands[index]) or [cands[index]]
+    sent = 0
     try:
-        fill_reply(cands[index], send=True)
+        for i, part in enumerate(parts):
+            if i:
+                time.sleep(_SEND_GAP)
+            fill_reply(part, send=True)
+            sent = i + 1
     except Exception as e:
         ov.set_status("自动发送失败，请确认聊天窗口可用。", "error")
-        ov.log(f"[自动发送失败] {type(e).__name__}: {e}")
+        ov.log(f"[自动发送失败] 连发 {len(parts)} 条，只发出 {sent} 条：{type(e).__name__}: {e}")
         return
     mark_used(index, "auto")  # 记进 AI 记录：这一轮用的是「自动发送」，不是人点的
-    ov.log(f"[自动发送] 已发出第 {index + 1} 条：{cands[index]}")
-    ov.set_status("已自动发送，可在微信里撤回。", "warning")
+    ov.log(f"[自动发送] 已发出第 {index + 1} 条"
+           + (f"（连发 {len(parts)} 条）" if len(parts) > 1 else "")
+           + "：" + " / ".join(parts))
+    ov.set_status(f"已自动发送 {len(parts)} 条，可在微信里撤回。" if len(parts) > 1
+                  else "已自动发送，可在微信里撤回。", "warning")
 
 
 def convert_voice():
@@ -731,6 +748,7 @@ def analyze_bg(msgs, title, revision, reply_to=None, trigger="对方来新消息
         # 喂给模型的是关系的中文名（「朋友」「前女友」），判断那一步也看它。
         r = analyze(msgs, settings.relation_name(settings.relation_of(title)),
                     context=settings.context(),
+                    rounds=settings.reply_rounds(),
                     model=settings.draft_model() or None,
                     provider=provider,
                     base_url=(relay_base if "relay" in (provider, jev_provider)
@@ -760,6 +778,7 @@ def opener_bg(msgs, title, revision, waited, reply_to=None, trigger="冷场到�
         relay_base = settings.relay_base_url()
         r = analyze_opener(msgs, settings.relation_name(settings.relation_of(title)),
                            context=settings.context(),
+                           rounds=settings.reply_rounds(),
                            model=settings.draft_model() or None, provider=provider,
                            base_url=(relay_base if "relay" in (provider, jev_provider)
                                      else settings.draft_base_url()) or None,

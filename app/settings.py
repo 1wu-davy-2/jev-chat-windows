@@ -28,6 +28,11 @@ _DB = os.path.join(_ROOT, "jev.db")  # 已进 .gitignore
 # **没有记录时不受这条影响**：各处取的都是 messages[-keep:]，有多少喂多少；刚加的好友（空会话）
 # 走 OPENER_BLANK_SYSTEM 那套「先开口打个招呼」，样本段一条都不给（见 draft._prompt）。
 _DEFAULT_CONTEXT = 30
+# 「回复轮数」默认 1：一个候选就是一句。> 1 时起草会允许模型把「接着想说的」写进同一个候选，
+# 界面上点一次「填入」填一条、发出去了再点下一条，微信里就是挨着的几个气泡。
+# 默认必须是 1——多轮是**选项**，不打招呼就把三条候选变成三串连发是另一回事。
+_DEFAULT_ROUNDS = 1
+ROUNDS_MAX = 3  # 界面上那个控件和面板顶部的翻页按钮都按它来（别在别处再写一个 3）
 # 老配置里 relationship 存的是这几个英文（安卓原版传下来的），迁移时折回内置的键
 _LEGACY_RELATION_KEYS = {"romantic partners": "romance", "friends": "friend",
                          "colleagues": "colleague", "family": "family"}
@@ -147,6 +152,18 @@ def context() -> int:
     except (TypeError, ValueError):
         return _DEFAULT_CONTEXT
     return max(3, min(30, n))
+
+def reply_rounds() -> int:
+    """回复轮数：一个候选最多连着发几条消息。1~3，默认 1（一句一回）。
+
+    只管**起草时要不要多写一句**：> 1 时提示里会要模型把想接着说的写进同一个候选，
+    候选内部就是几条用换行连着的消息（切分走 core/draft.lines）。判断和排序照旧按整条比。
+    填入/自动发送按条走：点一次填一条，发出去再点下一条。"""
+    try:
+        n = int(_read("reply_rounds", _DEFAULT_ROUNDS))
+    except (TypeError, ValueError):
+        return _DEFAULT_ROUNDS
+    return max(1, min(ROUNDS_MAX,n))
 
 def style() -> str:
     """老字段：一句自由文本口吻。它是「场景模板」之前那一版的东西，现在只在迁移里用得上
@@ -393,7 +410,7 @@ def save(context_n: int | None = None, *,
          pet_enabled_on: bool | None = None, opener_on: bool | None = None,
          opener_minutes_n: int | None = None, history_on: bool | None = None,
          chatlog_on: bool | None = None, auto_send_on: bool | None = None,
-         chat_pin_text: str | None = None) -> None:
+         chat_pin_text: str | None = None, rounds_n: int | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -407,6 +424,7 @@ def save(context_n: int | None = None, *,
     if wrote_key:
         _notify_env()
     n = context() if context_n is None else max(3, min(30, int(context_n)))
+    rounds = reply_rounds() if rounds_n is None else max(1, min(ROUNDS_MAX,int(rounds_n)))
     opener_n = (opener_minutes() if opener_minutes_n is None
                 else max(1, min(720, int(opener_minutes_n))))
     # 空串 = 清掉，None = 原样留着（读原始字段，别读补过默认值的那个）
@@ -422,7 +440,7 @@ def save(context_n: int | None = None, *,
     # 整个 dict 必须在 open(..., "w") **之前**拼好：open 一上来就把文件截断，
     # 之后再 _read() 读到的是空文件，None 那几项就不是「保留」而是被清空了。
     data = {
-        "context": n, "relations": model,
+        "context": n, "reply_rounds": rounds, "relations": model,
         # 每个会话挑了哪一型场景模板也不归这儿管（面板上拨一下走 save_chat_scene），
         # 但同样**必须带过去**：整份重写，漏了就等于把它删了。
         "chat_scenes": dict(scenes) if isinstance(scenes, dict) else {},
@@ -686,6 +704,17 @@ if __name__ == "__main__":
     assert auto_send() is True and _load_all()["auto_send"] is True
     save(10, pet_enabled_on=False)
     assert auto_send() is True, "改别的开关不能顺手把它关掉"
+
+    # 回复轮数：默认 1（一句一回），存盘夹到 1~3，不传 = 保留当前值
+    assert reply_rounds() == 1, "没设置过就是 1——多轮是选项，不能默认开"
+    save(10, rounds_n=3)
+    assert reply_rounds() == 3 and _load_all()["reply_rounds"] == 3
+    save(10, rounds_n=9)
+    assert reply_rounds() == 3, "超过 3 夹回 3"
+    save(10)
+    assert reply_rounds() == 3, "不传 = 保留，别退回默认"
+    _dump({"reply_rounds": "三条"})
+    assert reply_rounds() == 1, "脏数据退默认 1"
 
     # 老名字迁移：新名字空着要**逐个**试老名字——LEGACY 里挂的是一串（元组），不是单个名字。
     # 以前是把整个元组塞进 _read_env 的，于是变成 os.environ.get(元组) → TypeError:

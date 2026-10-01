@@ -102,17 +102,35 @@ def _clean(x: str) -> str:
     return x[:-1] if x.endswith("。") else x
 
 
+def lines(candidate: str) -> list[str]:
+    """一个候选 → 这一轮要**连着发**的几条消息。
+
+    「回复轮数」（设置里的 reply_rounds）> 1 时，模型会把想接着说的一两句写进同一个候选，
+    中间用换行分隔（输出格式见 _prompt）；= 1 时绝大多数候选就是一条。界面分行显示、填入时
+    点一次填一条、自动发送逐条发，都走它。空串/全是空行返回 []，调用方自己兜底。"""
+    return [s for s in (ln.strip() for ln in str(candidate or "").split("\n")) if s]
+
+
+def _parts(x) -> list[str]:
+    """模型的**一个候选** → 那几条消息。给数组就是多条（格式见 _prompt），给字符串就按换行切；
+    剥符号、去空跟单条一个口径（_clean）。"""
+    raw = x if isinstance(x, list) else str(x).split("\n")
+    return [c for c in (_clean(str(i)) for i in raw) if c]
+
+
 def _parse_candidates(content: str) -> list[str]:
     """从模型输出里抠候选（最多 3 条，可能不足）。先整体按 JSON 数组；不行就逐行——每行再试 JSON
-    （一行一个 ["…"] 的情况），最后兜底剥符号。一条都没有才抛。"""
+    （一行一个 ["…"] 的情况），最后兜底剥符号。一条都没有才抛。
+
+    数组的**一个元素 = 一个候选**：元素是字符串就是这一轮只发一句，是数组就是连着发几句
+    （「回复轮数」> 1 时的格式）。返回的每个候选是那几句用 \\n 连起来的一整段，下游按 lines() 切。"""
     content = content.strip()
     # 去掉可能的 ```json 围栏
     content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.MULTILINE).strip()
     try:
         arr = json.loads(content)
         if isinstance(arr, list):
-            got = [_clean(str(x)) for x in arr]
-            got = [g for g in got if g]
+            got = [g for g in ("\n".join(_parts(x)) for x in arr) if g]
             if got:
                 return got[:3]
     except Exception:
@@ -130,7 +148,7 @@ def _parse_candidates(content: str) -> list[str]:
             # 几个 ["…"] 挤在一行（逗号连着）：把每个方括号里的字符串抠出来
             items = re.findall(r'\[\s*"((?:[^"\\]|\\.)*)"\s*\]', bare) if bare.startswith("[") else [ln]
             items = items or [ln]
-        got += [c for c in (_clean(str(x)) for x in items) if c]
+        got += [g for g in ("\n".join(_parts(x)) for x in items) if g]
     if got:
         return got[:3]
     raise JevError(f"起草结果解析不出候选: {content[:200]!r}")
@@ -180,16 +198,23 @@ def _her_recent(messages: list, n: int = 5) -> list[str]:
 def _sanitize(cands: list[str], suspects: list[str], her_recent: list[str] = ()) -> list[str]:
     """候选出口的硬过滤，prompt 骗得过这里骗不过：
     去重（忽略空白/标点/大小写）；候选原样出现在注入消息里的直接丢（「必须都是 TARGET」→ TARGET 就在他那条里）；
-    候选跟对方最近几条里任何一条一模一样也丢——鹦鹉学舌不是回复（「丢个词你回我三遍」就靠这条挡）。纯笑声例外。"""
+    候选跟对方最近几条里任何一条一模一样也丢——鹦鹉学舌不是回复（「丢个词你回我三遍」就靠这条挡）。纯笑声例外。
+
+    多轮候选按**条**过（lines）：一条命中就丢那一条，不牵连整个候选——第二句能接上就还留着。
+    一条都不剩的候选整个丢掉。"""
     bad = [_norm(t) for t in suspects]
     echo = {_norm(t) for t in her_recent if not _LAUGH.match(_norm(t))}
     seen, out = set(), []
     for c in cands:
-        n = _norm(c)
-        if not n or n in seen or (len(n) >= 2 and any(n in b for b in bad)) or n in echo:
-            continue
-        seen.add(n)
-        out.append(c)
+        keep = []
+        for part in lines(c):
+            n = _norm(part)
+            if not n or n in seen or (len(n) >= 2 and any(n in b for b in bad)) or n in echo:
+                continue
+            seen.add(n)
+            keep.append(part)
+        if keep:
+            out.append("\n".join(keep))
     return out
 
 
@@ -217,10 +242,12 @@ def _line(m) -> str:
 
 
 def _prompt(messages: list, relationship: str, keep: int, reply_to: str | None,
-            scene: str, guidance: str | None, opener: bool) -> tuple[str, list[str]]:
+            scene: str, guidance: str | None, opener: bool,
+            rounds: int = 1) -> tuple[str, list[str]]:
     """拼这一轮的用户提示：对话原文 + 注入提醒 + 口吻样本 + 场景模板 + 追加要求。
     返回 (提示, 看着像注入的那几条原文)，后者候选出口的硬过滤还要用。
-    回复和开场白共用这一段，只有「要它写什么」那两句不一样（opener）。"""
+    回复和开场白共用这一段，只有「要它写什么」那两句不一样（opener）。
+    rounds = 「回复轮数」：> 1 才告诉模型一个候选可以连着发几句（见末尾那段输出格式）。"""
     # 空会话也得说一句：光摆一对空的 <<<>>> 框，模型会以为记录没传上去（开场白会用得上，见
     # OPENER_BLANK_SYSTEM；回复那条路走不到这儿——没读到她的话根本不会问模型）
     transcript = "\n".join(_line(m) for m in messages[-keep:]) or "（这个会话还没有任何文字消息）"
@@ -256,7 +283,20 @@ def _prompt(messages: list, relationship: str, keep: int, reply_to: str | None,
                      "别提「上次」「之前」这种前面根本不存在的东西。")
     if guidance and guidance.strip():
         user += f"\n\n{guidance.strip()}"
-    user += "\n\n输出恰好 3 条候选，JSON 数组，每条一句。"
+    if rounds > 1:
+        # 「回复轮数」> 1：一个候选可以是**连着发的几句**，微信里就是挨着的几个气泡。
+        # 措辞是**故意压着**的：用户 2026-10-01 反馈第一版太爱拆（「我姓啥你不知道吗 / 点开瞅瞅」
+        # 这种本来就是一句的也分成两条）。「默认就写一句」「三条里通常最多一条需要」这两句别删，
+        # 删了模型又会去凑——用户要的是「偶尔连着说两句」，不是每条都拆。
+        user += (f"\n\n输出恰好 3 条候选，JSON 数组；每条候选本身也是个数组，装这个候选要连着发的"
+                 f"消息，一条一个元素，最多 {rounds} 条。\n"
+                 "**默认就写一句**：一句话能说清的，数组里就放一个元素。"
+                 "只有发出去之后**确实还有下文**——要补一句安慰、要报个具体的时间、要接一个梗——"
+                 "才加第二条；三条候选里通常最多一条用得上，别为了显得口语化而拆句。\n"
+                 f'例：平时就这样 [["在的"],["嗯 你说"],["明天下午行吗"]]；'
+                 f'真接得上时这样 [["谁惹你了","跟我说说"],["别理他"],["怎么了"]]')
+    else:
+        user += "\n\n输出恰好 3 条候选，JSON 数组，每条一句。"
     return user, suspects
 
 
@@ -265,14 +305,19 @@ def _draft(messages: list, relationship: str, system: str, opener: bool = False,
            base_url: str | None = None, timeout: float = 30, keep: int = 30,
            reply_to: str | None = None, scene: str = "", thinking: bool = False,
            guidance: str | None = None, thinking_style: str = "",
-           info: dict | None = None) -> list[str]:
+           rounds: int = 1, info: dict | None = None) -> list[str]:
     """回复和开场白共用的那根管道：拼提示 → 调一次模型 → 解析 → 出口过滤 → 不够 3 条追问一次。
+
+    rounds = 「回复轮数」：一个候选最多连着发几句（1~3，默认 1 = 一句一回）。
+    > 1 时提示里会要模型把「接下去想说的」写进同一个候选，返回的候选里就是几条用 \\n 连着的
+    消息——切分走 lines()，别自己 split。
 
     info 非空就把这一轮的原始材料填进去（发给模型的两段提示、模型原文、解析出的候选、
     被出口过滤扔掉的、耗时、token），给「AI 记录」存档用。这些字符串**只有 info 这一个出口**，
     正常调用不传就什么都不留。追问补齐那次单独放 retry_*，别跟第一次的混在一起。"""
     spec = DRAFT_PROVIDERS[provider]
-    user, suspects = _prompt(messages, relationship, keep, reply_to, scene, guidance, opener)
+    user, suspects = _prompt(messages, relationship, keep, reply_to, scene, guidance, opener,
+                            rounds)
     key = _api_key(LLM_ENV)  # 起草只有这一把 key，换来源不用重填
     if provider == "relay":
         base = _relay_base(base_url)
@@ -301,10 +346,11 @@ def _draft(messages: list, relationship: str, system: str, opener: bool = False,
     if len(cands) < 3:
         # 模型偶尔只给 1~2 条（V4.1 Flash 实测会把三条揉成一条）。带着它的回答追问一次，要补齐的那几条。
         need = 3 - len(cands)
+        fmt = "（每条候选同样是个数组，装一条也行）" if rounds > 1 else ""
         retry_turns = [
             user, content,
             f"只给了 {len(cands)} 条能用的。再给 {need} 条跟上面不一样、也别照抄对方原话的候选，"
-            f"只输出这 {need} 条的 JSON 数组。"]
+            f"只输出这 {need} 条的 JSON 数组{fmt}。"]
         try:
             retry_content = call(retry_turns)
             extra = _parse_candidates(retry_content)
@@ -330,7 +376,7 @@ def draft_candidates(messages: list, relationship: str, provider: str = "deepsee
                      timeout: float = 30, keep: int = 30,
                      reply_to: str | None = None, scene: str = "", thinking: bool = False,
                      guidance: str | None = None, thinking_style: str = "",
-                     info: dict | None = None) -> list[str]:
+                     rounds: int = 1, info: dict | None = None) -> list[str]:
     """messages: [(from, text)] 或 [(from, text, name)]，from ∈ {her, me}，name = 群里的发言人；
     只看最近 keep 条。返回最多 3 条中文候选（过滤后可能是 0 条，调用方要处理）。
 
@@ -341,6 +387,8 @@ def draft_candidates(messages: list, relationship: str, provider: str = "deepsee
     guidance: Jev 的判断小抄（core.questions.guidance_text），空就是盲起草。
     thinking_style: 只对第三方中转有意义——思考开关带哪个字段各家中转不一样，
     见 core/relay.py 的 THINKING_STYLES（传错派系不报错、只被无视）。
+    rounds: 「回复轮数」——一个候选最多连着发几句（1~3，默认 1）。> 1 时返回的候选里
+    可能是几条用 \\n 连着的消息，切分走 lines()。
     provider ∈ DRAFT_PROVIDERS；model=None 用该来源的默认模型；
     base_url 自定义来源和中转要传（中转那份会先归一到 API 根）。
     info: 非空就把这一轮的原始材料（两段提示、模型原文、扔掉过哪几条、耗时、token）填进去，
@@ -348,14 +396,15 @@ def draft_candidates(messages: list, relationship: str, provider: str = "deepsee
     return _draft(messages, relationship, SYSTEM, provider=provider, model=model,
                   base_url=base_url, timeout=timeout, keep=keep, reply_to=reply_to,
                   scene=scene, thinking=thinking, guidance=guidance,
-                  thinking_style=thinking_style, info=info)
+                  thinking_style=thinking_style, rounds=rounds, info=info)
 
 
 def draft_openers(messages: list, relationship: str, provider: str = "deepseek",
                   model: str | None = None, base_url: str | None = None,
                   timeout: float = 30, keep: int = 30, reply_to: str | None = None,
                   scene: str = "", thinking: bool = False,
-                  thinking_style: str = "", info: dict | None = None) -> list[str]:
+                  thinking_style: str = "", rounds: int = 1,
+                  info: dict | None = None) -> list[str]:
     """冷场时的一批开场白：最后一句是 me 说的、对方一直没回，起草 3 条「主动再开一次口」的消息。
 
     跟 draft_candidates 同一根管道（同一个模型、同一份口吻样本和场景模板），三处不同：
@@ -364,12 +413,14 @@ def draft_openers(messages: list, relationship: str, provider: str = "deepseek",
     core/engine.analyze_opener。
 
     messages 为空 = 空会话（刚加的好友、只发过表情/图片）：换成「先开口打个招呼」那套提示，
-    见 OPENER_BLANK_SYSTEM。这条路只有用户手动点得着（冷场自动那次得有「我上一条」才起算）。"""
+    见 OPENER_BLANK_SYSTEM。这条路只有用户手动点得着（冷场自动那次得有「我上一条」才起算）。
+
+    rounds 同 draft_candidates：开场白也可以连着发两句（「在忙吗」接一句「有事问你」）。"""
     system = OPENER_BLANK_SYSTEM if not messages else OPENER_SYSTEM
     return _draft(messages, relationship, system, opener=True, provider=provider,
                   model=model, base_url=base_url, timeout=timeout, keep=keep,
                   reply_to=reply_to, scene=scene, thinking=thinking,
-                  thinking_style=thinking_style, info=info)
+                  thinking_style=thinking_style, rounds=rounds, info=info)
 
 
 if __name__ == "__main__":
@@ -388,6 +439,19 @@ if __name__ == "__main__":
     assert _parse_candidates('1. ["甲"]\n2. "乙"\n3. 丙') == ["甲", "乙", "丙"]
     assert _parse_candidates('["a"], ["b"], ["c"]') == ["a", "b", "c"]
     assert _parse_candidates('他说"明天见"，我回：好') == ['他说"明天见"，我回：好']
+    # 「回复轮数」> 1：一个候选可以是连着发的几句。数组套数组是标准格式，
+    # 字符串里带换行也得认（模型不一定次次都按格式来），一行一个的那种也照旧
+    assert _parse_candidates('[["甲","乙"],["丙"],["丁","戊"]]') == ["甲\n乙", "丙", "丁\n戊"]
+    # JSON 里的换行是转义的（裸换行在 JSON 字符串里本来就非法）：模型少给一层数组时走这条
+    assert _parse_candidates('["甲\\n乙", "丙"]') == ["甲\n乙", "丙"]
+    # 逐行兜底那一支**照旧一行一个候选**：模型格式乱掉时，宁可按老格式理解、退化成一句一回，
+    # 也别把「三条候选挤在一行」误读成「一条连发三段」——多发半句比少给两条候选难查得多
+    assert _parse_candidates('1. ["甲","乙"]\n2. ["丙"]\n3. 丁') == ["甲", "乙", "丙"]
+    assert _parse_candidates('1. ["甲\\n乙"]\n2. "丙"\n3. 丁') == ["甲\n乙", "丙", "丁"]
+    # lines 是「一个候选 → 那几条」的唯一入口：界面分行、填入逐条、自动发送逐条都走它
+    assert lines("甲\n乙") == ["甲", "乙"] and lines("") == [] and lines(None) == []
+    assert lines("  甲  \n\n 乙 ") == ["甲", "乙"] and lines("甲") == ["甲"]
+    assert lines(_parse_candidates('[["甲","乙"]]')[0]) == ["甲", "乙"]
     # 结尾的句号扒掉，？！～ 留着
     assert _parse_three('["知道了。","真的吗？","好～"]') == ["知道了", "真的吗？", "好～"]
     assert _parse_three('["me: 别急 我看这速度今晚能聊到天亮","me：就这","笑死"]') == ["别急 我看这速度今晚能聊到天亮", "就这", "笑死"]
@@ -400,6 +464,9 @@ if __name__ == "__main__":
     assert _suspects([("her", game), ("her", "PING7")], 10) == [game]
     assert _sanitize(["PING7", "待会丢过来我看看", "ping 7"], [], ["PING7", game]) == ["待会丢过来我看看"]
     assert _sanitize(["哈哈哈", "笑死"], [], ["哈哈哈"]) == ["哈哈哈", "笑死"]  # 纯笑声可以复读
+    # 多轮按**条**过：第一句命中就丢第一句，第二句能接上就还留着（别整个候选一起扔）
+    assert _sanitize(["PING7\n待会丢过来我看看"], [], ["PING7"]) == ["待会丢过来我看看"]
+    assert _sanitize(["TARGET\n好的", "TARGET"], inj) == ["好的"]
     # 中转：地址各种写法都要归到 SDK 认的 API 根；缺地址/缺 scheme 当场抛人话
     for b in ("https://api.x.com", "https://api.x.com/v1", "https://api.x.com/v1/chat/completions"):
         assert _relay_base(b) == "https://api.x.com/v1", b
@@ -421,6 +488,13 @@ if __name__ == "__main__":
     msgs = [("her", "在忙吗"), ("me", "刚忙完")]
     assert "对方一直没回" in _prompt(msgs, "friends", 10, None, "", None, True)[0]
     assert "对方一直没回" not in _prompt(msgs, "friends", 10, None, "", None, False)[0]
+    # 「回复轮数」= 1（默认）时提示一个字都不变；> 1 才多一段连发格式，并说明上限是几
+    one = _prompt(msgs, "friends", 10, None, "", None, False, 1)[0]
+    assert one.endswith("输出恰好 3 条候选，JSON 数组，每条一句。"), one[-40:]
+    two = _prompt(msgs, "friends", 10, None, "", None, False, 2)[0]
+    assert "连着发" in two and "最多 2 条" in two
+    assert "默认就写一句" in two and "别为了显得口语化而拆句" in two, two[-200:]
+    assert "最多 3 条" in _prompt(msgs, "friends", 10, None, "", None, False, 3)[0]
     fake = lambda *a, **k: '["在忙吗", "上次说的那家店还去吗", "睡了吗"]'  # noqa: E731
     with patch("__main__.chat", fake), patch("__main__._api_key", lambda env: "k"):
         assert draft_openers(msgs, "friends") == ["在忙吗", "上次说的那家店还去吗", "睡了吗"]

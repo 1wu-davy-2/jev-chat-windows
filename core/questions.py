@@ -291,21 +291,31 @@ def build_state(messages: list, relationship: str, keep: int = 30,
 
 
 def build_rank_question(candidates: list[str]) -> dict:
-    """Build the best_reply choice question. criteria values stay in original Chinese."""
+    """Build the best_reply choice question. criteria values stay in original Chinese.
+
+    一个候选可能是几条连着发的消息（「回复轮数」> 1，多条之间用换行分隔，见 draft.lines）：
+    那时多给一句说明，要 Jev 按整串比——不说的话它会把换行当成排版，只盯第一行。"""
     if not 2 <= len(candidates) <= 3:
         raise ValueError("build_rank_question expects 2 or 3 candidate replies")
     keys = ("reply_a", "reply_b", "reply_c")[:len(candidates)]
+    instructions = (
+        "Which candidate reply is the most appropriate next message, "
+        "given the conversation and the other person's true need? "
+        "Prefer a reply that matches the best action type. "
+        "Penalize dismissive, over-promising, or off-topic replies. "
+        "If the facts are not yet confirmed, prefer the candidate that looks them up "
+        "instead of faking memory or a vague apology."
+    )
+    if any("\n" in c for c in candidates):
+        instructions += (
+            " A candidate may hold several short messages the sender would send back to back "
+            "(one per line, in the order they would be sent); judge the run as a whole, "
+            "not line by line, and do not penalize it merely for being split."
+        )
     return {
         "best_reply": {
             "type": "choice",
-            "instructions": (
-                "Which candidate reply is the most appropriate next message, "
-                "given the conversation and the other person's true need? "
-                "Prefer a reply that matches the best action type. "
-                "Penalize dismissive, over-promising, or off-topic replies. "
-                "If the facts are not yet confirmed, prefer the candidate that looks them up "
-                "instead of faking memory or a vague apology."
-            ),
+            "instructions": instructions,
             "criteria": {key: text for key, text in zip(keys, candidates)},
         }
     }

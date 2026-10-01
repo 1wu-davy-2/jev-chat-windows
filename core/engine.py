@@ -30,7 +30,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             base_url: str | None = None, reply_to: str | None = None, scene: str = "",
             thinking: bool = False, jev_provider: str = "openrouter",
             jev_model: str | None = None, judge_path: str = "",
-            thinking_style: str = "") -> dict:
+            thinking_style: str = "", rounds: int = 1) -> dict:
     """messages: [(from, text)] from ∈ {her, me}，最新一条在最后；
     群聊里可以带第三项 name（说这句话的人），单聊不带。
     context: 起草和判断各看最近多少条消息（用户设置里的「参考上下文」）。
@@ -42,6 +42,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     scene: 这次说话的口气那段正文（这个会话那种关系的，或场景模板临时换的那一型），只影响
     起草——Jev 判的是意图和紧张度，跟措辞无关。
     thinking: 起草时是否开思考模式，只影响起草，默认关。
+    rounds: 「回复轮数」——一个候选最多连着发几句（1~3，默认 1）。> 1 时候选里可能是几条
+    用 \\n 连着的消息（切分走 draft.lines），判断和排序照旧按整个候选比。
     model / jev_model = None 用该来源的默认模型。
 
     返回 {candidates, best_index, best_reply, scores, answers, usage, reply_to, trace}。
@@ -62,6 +64,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     trouble = ""  # 判断/排序为什么没跑成。带给界面显示，别让调用方只看到「生成失败」
     # 一路往里填，哪个环节挂了都有东西可查
     trace: dict = {"messages": list(messages), "relationship": relationship, "context_n": context,
+                   "rounds": rounds,
                    "scene": scene, "reply_to": reply_to, "judge_state": state,
                    "judge_provider": jev_provider, "judge_model": jev_model or "",
                    "judge_path": judge_path, "draft_provider": provider,
@@ -89,6 +92,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
                                       base_url=base_url, timeout=timeout, keep=context,
                                       reply_to=reply_to, scene=scene,
                                       thinking=thinking, thinking_style=thinking_style,
+                                      rounds=rounds,
                                       guidance=guidance_text(answers) if judged else None,
                                       info=draft_info)
     except JevError as e:
@@ -162,7 +166,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
 def analyze_opener(messages: list, relationship: str, model: str | None = None,
                    timeout: float = 30, context: int = 30, provider: str = "deepseek",
                    base_url: str | None = None, reply_to: str | None = None, scene: str = "",
-                   thinking: bool = False, thinking_style: str = "") -> dict:
+                   thinking: bool = False, thinking_style: str = "",
+                   rounds: int = 1) -> dict:
     """冷场时的一批开场白（最后一句是 me 说的、对方一直没回）：只起草，**不过 Jev**。
 
     七道判断题问的全是「对方最新那条什么意思」，而这里的场景恰恰是对方没有新话——问不出东西，
@@ -177,6 +182,7 @@ def analyze_opener(messages: list, relationship: str, model: str | None = None,
     返回的 blank=True 让界面别摆「对方 N 分钟没回」——那会儿根本没人被晾着。
     """
     trace: dict = {"messages": list(messages), "relationship": relationship, "context_n": context,
+                   "rounds": rounds,
                    "scene": scene, "reply_to": reply_to, "draft_provider": provider,
                    "draft_base_url": base_url or ""}
     started = time.monotonic()
@@ -185,7 +191,7 @@ def analyze_opener(messages: list, relationship: str, model: str | None = None,
         candidates = draft_openers(messages, relationship, provider=provider, model=model,
                                    base_url=base_url, timeout=timeout, keep=context,
                                    reply_to=reply_to, scene=scene, thinking=thinking,
-                                   thinking_style=thinking_style, info=draft_info)
+                                   thinking_style=thinking_style, rounds=rounds, info=draft_info)
         trace["draft"] = draft_info
         if not candidates:  # 注入过滤可以把起草结果全扔掉；接着取 [0] 会 IndexError
             raise JevError("起草结果没有可用候选")
@@ -234,6 +240,12 @@ if __name__ == "__main__":
     assert r["scores"] == [0.0, 0.0, 0.0] and r["best_index"] == 0
     assert r["answers"] == {}
 
+    # 「回复轮数」原样传到起草那一层（判断和排序不看它——整条候选一起比）
+    with patch("__main__.ask", return_value={"answers": {}, "usage": {}}), \
+         patch("__main__.draft_candidates", return_value=["甲", "乙", "丙"]) as fake:
+        analyze([("her", "hello")], "friends", rounds=3)
+    assert fake.call_args.kwargs["rounds"] == 3, fake.call_args
+
     # 判断答上了、只有排序那一步挂了：judged 真 / ranked 假，原因照样带回来
     first = {"answers": {"true_intent": {"choice": "casual_chat"}}, "usage": {}}
     with patch("__main__.ask", side_effect=[first, JevError("排序口 500")]), \
@@ -278,6 +290,7 @@ if __name__ == "__main__":
     assert tr["judge_error"] == "Jev HTTP 401" and "judge_answers" not in tr
     assert tr["judge_ms"] >= 0 and tr["ms"] >= 0 and "draft" in tr
     assert tr["draft_provider"] == "deepseek" and tr["context_n"] == 30
+    assert tr["rounds"] == 1, "默认一句一回；这一轮用了几条连发要留痕"
 
     # 起草就挂了：材料得挂在异常上一起抛出去，调用方照样能落库（失败的那轮最该查）
     with patch("__main__.ask", return_value={"answers": {}, "usage": {}}), \
