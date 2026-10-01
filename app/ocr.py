@@ -220,8 +220,8 @@ def bottom_speaker(lines, voices):
     文字和语音**一起算**——微信新消息在最下面，所以「最底下那条」就是这条会话里最后说的一句话。
     父进程拿它判「最后说话的是不是我」：自己发的语音也是「我已经回了」，对方那句早就答过了，
     不该再触发一次判断（以前只拿文字判，所以对方来一句、自己回两条语音，照样会问一次）。
-    lines 是 read() 的返回（`[(who, name, text, y)]`），voices 是 last_voice（`[(x0,y0,x1,y1,时长,谁)]`）。"""
-    items = [(y, who) for who, _, _, y in lines] + [(v[1], v[5]) for v in voices]
+    lines 是 read() 的返回（`[(who, name, text, y, 横向中心)]`），voices 是 last_voice（`[(x0,y0,x1,y1,时长,谁)]`）。"""
+    items = [(y, who) for who, _, _, y, *_ in lines] + [(v[1], v[5]) for v in voices]
     return max(items)[1] if items else ""
 
 
@@ -247,7 +247,8 @@ class Reader:
         self.seen = []  # [(who, name, text)]，累计，封顶 500
         self.last_boxes = []  # 调试视图用：[(x0,y0,x1,y1,kind,text)]，消息区裁剪坐标
         self.last_voice = []  # 这一帧的语音气泡 [(x0,y0,x1,y1,时长,谁)]，_under_voice 要用全部
-        self.last_voice_open = []  # 上面那些里**还没转过文字**的，给候选条决定要不要提示「转文字」
+        self.last_voice_open = []  # 上面那些里**还没转过文字、也还没被更新的消息压过去**的，见 _open_voices
+        self._w = 0  # 消息区宽度，read() 每帧更新：判「这一行跟那条语音同不同侧」要用
         self.seen_voice = []  # 已经报给父进程的语音 [(谁, 时长)]，按出现顺序攒着，new_voices 要用
         self.last_ms = 0  # 上一帧 OCR 耗时
         self.last_metrics = []  # 调试窗「列出每个框的数据」用，见 read()
@@ -273,6 +274,7 @@ class Reader:
         self.last_voice = []
         self.last_voice_open = []
         W = chat.shape[1]
+        self._w = W  # 给 _same_side 用（判转写和语音同不同侧）
         # 群聊：每条 her 气泡上方一行灰色发言人名（靠左、短、不带冒号、印在面板底色上），从上往下扫，名字带给后面的气泡。
         # 引用块/时间戳/公告带冒号，链接卡片灰字印在气泡底色上，都不会被当成名字。
         # ponytail: 名字行被 OCR 漏掉时会挂到上一个人头上。
@@ -300,7 +302,7 @@ class Reader:
                 # 那道也会吃它。所以这两关都不走，直接照 her 落进 raw。
                 m["final"] = "recall_her"
                 self.last_boxes.append(rect + ("recall_her", text))
-                raw.append(("her", None, text, box[0][1], box[2][1], h))
+                raw.append(("her", None, text, box[0][1], box[2][1], h, min(xs), max(xs)))
                 continue
             if (_VOICE.fullmatch(text.strip()) or _VOICE_ICON.fullmatch(text.strip())
                     or (_DIGITS.fullmatch(text.strip()) and _has_icon(chat, box, kind, h))):
@@ -326,24 +328,41 @@ class Reader:
                 self.last_boxes.append(rect + (m["final"], text))
                 continue
             self.last_boxes.append(rect + (kind, text))
-            raw.append((kind, name if kind == "her" else None, text, box[0][1], box[2][1], h))
+            raw.append((kind, name if kind == "her" else None, text, box[0][1], box[2][1], h,
+                        min(xs), max(xs)))
         if not self.lh and len(raw) >= 3:
             self.lh = float(np.median([r[5] for r in raw]))
         # 同一气泡的多行合并：同人、上一行底到这一行顶的间距不到半个字高（不同气泡之间至少隔一个字高）
+        # 顺带把这几行的横向范围攒成一条（left/right），第 5 个返回值要用它判这一行在左半边还是右半边
         lines = []
-        for who, nm, text, top, bottom, h in raw:
+        for who, nm, text, top, bottom, h, left, right in raw:
             if lines and lines[-1][0] == who and lines[-1][1] == nm and top - lines[-1][4] < 0.6 * (self.lh or h):
                 lines[-1][2] += text
                 lines[-1][4] = bottom
+                lines[-1][5] = min(lines[-1][5], left)
+                lines[-1][6] = max(lines[-1][6], right)
             else:
-                lines.append([who, nm, text, top, bottom])
-        out = [(w, n, t, y) for w, n, t, y, _ in lines]
-        # 已经转过文字的语音：转出来的字就紧贴在气泡正下方（实测隔 17px，而下一条普通消息隔 69px，
-        # 字高 lh=13）。转过之后别再提示「转文字」了——不然用户转完、转写气泡一出现、布局一移，
-        # 子进程重报一次位置，候选条上的「转文字」就又冒回来了。
-        self.last_voice_open = [v for v in self.last_voice
-                                if not any(0 <= y - v[3] <= 2.5 * (self.lh or 17) for _, _, _, y in out)]
+                lines.append([who, nm, text, top, bottom, left, right])
+        out = [(w, n, t, y, (lo + hi) / 2) for w, n, t, y, _, lo, hi in lines]
+        self.last_voice_open = self._open_voices(out)
         return out
+
+    def _open_voices(self, out):
+        """这一帧里还算数的语音气泡：**下面没有更新的文字消息**的那些。
+
+        文字那一路本来就有「只认已知行下方的」这道闸（见 new_lines 的 floor），语音这一路一直
+        缺——补在这儿。少了它，往上翻、切会话时露出来的老语音会被当成刚发来的：真机上报过，
+        切过去没认出最底下那两条新消息，反而把顶上翻出来的老语音记成了「对方最近说」，
+        候选条上还摆着它的「转文字」。`new_voices` 报哪几条也是按它筛的（`fresh` 只在
+        last_voice_open 里挑），所以记录里也不会平白多出两行旧的。
+
+        已经转过文字的语音一并被这条挡住：转出来的字就贴在气泡正下方，它比气泡新，所以
+        转完不会再提示一次「转文字」（以前是靠「紧贴的那一行」单独判的，现在同一条规则管了）。
+
+        代价：一帧里「先一条语音、紧跟一条文字」时那条语音不记了（宁可漏记一行占位，
+        也不能把压在上面的老语音当成刚发来的）。整屏一条文字都没有（只发语音的会话）就都留着。"""
+        tail = max((t[3] for t in out), default=None)
+        return [v for v in self.last_voice if tail is None or v[1] > tail]
 
     def new_voices(self):
         """这一帧里**新出现、还没转过文字**的语音气泡——父进程拿它往聊天记录里记一行
@@ -382,7 +401,17 @@ class Reader:
                 fresh.append(v)
         return fresh
 
-    def _under_voice(self, y):
+    def _same_side(self, voice, x):
+        """这一行跟那条语音在不在同一侧（左半边 / 右半边）。
+
+        转写是画在语音气泡正下方、跟它同侧的；普通消息则可能跟语音分属两个人（一左一右）。
+        拿不到横向位置就不拦（自测里手搓的行没有 x）——这道闸是给误判打的补丁，
+        宁可退回老行为，也别把真转写挡在外面。"""
+        if x is None or not self._w:
+            return True
+        return (x > self._w / 2) == ((voice[0] + voice[2]) / 2 > self._w / 2)
+
+    def _under_voice(self, y, x=None):
         """这一行紧跟在哪个语音气泡下面？是的话返回 `(谁, 时长)`（时长是 OCR 原样，可能是 `3"`、
         也可能是 `)3`），不是就返回空元组——空元组在布尔位置上就是假，调用方直接当条件用。
 
@@ -394,10 +423,14 @@ class Reader:
 
         返回**谁**是因为微信把转出来的字画在一个**灰白气泡**里，自己那条语音转出来也是这个
         颜色，按底色分类会被认成对方说的（真机上报过：自己的语音转完，界面上写着「对方刚说
-        ……」，还白问了一次模型）。谁说的以那条语音为准。"""
+        ……」，还白问了一次模型）。谁说的以那条语音为准。
+
+        `x` 是这一行的横向中心（read() 算出来的）：还得跟那条语音**同一侧**才算数。只按「紧贴」
+        判的话，跟在语音下面的**普通消息**会被当成它的转写——真机上报过：对方一条「是的」正好
+        压在我那条语音下面，被记成了我语音转出来的字（谁说的、时长全错，进上下文的那份也错）。"""
         for item in self.last_voice:
-            if 0 <= y - item[3] <= 2.5 * (self.lh or 17):  # item[3] = 气泡底
-                return item[5], item[4]  # (谁, 时长)
+            if 0 <= y - item[3] <= 2.5 * (self.lh or 17) and self._same_side(item, x):
+                return item[5], item[4]  # (谁, 时长)  item[3] = 气泡底
         return ()
 
     def new_lines(self, lines, under_voice=False):
@@ -413,20 +446,22 @@ class Reader:
         气泡下面」，跟放不放它过 floor 无关——最新那条语音转出来的字是走正常规则进来的，
         同样得标上。实测转写贴 17px、下一条普通消息隔 69px，2.5×lh 分得开。
         转写那行的 **who 也以那条语音为准**，不看气泡底色（微信把转写画成灰白气泡，
-        自己的语音转出来也长这样）。
+        自己的语音转出来也长这样），而且还得跟那条语音**同一侧**——不然跟在语音下面的
+        普通消息会被当成它的转写，见 _under_voice。
 
         本帧一行已知的都没有（大图把旧文字全顶出去了、切了聊天、滚远了）：全算，宁可多算不能漏。
-        ponytail: 同一人连发两句一模一样的会吞一句——对触发分析无害。"""
-        known_y = [y for w, n, t, y in lines if self._seen(w, n, t)]
+        ponytail: 同一人连发两句一模一样的会吞一句——对触发分析无害。
+        lines 是 read() 的返回（`[(who, name, text, y, 横向中心)]`；自测里手搓的行只给前四个）。"""
+        known_y = [y for w, n, t, y, *_ in lines if self._seen(w, n, t)]
         floor = max(known_y) if known_y else -1
         new = []
-        for w, n, t, y in lines:
-            under = self._under_voice(y)
+        for w, n, t, y, *rest in lines:
+            under = self._under_voice(y, rest[0] if rest else None)
             if not (y > floor or (under_voice and under)) or self._seen(w, n, t):
                 continue
             # 紧跟语音气泡的那行是转写：谁说的、时长多少都以**那条语音**为准，别看气泡底色
             new.append((under[0] if under else w, n, t, under[1] if under else ""))
-        self.seen.extend((w, n, t) for w, n, t, _ in lines if not self._seen(w, n, t))
+        self.seen.extend((w, n, t) for w, n, t, *_ in lines if not self._seen(w, n, t))
         del self.seen[:-500]
         return new
 
@@ -549,16 +584,18 @@ if __name__ == "__main__":
     # 对方撤回的：算 her 说了句话。下面这两条都得成立——
     # ① 走 readonly 的 her 分支（不是被当灰字/小字丢掉）
     r = _reader([(_box, '"A 阿坤" 撤回了一条消息', 0.99)])
-    assert r.read(_frame(), _white) == [("her", None, '"A 阿坤" 撤回了一条消息', 10)], "对方撤回的要留下"
+    assert r.read(_frame(), _white) == [("her", None, '"A 阿坤" 撤回了一条消息', 10, 105.0)], \
+        "对方撤回的要留下"
     assert r.last_boxes[-1][4] == "recall_her", r.last_boxes
     # ② 系统提示本来就比气泡字小（lh 抬到 40，墨高 13 够不着 0.6*lh），「小字」那关也不许吃它
     r = _reader([(_box, "对方撤回了一条消息", 0.99)], lh=40.0)
-    assert r.read(_frame(), _white) == [("her", None, "对方撤回了一条消息", 10)], \
+    assert r.read(_frame(), _white) == [("her", None, "对方撤回了一条消息", 10, 105.0)], \
         "不能被「小字」那道吃掉"
 
-    # 真消息照旧：普通气泡还是一条 her（别把新加的那道拦宽了）
+    # 真消息照旧：普通气泡还是一条 her（别把新加的那道拦宽了）。
+    # 第 5 位是这一行的横向中心（框 10~200），_same_side 拿它判转写跟语音同不同侧
     r = _reader([(_box, "在吗", 0.99)])
-    assert r.read(_frame(), _white) == [("her", None, "在吗", 10)]
+    assert r.read(_frame(), _white) == [("her", None, "在吗", 10, 105.0)]
 
     # 「重新识别」的放大重读：坐标要能折回原尺度（框是放大后给的，下游一律按原图算）
     assert _upscale(np.zeros((10, 20, 3), np.uint8), 1).shape == (10, 20, 3)
@@ -667,5 +704,29 @@ if __name__ == "__main__":
     reader.last_voice_open, reader.seen = [], []
     assert reader.new_lines([("her", None, "刚转出来的", 67)]) == [
         ("her", None, "刚转出来的", '4"')]
+
+    # 转写还得跟那条语音**同一侧**：光按「紧贴」判的话，跟在语音下面的普通消息会被当成它的转写。
+    # 真机：对方一条「是的」正好压在我那条 3" 语音下面，被记成了我语音转出来的字（who/时长全错）
+    reader.lh, reader._w = 13.0, 400
+    reader.last_voice = [(300, 0, 400, 50, '3"', "me")]  # 我发的语音，靠右半边
+    reader.last_voice_open, reader.seen = [], []
+    assert reader.new_lines([("her", None, "是的", 67, 60)]) == [("her", None, "是的", "")], \
+        "她靠左那句不是转写，别跟着语音的 who 走"
+    reader.seen = []
+    assert reader.new_lines([("her", None, "转出来的字", 67, 380)]) == [
+        ("me", None, "转出来的字", '3"')], "靠右 = 我那条语音的转写"
+
+    # 还算数的语音：**下面没有更新的文字消息**的那些。真机：切过去没认出最底下那两条新消息，
+    # 反而把顶上翻出来的老语音记成了「对方最近说」，候选条上还摆着它的「转文字」
+    reader.last_voice = [band(100, '2"'), band(160, '5"')]
+    assert reader._open_voices([("her", None, "不啊", 300, 60),
+                                ("her", None, "不会饿", 330, 60)]) == [], "两条都压在最新那两句上面"
+    # 最底下就是那条语音（对方刚发来的）：还算数，候选条照旧提示「转文字」
+    assert reader._open_voices([("her", None, "在吗", 60, 60)]) == reader.last_voice
+    # 转过文字的那条也被同一条规则挡住：转写贴在它下面，比它新
+    reader.last_voice = [band(100, '3"')]
+    assert reader._open_voices([("me", None, "转出来的字", 150, 65)]) == []
+    # 一条文字都没认出来（只发语音的会话）：都留着
+    assert reader._open_voices([]) == reader.last_voice
 
     print("ocr._VOICE ok")

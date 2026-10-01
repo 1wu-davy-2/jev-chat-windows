@@ -36,7 +36,7 @@ def _packet(full, area, title, reader, lines, thorough=False):
             # 参考字高和面板底色：判「当小字丢掉」要拿墨高跟 0.6×lh 比，没这两个数看不出差多少
             "lh": float(reader.lh or 0) if reader else 0,
             "pane_bg": tuple(int(v) for v in area[4]) if area else None,
-            "lines": [(w, n, t) for w, n, t, _ in lines],
+            "lines": [(w, n, t) for w, n, t, *_ in lines],
             # 这一帧是不是「重新识别」那一遍（放大重读）。导出数据时要带上：不然分不清
             # 「改了参数没生效」和「改了没用」——同一串数字能贴两遍（真踩过）
             "thorough": bool(thorough),
