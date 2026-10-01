@@ -30,7 +30,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             base_url: str | None = None, reply_to: str | None = None, scene: str = "",
             thinking: bool = False, jev_provider: str = "openrouter",
             jev_model: str | None = None, judge_path: str = "",
-            thinking_style: str = "", rounds: int = 1) -> dict:
+            thinking_style: str = "", rounds: int = 1, profile: str = "") -> dict:
     """messages: [(from, text)] from ∈ {her, me}，最新一条在最后；
     群聊里可以带第三项 name（说这句话的人），单聊不带。
     context: 起草和判断各看最近多少条消息（用户设置里的「参考上下文」）。
@@ -41,6 +41,8 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     reply_to: 群聊里指定回复给谁；None = 正常回复。
     scene: 这次说话的口气那段正文（这个会话那种关系的，或场景模板临时换的那一型），只影响
     起草——Jev 判的是意图和紧张度，跟措辞无关。
+    profile: 「对方是谁」那一段（性别/星座/补充信息，core/profile 拼好，按会话取）。同 scene：
+    只影响起草，判断和排序那两次调用里一个字都不带。
     thinking: 起草时是否开思考模式，只影响起草，默认关。
     rounds: 「回复轮数」——一个候选最多连着发几句（1~3，默认 1）。> 1 时候选里可能是几条
     用 \\n 连着的消息（切分走 draft.lines），判断和排序照旧按整个候选比。
@@ -64,7 +66,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     trouble = ""  # 判断/排序为什么没跑成。带给界面显示，别让调用方只看到「生成失败」
     # 一路往里填，哪个环节挂了都有东西可查
     trace: dict = {"messages": list(messages), "relationship": relationship, "context_n": context,
-                   "rounds": rounds,
+                   "rounds": rounds, "profile": profile,
                    "scene": scene, "reply_to": reply_to, "judge_state": state,
                    "judge_provider": jev_provider, "judge_model": jev_model or "",
                    "judge_path": judge_path, "draft_provider": provider,
@@ -90,7 +92,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     try:
         candidates = draft_candidates(messages, relationship, provider=provider, model=model,
                                       base_url=base_url, timeout=timeout, keep=context,
-                                      reply_to=reply_to, scene=scene,
+                                      reply_to=reply_to, scene=scene, profile=profile,
                                       thinking=thinking, thinking_style=thinking_style,
                                       rounds=rounds,
                                       guidance=guidance_text(answers) if judged else None,
@@ -167,7 +169,7 @@ def analyze_opener(messages: list, relationship: str, model: str | None = None,
                    timeout: float = 30, context: int = 30, provider: str = "deepseek",
                    base_url: str | None = None, reply_to: str | None = None, scene: str = "",
                    thinking: bool = False, thinking_style: str = "",
-                   rounds: int = 1) -> dict:
+                   rounds: int = 1, profile: str = "") -> dict:
     """冷场时的一批开场白（最后一句是 me 说的、对方一直没回）：只起草，**不过 Jev**。
 
     七道判断题问的全是「对方最新那条什么意思」，而这里的场景恰恰是对方没有新话——问不出东西，
@@ -182,7 +184,7 @@ def analyze_opener(messages: list, relationship: str, model: str | None = None,
     返回的 blank=True 让界面别摆「对方 N 分钟没回」——那会儿根本没人被晾着。
     """
     trace: dict = {"messages": list(messages), "relationship": relationship, "context_n": context,
-                   "rounds": rounds,
+                   "rounds": rounds, "profile": profile,
                    "scene": scene, "reply_to": reply_to, "draft_provider": provider,
                    "draft_base_url": base_url or ""}
     started = time.monotonic()
@@ -191,7 +193,8 @@ def analyze_opener(messages: list, relationship: str, model: str | None = None,
         candidates = draft_openers(messages, relationship, provider=provider, model=model,
                                    base_url=base_url, timeout=timeout, keep=context,
                                    reply_to=reply_to, scene=scene, thinking=thinking,
-                                   thinking_style=thinking_style, rounds=rounds, info=draft_info)
+                                   thinking_style=thinking_style, rounds=rounds,
+                                   profile=profile, info=draft_info)
         trace["draft"] = draft_info
         if not candidates:  # 注入过滤可以把起草结果全扔掉；接着取 [0] 会 IndexError
             raise JevError("起草结果没有可用候选")
@@ -245,6 +248,17 @@ if __name__ == "__main__":
          patch("__main__.draft_candidates", return_value=["甲", "乙", "丙"]) as fake:
         analyze([("her", "hello")], "friends", rounds=3)
     assert fake.call_args.kwargs["rounds"] == 3, fake.call_args
+
+    # 「对方是谁」那段：原样传到起草那一层、也留在 trace 里给 AI 记录看。
+    # 判断那两次调用**不带**它——那七道题问的是对方最新那条的意图和紧张度，跟这个人是谁无关
+    who = "对方是谁（…）:\n- 女，天蝎座"
+    with patch("__main__.ask", return_value={"answers": {}, "usage": {}}) as jask, \
+         patch("__main__.draft_candidates", return_value=["甲", "乙", "丙"]) as fake:
+        r = analyze([("her", "hello")], "friends", profile=who, scene="朋友那套")
+    assert fake.call_args.kwargs["profile"] == who, fake.call_args
+    assert r["trace"]["profile"] == who, "AI 记录里要看得见这一轮喂了谁的资料"
+    assert who not in str(jask.call_args_list), "判断那一步不许带资料"
+    assert "朋友那套" not in str(jask.call_args_list), "场景正文也一样，只喂起草"
 
     # 判断答上了、只有排序那一步挂了：judged 真 / ranked 假，原因照样带回来
     first = {"answers": {"true_intent": {"choice": "casual_chat"}}, "usage": {}}
@@ -317,9 +331,10 @@ if __name__ == "__main__":
     # 空会话的开场白（刚加的好友、只发过表情/图片）：messages 为空也照起草，
     # blank=True 让界面说「还没聊过」而不是「对方 N 分钟没回」——那会儿没人被晾着
     with patch("__main__.draft_openers", return_value=["嗨", "在忙啥呢", "好久不见"]) as fake:
-        op = analyze_opener([], "friends")
+        op = analyze_opener([], "friends", profile=who)
     assert fake.call_args[0][0] == [], "空列表原样传下去，别在这儿替换成别的"
+    assert fake.call_args.kwargs["profile"] == who, "开场白也吃资料（先开口也得知道对面是谁）"
     assert op["blank"] is True and op["candidates"] == ["嗨", "在忙啥呢", "好久不见"]
     assert op["opener"] is True and op["judged"] is False and op["ranked"] is False
-    assert op["trace"]["messages"] == []
+    assert op["trace"]["messages"] == [] and op["trace"]["profile"] == who
     print("engine ok")

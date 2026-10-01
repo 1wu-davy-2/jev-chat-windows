@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import settings, shortcut
-from core import chatlog, relations, styles
+from core import chatlog, profile, relations, styles
 
 
 _STATES = ("ready", "waiting", "loading", "error", "degraded", "setup", "settings", "paused",
@@ -169,6 +169,9 @@ _TRACE_ROWS = (
      "chat": _CHAT, "kind": "reply", "trigger": "对方来新消息",
      "relationship": "同事", "context_n": 10,
      "scene": "同事：平级同事，能开玩笑但终究是工作关系。",
+     # 「用户维护」里那份资料：跟 scene 一样按会话现取，只喂起草
+     "profile": "对方是谁（写的时候照着来：称呼、语气、热络到什么程度；这是背景，"
+                "别在话里点破你知道这些）:\n- 女，天蝎座\n- 在杭州，做设计的",
      "messages": [["her", "周末有人去爬山吗", "阿杰"], ["me", "我有空，几点集合？", None],
                   ["her", "八点地铁口见，记得带水", "阿杰"]],
      "draft_provider": "deepseek", "draft_model": "deepseek-flash", "draft_ms": 3200,
@@ -223,7 +226,7 @@ def main() -> int:
     )
     parser.add_argument("--state", choices=_STATES, default="ready", help="预览界面状态")
     parser.add_argument("--screenshot", metavar="PATH", help="将演示界面保存为 PNG 后退出（合成数据，不含微信内容）")
-    parser.add_argument("--tab", choices=("preference", "models", "style", "system"),
+    parser.add_argument("--tab", choices=("preference", "models", "style", "profile", "system"),
                         help="设置页停在哪个页签（配合 --state settings）")
     parser.add_argument("--relay", action="store_true",
                         help="演示第三方中转那组字段（地址 / 判断接口路径 / 思考开关的传法）")
@@ -272,7 +275,14 @@ def main() -> int:
                      "relay_judge_path": "/v1/systemone",
                      "relay_thinking_style": "thinking",
                      # 导入时给隐形昵称起的名：{会话名: {原昵称: 名字}}，只活在内存里
-                     "chat_remarks": {}}
+                     "chat_remarks": {},
+                     # 「用户维护」那份资料：{会话名: {gender, zodiac, note}}。_CHAT 填满，
+                     # 另一个只有下拉里的两项——它这次还没聊到，列表里照样在（以前维护过的）
+                     "profiles": {
+                         _CHAT: {"gender": "f", "zodiac": "scorpio",
+                                 "note": "- 怎么称呼 TA：小金\n- 在杭州，做设计的\n"
+                                         "- 别碰的话题：加班"},
+                         "老同学": {"gender": "m", "zodiac": "leo", "note": ""}}}
 
     def demo_relations():
         return demo_settings["relations"]
@@ -286,6 +296,18 @@ def main() -> int:
         return styles.resolve(demo_settings["chat_scenes"].get(str(chat or ""), ""),
                               relation=demo_relation_of(chat),
                               relation_texts=d["texts"], customs=d["customs"])
+
+    def demo_profiles():
+        """「用户维护」那份资料，深拷一份出去——真 settings 每次读都是新解析的 dict，
+        界面往里塞东西不该改到 demo_settings 自己那份。"""
+        return json.loads(json.dumps(demo_settings["profiles"], ensure_ascii=False))
+
+    def demo_profile_of(chat):
+        return demo_profiles().get(str(chat or ""), {})
+
+    def demo_profile_text(chat):
+        """跟真 settings.profile_text 一样，走 core.profile 把那份拼成提示里的一段。"""
+        return profile.prompt_text(demo_profile_of(chat))
 
     def demo_chat_remarks(chat):
         """导入时给隐形昵称起的名，按会话存——跟 settings.chat_remarks 一个形状。"""
@@ -306,7 +328,7 @@ def main() -> int:
                            relay_base_url_text=None, relay_judge_path_text=None,
                            relay_thinking_style_text=None, pet_enabled_on=None,
                            opener_on=None, opener_minutes_n=None, history_on=None,
-                           chatlog_on=None, auto_send_on=None, rounds_n=None):
+                           chatlog_on=None, auto_send_on=None, rounds_n=None, profiles=None):
         if context_n is not None:
             demo_settings["context"] = context_n
         if rounds_n is not None:
@@ -316,6 +338,9 @@ def main() -> int:
         if relation_model is not None:
             # 真 settings.save 会把整份模型收干净再写，这儿照做，免得演示里存进去一份脏的
             demo_settings["relations"] = json.loads(json.dumps(relation_model, ensure_ascii=False))
+        if profiles is not None:
+            # 「用户维护」整份提交，跟关系模型一个道理
+            demo_settings["profiles"] = json.loads(json.dumps(profiles, ensure_ascii=False))
         for name, value in (("jev_provider", jev_provider_text), ("jev_model", jev_model_text),
                             ("draft_provider", draft_provider_text), ("draft_model", draft_model_text),
                             ("draft_base_url", draft_base_url_text), ("style", style_text),
@@ -374,6 +399,10 @@ def main() -> int:
         scene_text=demo_scene_text,
         save_chat_relation=lambda name, key: demo_relations()["chats"].update({name: key}),
         save_chat_scene=lambda name, key: demo_settings["chat_scenes"].update({name: key}),
+        # 「用户维护」那份资料：也只活在内存里，读出来跟真 settings 一个形状
+        profiles_dict=demo_profiles,
+        profile_of=demo_profile_of,
+        profile_text=demo_profile_text,
         # 导入时给隐形昵称起的名：也只存在内存里那份 demo 设置里，不碰真实 config.json
         chat_remarks=demo_chat_remarks,
         save_chat_remark=demo_save_chat_remark,

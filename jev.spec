@@ -20,6 +20,7 @@ hiddenimports = [
     "core.relations",  # 关系（谁是谁 + 按这个关系怎么说话），styles 从它取正文
     "core.chatlog",    # 聊天记录库（stdlib sqlite3），界面那串气泡和喂模型的上下文都从它来
     "core.paste",      # 导入聊天记录：把微信「复制」出来的文本解析成消息行
+    "core.profile",    # 「用户维护」那份资料：性别/星座/补充信息拼成起草提示里的一段
 ]
 datas, binaries = [], []
 for pkg in (

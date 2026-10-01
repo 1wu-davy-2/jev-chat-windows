@@ -53,6 +53,12 @@ Windows 上挂在微信（4.x，`Weixin.exe`）旁边的回复助手：截自己
    「打包版默认不在硬盘上留库文件」这条就废了。
    加**第三个**写盘口子之前先想清楚这条边界——截图仍然一律不落盘（见 3），
    两张表记的都是文字，都只在本机，写之前每个字符串都过 `redact_secrets()`。
+   「用户维护」那份资料（性别/星座/补充信息）**故意不进 jev.db**，走 `config.json` 的 `profiles`
+   键（跟 `relations.chats` / `chat_scenes` / `chat_remarks` 并排）：它是**设置**、不是记录，
+   两个存储开关都关着也得在（打包版默认就是关的，放库里等于把用户的资料绑在一个默认关的
+   开关上）；而且库文件是「谁开谁建」，给它开个常驻的第三张表，打包版一跑就把
+   「不在硬盘上留库文件」那条废了。用户提过以后可能搬进 jev.db——真搬的话连开关一起想清楚，
+   读写只有 `_clean_profiles` / `profiles_dict` / `profile_of` / `profile_text` 这几个口子。
 
 ## 常用命令
 
@@ -65,7 +71,8 @@ python core/draft.py        # 候选解析器 + 防注入过滤的断言 + 开�
 python core/engine.py       # 判断挂了不丢候选、开场白不过 Jev、trace 留痕
 python core/relations.py    # 关系：每段正文 ≤1000 字、键/名字不重、自建关系的键怎么编
 python core/styles.py       # 场景模板：选项顺序、挑了用挑的那型、没挑退回关系那型
-python app/settings.py      # 关系模型：老配置迁移、存盘不丢别的键、按会话读回（写临时目录，不碰本机配置）
+python core/profile.py      # 用户维护：认不出的键当没填、占位行不进提示、空资料一个字都不加
+python app/settings.py      # 关系模型 + 用户资料：老配置迁移、存盘不丢别的键、按会话读回（写临时目录，不碰本机配置）
 python core/trace.py        # AI 记录库：写读回填清空、类型转换、脱敏、没配库时不建文件
 python core/chatlog.py      # 聊天记录库：写读正序、并语音、90 天留存、脱敏、关掉后不写也不建文件
 python core/paste.py        # 导入：微信复制格式的解析、隐形昵称、正文带空行、who 映射
@@ -82,10 +89,11 @@ python tools/preview_ui.py --state ready
 python tools/preview_ui.py --state ready --screenshot docs/ui_home.png
 python tools/preview_ui.py --state settings --screenshot docs/ui_settings.png
 python tools/preview_ui.py --state settings --tab style --screenshot docs/ui_style.png
+python tools/preview_ui.py --state settings --tab profile --screenshot docs/ui_profile.png
 # 可用的 --state：ready / waiting / loading / error / degraded / setup / settings / paused /
 #   debug / ime / ime-thinking / pet / pet-menu / bar / voice / log /
 #   opener / opener-bar / opener-loading / opener-blank / history / pinned / import
-# 可用的 --tab：preference / models / style / system（配合 --state settings）
+# 可用的 --tab：preference / models / style / profile / system（配合 --state settings）
 # --round N：多轮候选翻到第 N 条（演示数据里「推荐回复」那条是两轮的，--round 2 看第二句）
 # （history 会往临时目录写一个演示库，不碰本机那份 jev.db；预览里 core.chatlog
 #   整个被 patch 成假的，同样碰不到本机那份）
@@ -523,10 +531,12 @@ scrollbar 的 `maximum()` 还是旧值，跟底得 `QTimer.singleShot(0, ...)`�
   （比如开场白那个分钟数跟着开关灰）得在 `_load_settings()` 里手动补调一次。
   `save()` 是**把 config.json 整份重写**：加新键的同时，别把不归它管的键漏掉（`pet_pos` 就是这么
   丢过一次的——点一次「保存设置」，宠物下次就跳回默认角落），照 `keep` / `_load_all()` 的写法带过去。
-  设置页是**四个页签**（回复偏好 / 模型设置 / 个人风格 / 系统设置）：那一排按钮在
+  设置页是**五个页签**（回复偏好 / 模型设置 / 个人风格 / 用户维护 / 系统设置）：那一排按钮在
   `_build_settings()` 的 `tabButtons` 循环里、卡片显隐在 `_switch_tab()` 里，加一页要两处一起加。
-  第三页「个人风格」整页都是关系，截图 `--state settings --tab style`；第四页「系统设置」是
-  聊天会话存储 / 记录 AI 调用 / 启动时检查更新 / 调试视图 / 桌面宠物，`--tab system`。
+  第三页「个人风格」整页都是关系，截图 `--state settings --tab style`；第四页「用户维护」是
+  按会话维护那个人的资料，`--tab profile`（它跟别的页不一样：**页内还有一层会话选择**，见下面
+  那条）；第五页「系统设置」是聊天会话存储 / 记录 AI 调用 / 启动时检查更新 / 调试视图 / 桌面宠物，
+  `--tab system`。
   挪开关的时候记得 `_load_settings()` 里那几个 `blockSignals` 也要跟着搬——拨一下立刻生效的那几个
   （调试视图、桌面宠物、聊天会话存储）在加载时会真的去开窗/配库。
 - **关系**（`core/relations.py`）：这个会话里的人是谁，外加**按这个关系该怎么说话**。七型内置
@@ -553,6 +563,32 @@ scrollbar 的 `maximum()` 还是旧值，跟底得 `QTimer.singleShot(0, ...)`�
   「这次用哪一型的」。挑了某一型就用那一型的正文（「对一个客户用同事那套口气」），没挑就退回
   这个会话自己那种关系。存 `chat_scenes`（`{会话名: 键}`，空串/缺 = 跟随关系）。
   **所以别再加第二个正文编辑器**——原来设置页有一个，跟关系那套改的是同样的字，已经删了。
+- **用户维护**（`core/profile.py` + 设置页第四页签）：**这个会话里那个人是谁**——性别、星座，
+  加一段自由补充（怎么称呼、做什么的、最近在忙什么、别碰的话题）。跟「关系」是**一对正交的东西**，
+  别合并也别互相替代：关系答「你俩什么关系」，正文是一套通用口径；资料答「对面这个人」，
+  同一型关系里对哥们儿和对刚认识的女生该说得不一样，而这些光看聊天记录不一定读得出来。
+  按会话存 `config.json` → `profiles`：`{会话名: {gender, zodiac, note}}`。
+  **键是稳定的英文**（`f`/`m`、`aries`…），界面和提示里一律用中文名——`core/profile.py` 是
+  **唯一**的词汇表，加一项只动它（`GENDERS` / `ZODIACS`），两个下拉和提示都跟着认。
+  三条改这块先看：
+  ① **只喂起草**（回复和开场白都喂）：`_prompt` 里接在 `relationship:` 那一行下面，跟 `scene`
+  一个待遇；判断和排序那两次调用一个字都不带——那七道题问的是对方最新那条的意图和紧张度，
+  跟这个人是谁无关。跑之前看 `main.analyze_bg` / `opener_bg` 里那两个 `profile=settings.profile_text(title)`。
+  ② **拼出来的那段自带抬头，且明说「别在话里点破」**（`profile.prompt_text`）。不打招呼模型会
+  写出「听说你是天蝎座的？」——那比不给资料还糟。改那段文字时这句别删。
+  ③ **占位行不算资料**：`TEMPLATE`（「插入模板」塞进框里那份待填条目）原样进提示是六行噪音，
+   `_note_lines` 在**拼提示时**把「跟模板某一行一模一样」的行丢掉，`clean()` 在**收数据时**
+  把「只剩占位行」的整格当没写（只填了一半的照留——占位行是用户的编辑底稿）。判据都是整行相等，
+  用户自己写的「- 别碰的话题：工作」不会被误伤。
+  界面上它跟别的页签不一样：**页内还有一层会话选择**。`_profiles` 是内存里那份（点「保存设置」
+  才整份落盘，跟关系模型一个套路），`_profileShown` 是三个控件里现在装着哪个会话的那份——
+  **换会话（`_profile_changed`）和保存（`_save`）之前都得先 `_profile_stash()`**，不然用户刚打的
+  字被下一份盖掉；`_sync_profile_chats()` 在切到这一页时重填下拉（这次见过的会话 + 以前维护过的，
+  见 `_profile_chats`），重填前也要先 stash。**别去读聊天记录库凑名单**：那张表默认关着，
+  读一下 sqlite 还会把库文件建出来。
+  落盘前每个字符串过 `redact_secrets()`（`_clean_profiles` 是唯一的口子）——补充信息是个自由填的
+  框，粘一段带 key 的东西进来是最常见的情形（导入那条路上真出现过别人的 `sk-…`），而 config.json
+  是明文、整个文件无条件写盘。
   老配置的 `style_preset` / `style_texts` / `style` 由 `settings._migrate_relations()` 接过来
   （老的场景模板全局一份、真正在管措辞，所以它认得出某一型就以它为准当默认关系），
   保存一次之后 config.json 里就只剩新形状了。

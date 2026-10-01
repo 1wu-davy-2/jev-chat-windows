@@ -41,7 +41,9 @@ _LOCK = threading.Lock()  # 写来自后台线程、读来自 Qt 主线程，串
 # 每一轮一行，列按「一轮里发生的顺序」排：谁触发的 → 发了什么上下文 → 起草 → 判断 → 排序 → 结果 → 人干了什么
 _COLUMNS = (
     "created_at", "finished_at", "ms", "chat", "kind", "trigger",  # 什么时候、多久、哪个会话、哪种轮次
-    "relationship", "scene", "context_n", "messages",        # 这一轮发出去的上下文
+    # 这一轮发出去的上下文。profile = 「对方是谁」那段（性别/星座/补充信息），跟 scene 一样
+    # 只喂起草；它只影响措辞，不参与判断和排序
+    "relationship", "scene", "profile", "context_n", "messages",
     # 起草（语言模型）
     "draft_provider", "draft_model", "draft_base_url", "draft_thinking", "draft_ms",
     "draft_system", "draft_prompt", "draft_reply", "draft_candidates", "draft_dropped",
@@ -58,7 +60,7 @@ _COLUMNS = (
 
 # 存文本的那几列；其余一律 INTEGER（时间戳、耗时、token、下标、布尔）
 _TEXT_COLUMNS = frozenset((
-    "chat", "kind", "trigger", "relationship", "scene", "messages", "draft_provider",
+    "chat", "kind", "trigger", "relationship", "scene", "profile", "messages", "draft_provider",
     "draft_model", "draft_base_url", "draft_system", "draft_prompt", "draft_reply",
     "draft_candidates", "draft_dropped", "draft_retry_prompt", "draft_retry_reply",
     "draft_error", "judge_provider", "judge_model", "judge_path", "judge_state",

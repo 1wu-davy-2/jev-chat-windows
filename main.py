@@ -753,7 +753,10 @@ def analyze_bg(msgs, title, revision, reply_to=None, trigger="对方来新消息
                     provider=provider,
                     base_url=(relay_base if "relay" in (provider, jev_provider)
                               else settings.draft_base_url()) or None,
+                    # 「对方是谁」（性别/星座/补充信息）也按会话现读，跟关系和口吻一个道理：
+                    # 设置页里改完点保存，下一轮生成就用上了。只喂起草，判断那一步不带它
                     reply_to=reply_to, scene=settings.scene_text(title),
+                    profile=settings.profile_text(title),
                     thinking=settings.thinking(),
                     thinking_style=settings.relay_thinking_style(),
                     judge_path=settings.relay_judge_path(),
@@ -783,6 +786,7 @@ def opener_bg(msgs, title, revision, waited, reply_to=None, trigger="冷场到�
                            base_url=(relay_base if "relay" in (provider, jev_provider)
                                      else settings.draft_base_url()) or None,
                            reply_to=reply_to, scene=settings.scene_text(title),
+                           profile=settings.profile_text(title),
                            thinking=settings.thinking(),
                            thinking_style=settings.relay_thinking_style())
         r["waited"] = waited

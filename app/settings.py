@@ -12,8 +12,10 @@ import json
 import os
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
 
+from core import profile as prof
 from core import relations as rel
 from core import styles
+from core.jev_client import redact_secrets
 from core.providers import CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, LEGACY, LLM_ENV
 from core.relay import DEFAULT_JUDGE_PATH, DEFAULT_THINKING_STYLE, THINKING_STYLES
 
@@ -68,6 +70,24 @@ def _clean_relations(raw) -> dict:
             "texts": texts, "customs": customs,
             "chats": {str(k): str(v) for k, v in (raw.get("chats") or {}).items()
                       if str(v) in known}}
+
+
+def _clean_profiles(raw) -> dict:
+    """「用户维护」那份资料收干净：每个会话过一遍 core.profile.clean（认不出的性别/星座当没填、
+    补充信息截到上限），三个字段全空的那一格直接丢掉——不留「三项都是空串」的壳子。
+
+    补充信息在这里过一遍 `redact_secrets()`：那是个**自由填的框**，用户可能顺手把一段带 key 的
+    东西粘进去（导入聊天记录那条路上真出现过别人的 `sk-…`），而 config.json 是明文、而且整个
+    文件无条件写盘。**收数据的口子只有这一个**，读、写、设置页提交都走它。"""
+    raw = raw if isinstance(raw, dict) else {}
+    out = {}
+    for chat, one in raw.items():
+        one = prof.clean(one)
+        if not one:
+            continue
+        one["note"] = redact_secrets(one["note"])
+        out[str(chat)] = one
+    return out
 
 
 def _migrate_relations() -> dict:
@@ -181,6 +201,26 @@ def scene_text(chat: str = "") -> str:
     d = relations_dict()
     return styles.resolve(scene_of(chat), relation=relation_of(chat),
                           relation_texts=d["texts"], customs=d["customs"])
+
+def profiles_dict() -> dict:
+    """全部资料 `{会话名: {gender, zodiac, note}}`——「用户维护」那一页读写的就是它。
+    跟 relations / chat_scenes 一样是**按会话**的，只是不走 _save_spot 那种一格一格的写法：
+    那一页是整份提交（跟设置页其它项一起点「保存设置」）。"""
+    return _clean_profiles(_read("profiles"))
+
+
+def profile_of(chat: str) -> dict:
+    """这个会话的资料。没维护过返回 {}（三个字段都当空，界面上就是「不详 / 不详 / 空框」）。"""
+    return profiles_dict().get(str(chat or "")) or {}
+
+
+def profile_text(chat: str) -> str:
+    """这个会话的资料拼成起草提示里的一段；没维护过返回空串（提示里一个字都不加）。
+
+    跟 scene_text 一个口径：**只喂起草**（回复和开场白都喂），判断那一步不喂——那七道题问的是
+    对方最新那条的意图和紧张度，跟这个人是谁无关。"""
+    return prof.prompt_text(profile_of(chat))
+
 
 def jev_provider() -> str:
     """判断模型走哪家：openrouter（默认）、typesafe 直连，或 relay 第三方中转。"""
@@ -410,7 +450,8 @@ def save(context_n: int | None = None, *,
          pet_enabled_on: bool | None = None, opener_on: bool | None = None,
          opener_minutes_n: int | None = None, history_on: bool | None = None,
          chatlog_on: bool | None = None, auto_send_on: bool | None = None,
-         chat_pin_text: str | None = None, rounds_n: int | None = None) -> None:
+         chat_pin_text: str | None = None, rounds_n: int | None = None,
+         profiles: dict | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -437,6 +478,9 @@ def save(context_n: int | None = None, *,
     model["texts"] = {k: t for k, t in model["texts"].items()
                       if t != rel.default_text(k) and rel.is_builtin(k)}
     scenes = _read("chat_scenes")
+    # 「用户维护」那份资料：None = 原样留着（面板那条路不碰它）。设置页提交的是**整份**——
+    # 它就是在一页里维护的，跟关系模型一个道理
+    people = profiles_dict() if profiles is None else _clean_profiles(profiles)
     # 整个 dict 必须在 open(..., "w") **之前**拼好：open 一上来就把文件截断，
     # 之后再 _read() 读到的是空文件，None 那几项就不是「保留」而是被清空了。
     data = {
@@ -444,6 +488,9 @@ def save(context_n: int | None = None, *,
         # 每个会话挑了哪一型场景模板也不归这儿管（面板上拨一下走 save_chat_scene），
         # 但同样**必须带过去**：整份重写，漏了就等于把它删了。
         "chat_scenes": dict(scenes) if isinstance(scenes, dict) else {},
+        # 「这个会话里那个人是谁」（性别/星座/补充信息）。跟 chat_scenes 一样是按会话的一格一格，
+        # 但走的是**整份提交**（设置页那一页维护的就是它），不另开 save_chat_profile 那种单键写
+        "profiles": people,
         "jev_provider": jev, "jev_model": keep(jev_model_text, "jev_model"),
         "draft_provider": draft, "draft_model": keep(draft_model_text, "draft_model"),
         "draft_base_url": keep(draft_base_url_text, "draft_base_url"),
@@ -674,6 +721,36 @@ if __name__ == "__main__":
     assert scene_of("张三") == "" and scene_text("张三") == rel.TEXTS["workplace"]
     save_chat_relation("张三", "")
     assert relation_of("张三") == "friend"
+
+    # 「用户维护」那份资料：**按会话**存，读的时候收干净。它是设置、不是聊天记录，
+    # 所以跟 relations / chat_scenes 一样进 config.json——两个存储开关关掉也还在
+    assert profiles_dict() == {} and profile_of("张三") == {} and profile_text("张三") == ""
+    save(10, profiles={"张三": {"gender": "f", "zodiac": "scorpio", "note": " 养了只橘猫 "},
+                       "李四": {"gender": "m", "zodiac": "蛇夫座", "note": "   "}})
+    assert profile_of("张三") == {"gender": "f", "zodiac": "scorpio", "note": "养了只橘猫"}
+    assert profile_of("李四") == {"gender": "m", "zodiac": "", "note": ""}, \
+        "认不出的星座当没填，同一格里别的字段照留"
+    assert "- 女，天蝎座" in profile_text("张三") and "养了只橘猫" in profile_text("张三")
+    assert profile_text("王五") == "", "没维护过的会话，提示里一个字都不加"
+    # 三项一个都没落下（性别认不出、星座认不出、补充只有空白）= 整格不留，别存个空壳
+    save(10, profiles={"李四": {"gender": "外星人", "zodiac": "蛇夫座", "note": "  "}})
+    assert profiles_dict() == {} and "李四" not in profiles_dict()
+    # 三项填回空 = 这一格删掉（界面上删干净了就该真的删掉，不留空壳）
+    save(10, profiles={"张三": {"gender": "", "zodiac": "", "note": ""}})
+    assert profiles_dict() == {} and _load_all().get("profiles") == {}, "键还在，只是空的"
+    # 不传 = 保留；整份重写不能把它弄丢（pet_pos / chat_remarks 都这么丢过）
+    save(10, profiles={"张三": {"gender": "m"}})
+    save(11)
+    assert profile_of("张三")["gender"] == "m", "save() 该把 profiles 原样带过去"
+    # 补充信息是个自由填的框，粘一段带别人的 key 的东西进来是最常见的情形（导入那条路上
+    # 真出现过）。落盘之前必须过一遍脱敏——config.json 是明文，而且整个文件无条件写
+    save(10, profiles={"张三": {"note": "他那个 sk-4cz3A03TGwVyMI0fyfNxe3PFCdy4bLItbC5CPoH2SAnpBTQI 别外传"}})
+    note = profile_of("张三")["note"]
+    assert "sk-4cz3A0" not in note and "[REDACTED]" in note, note
+    assert "sk-4cz3A0" not in json.dumps(_load_all(), ensure_ascii=False), "落盘那份也不许有"
+    # 老配置里没有这个键：读出来就是空的，别把别的键一起带出来
+    _dump({})
+    assert profiles_dict() == {} and profile_of("谁") == {}
 
     # 设置页整份提交：自建关系的名字/正文、默认关系、每个会话的选择都得在
     save_chat_relation("张三", "r1")

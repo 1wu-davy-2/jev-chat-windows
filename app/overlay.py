@@ -8,7 +8,7 @@ from math import isfinite
 from types import SimpleNamespace
 
 from PySide6.QtCore import QLocale, QObject, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QSizeGrip, QSizePolicy,
     QStackedWidget, QVBoxLayout, QWidget,
@@ -28,7 +28,8 @@ from app.theme import (
     RADIUS_XL, SHADOW_PAD,
 )
 from app.version import VERSION
-from core import chatlog, draft, jev_client, llm, paste, providers, relations, relay, styles
+from core import (chatlog, draft, jev_client, llm, paste, profile, providers, relations, relay,
+                  styles)
 from core.questions import CHOICE_LABELS
 
 _LOG_LINES = 300
@@ -1058,6 +1059,11 @@ class Overlay:
         self.targets = {}  # {会话名: ([发言人], 当前回复对象)}
         self._relKeys = []  # 「关系」下拉的选项 [(键, 名字)]，跟控件里的行号一一对应
         self._sceneKeys = []  # 「场景模板」下拉的选项，同上
+        # 「用户维护」那一页维护的资料 {会话名: {gender, zodiac, note}}。在内存里改，
+        # 点「保存设置」才整份落盘（跟关系模型一个套路）；_profileShown 是三个控件里现在
+        # 装着哪个会话的那份——换会话之前得先按它把用户的改动收回来，见 _profile_stash
+        self._profiles = {}
+        self._profileShown = ""
         self._chat = ""  # 微信当前开着的会话。**能不能填只看它**（粘贴是发给微信的，跟面板看谁无关）
         self._shown = ""  # 界面上正在看的会话（浏览、固定时和上面不一样）
         self._pinned = ""  # 固定盯着哪个会话（"" = 跟随微信切）。父进程那份是准的，这里只是镜像
@@ -1449,13 +1455,15 @@ class Overlay:
         heading.addWidget(_tool(FIF.RETURN, "返回回复建议", self._back_home))
         heading.addWidget(_label("设置", FONT_H1, theme.INK, True), 1)
         body.addLayout(heading)
-        body.addWidget(_label("维护每种关系的说话方式，配置判断和起草用的两个模型。", FONT_MD, _MUTED))
+        body.addWidget(_label("维护每种关系怎么说话、每个会话里那个人是谁，配置判断和起草用的两个模型。",
+                              FONT_MD, _MUTED))
         # 两块内容分页签摆，别堆成一长条滚动。标题交给页签，卡片里就不再重复写一遍
         tabs = QHBoxLayout()
         tabs.setSpacing(GAP_SM)
         self.tabButtons = {}
         for key, text in (("preference", "回复偏好"), ("models", "模型设置"),
-                          ("style", "个人风格"), ("system", "系统设置")):
+                          ("style", "个人风格"), ("profile", "用户维护"),
+                          ("system", "系统设置")):
             button = QPushButton(text)
             button.setCheckable(True)
             button.setCursor(Qt.PointingHandCursor)
@@ -1724,6 +1732,71 @@ class Overlay:
         self.styleCard = style
         body.addWidget(style)
 
+        # 第四页签「用户维护」：**这个会话里那个人是谁**——性别、星座，加一段自由补充。
+        # 跟「个人风格」是一对：那一页管「你俩是什么关系、按这个关系怎么说话」（通用口径），
+        # 这一页管「对面这个人具体什么样」。起草时拼在 relationship 那一行下面，**只喂起草**，
+        # 判断那一步不喂（见 core/profile.py）。
+        # 资料跟关系/场景模板一样**按会话**存，所以这一页顶上要先挑是哪个会话。
+        people = _Surface()
+        box = QVBoxLayout(people)
+        box.setContentsMargins(GAP_LG, GAP_LG, GAP_LG, GAP_LG)
+        box.setSpacing(GAP_MD)
+        people_row = QHBoxLayout()
+        people_row.addWidget(_label("维护哪个会话", FONT_MD), 1)
+        self.profileChat = ComboBox()
+        self.profileChat.setMinimumWidth(0)
+        self.profileChat.setPlaceholderText("还没识别到会话")
+        self.profileChat.setAccessibleName("维护哪个会话")
+        self.profileChat.currentIndexChanged.connect(self._profile_changed)
+        people_row.addWidget(self.profileChat)
+        box.addLayout(people_row)
+        box.addWidget(self._hint(
+            "资料按会话存：同一个人在不同会话里是两份。这个列表是这次见过的会话（就是主页"
+            "「当前会话」里那些）加上以前维护过的；想维护一个还没聊到的，先在主页选中它。"))
+        attr_row = QHBoxLayout()
+        attr_row.setSpacing(GAP_SM)
+        attr_row.addWidget(_label("性别", FONT_MD))
+        self.genderBox = ComboBox()
+        self.genderBox.setMinimumWidth(0)
+        self.genderBox.setAccessibleName("对方性别")
+        self.genderBox.addItems([name for _, name in profile.GENDERS])
+        attr_row.addWidget(self.genderBox, 1)
+        attr_row.addSpacing(GAP_MD)
+        attr_row.addWidget(_label("星座", FONT_MD))
+        self.zodiacBox = ComboBox()
+        self.zodiacBox.setMinimumWidth(0)
+        self.zodiacBox.setAccessibleName("对方星座")
+        self.zodiacBox.addItems([name for _, name in profile.ZODIACS])
+        attr_row.addWidget(self.zodiacBox, 1)
+        box.addLayout(attr_row)
+        note_label = _label("补充信息", FONT_MD)
+        box.addWidget(note_label)
+        self.profileNote = TextEdit()
+        self.profileNote.setPlaceholderText(
+            "随便写：怎么称呼 TA、做什么的、最近在忙什么、有什么别碰的话题……")
+        self.profileNote.setFixedHeight(140)
+        self.profileNote.setAccessibleName("补充信息")
+        note_label.setBuddy(self.profileNote)
+        self.profileNote.textChanged.connect(self._note_count)
+        box.addWidget(self.profileNote)
+        note_row = QHBoxLayout()
+        # 不知道从哪儿下笔就点它：往框里塞一份待填的条目，照着填就行。已经有字就接在后面，
+        # 不覆盖用户写的东西；模板已经在里面了就不再塞第二遍
+        self.noteTpl = PushButton("插入模板")
+        self.noteTpl.setAccessibleName("插入填写模板")
+        self.noteTpl.clicked.connect(self._note_template)
+        note_row.addWidget(self.noteTpl)
+        note_row.addStretch(1)
+        self.noteCount = _label("", FONT_XS, _MUTED)
+        note_row.addWidget(self.noteCount)
+        box.addLayout(note_row)
+        box.addWidget(self._hint(
+            "这段跟聊天记录一起发给起草那个模型（回复和开场白都发），用来定称呼和语气；"
+            "判断那一步不喂。提示里会明说「别在话里点破」——你知道 TA 是天蝎座，不等于要说出来。"
+            "只存在本机（config.json），不填就一个字都不加。"))
+        self.profileCard = people
+        body.addWidget(people)
+
         models = _Surface()
         box = QVBoxLayout(models)
         box.setContentsMargins(GAP_LG, GAP_LG, GAP_LG, GAP_LG)
@@ -1978,6 +2051,11 @@ class Overlay:
         # _relShown 先清掉：下面填下拉会触发换型，别拿上一轮的键去收框里的字
         self._relShown = ""
         self._fill_rel_boxes(model["default"], model["default"])
+        # 「用户维护」：整份资料从盘上重读一遍（刚存过的那份就是它），_profileShown 同样先清掉
+        # ——下面重填下拉会触发换会话，别拿上一轮的会话名去收框里的字
+        self._profiles = settings.profiles_dict()
+        self._profileShown = ""
+        self._sync_profile_chats()
         self.contextBox.setValue(settings.context())
         self.roundsBox.setValue(settings.reply_rounds())
         self.targetSwitch.setChecked(settings.reply_target())
@@ -2034,6 +2112,10 @@ class Overlay:
         relation_model.update({"default": self._default_rel_key(),
                                "texts": self._rel_dirty(),
                                "customs": [dict(c) for c in self._relCustoms]})
+        # 「用户维护」：先把框里正在编辑的那份收回内存，再整份提交（跟关系模型一样，
+        # 这一页维护的就是全部——漏了就等于把别的会话的资料清空了）
+        self._profile_stash()
+        people = dict(self._profiles)
         if draft_provider in providers.CUSTOM and draft_provider != "relay" and not base:
             self._settings_feedback("自定义来源要填 Base URL。", error=True)
             self.baseEdit.setFocus()
@@ -2061,7 +2143,7 @@ class Overlay:
         try:
             settings.save(self.contextBox.value(),
                           rounds_n=self.roundsBox.value(),
-                          relation_model=relation_model,
+                          relation_model=relation_model, profiles=people,
                           jev_provider_text=jev_provider,
                           jev_key_text=self.jev.keyEdit.text().strip() or None,
                           jev_model_text=self.jev.modelBox.text().strip(),
@@ -2215,6 +2297,101 @@ class Overlay:
         self.relCount.setText(f"{n} 字" + (f"，超过 {relations.LIMIT} 了，会盖过对话本身"
                                            if n > relations.LIMIT else ""))
 
+    def _profile_chats(self):
+        """「用户维护」那个下拉里该有哪些会话：**这次见过的**（主页那个「当前会话」下拉里的，
+        worker 认出来的都加进去了）加上**以前维护过资料的**（这次还没聊到，但用户想改）。
+
+        不去读聊天记录库凑名单：那张表默认是关的（打包版），而且读一下 sqlite 就会把库文件
+        建出来。够用的口径是「能打开的会话都能维护」——真想维护一个没聊过的，先在主页选它。"""
+        names = [self.chatBox.itemText(i) for i in range(self.chatBox.count())]
+        names += [n for n in self._profiles if n not in names]
+        shown = self._shown
+        if shown and shown not in names:
+            names.insert(0, shown)  # 正看着的那个排最前，多半就是要维护它
+        return names
+
+    def _sync_profile_chats(self):
+        """重填「用户维护」那个会话下拉，并把选中的那份摆到控件上。
+
+        重填之前先 `_profile_stash()`：用户可能正在改 A 的资料，这会儿列表要重算（切页签回来、
+        刚保存完），不收回来那几下白改。选中的会话尽量保持不变，没了才退回正看着的那个。"""
+        self._profile_stash()
+        chat = self.profileChat.currentText() if self.profileChat.count() else ""
+        names = self._profile_chats()
+        if chat not in names:
+            chat = self._shown or (names[0] if names else "")
+        self.profileChat.blockSignals(True)
+        self.profileChat.clear()
+        self.profileChat.addItems(names)
+        self.profileChat.setCurrentIndex(names.index(chat) if chat in names else -1)
+        self.profileChat.blockSignals(False)
+        self._profile_show(chat)
+
+    def _profile_show(self, chat):
+        """把这个会话的资料摆到三个控件上。没有会话（一个都没见过）就整个灰掉——
+        那会儿拨了也没有对象可改，跟面板上「关系」下拉灰着的道理一样。"""
+        self._profileShown = chat or ""
+        one = self._profiles.get(self._profileShown) or {}
+        for box, table, current in ((self.genderBox, profile.GENDERS, one.get("gender") or ""),
+                                    (self.zodiacBox, profile.ZODIACS, one.get("zodiac") or "")):
+            box.blockSignals(True)
+            box.setCurrentIndex(next((i for i, (k, _) in enumerate(table) if k == current), 0))
+            box.blockSignals(False)
+        self.profileNote.blockSignals(True)
+        self.profileNote.setPlainText(one.get("note") or "")
+        self.profileNote.blockSignals(False)
+        for widget in (self.genderBox, self.zodiacBox, self.profileNote, self.noteTpl):
+            widget.setEnabled(bool(self._profileShown))
+        self._note_count()
+
+    def _profile_stash(self):
+        """把三个控件里那份收回 `self._profiles`。**换会话、保存之前都要先调它**——
+        不收回来，用户刚打的那几个字就被下一份覆盖掉了（跟关系那个 `_relShown` 一个道理）。
+
+        三项都空 = 把这个会话那一格删掉，不留空壳。过一遍 `profile.clean` 才判——「只点了插入
+        模板、一个字没填」也算空（判据跟落盘那边是同一个，见 core/profile.clean），顺手把
+        存进内存的那份收成规范形状（下拉给的就是键，正文 strip 过）。"""
+        chat = self._profileShown
+        if not chat:
+            return
+        one = profile.clean(
+            {"gender": profile.GENDERS[max(0, self.genderBox.currentIndex())][0],
+             "zodiac": profile.ZODIACS[max(0, self.zodiacBox.currentIndex())][0],
+             "note": self.profileNote.toPlainText()})
+        if one:
+            self._profiles[chat] = one
+        else:
+            self._profiles.pop(chat, None)
+
+    def _profile_changed(self, index):
+        """换了个会话来维护：先把手上这份收进内存，再把新那份摆上来。"""
+        self._profile_stash()
+        self._profile_show(self.profileChat.itemText(index) if index >= 0 else "")
+
+    def _note_template(self):
+        """往「补充信息」里塞一份待填的条目。已经有字就接在后面、不覆盖用户写的东西；
+        模板已经在里面了（判据是第一行）就不塞第二遍——按两下按钮不该出来两份模板。
+
+        光标挪到末尾再聚焦：用户接着就能往下填。"""
+        box = self.profileNote
+        text = box.toPlainText()
+        if profile.TEMPLATE.splitlines()[0] not in text:
+            box.setPlainText((text.rstrip() + "\n" if text.strip() else "") + profile.TEMPLATE)
+        box.setFocus()
+        cursor = box.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        box.setTextCursor(cursor)
+
+    def _note_count(self):
+        """框里多少字。超过上限保存时会被截掉，所以到了就明说——别让用户写完才发现少了半截。"""
+        n = len(self.profileNote.toPlainText().strip())
+        over = n > profile.NOTE_LIMIT
+        self.noteCount.setText(f"{n} 字" + (f"，超过 {profile.NOTE_LIMIT} 了，保存时会截掉"
+                                            if over else ""))
+        color = theme.WARN if over else _MUTED
+        qss = f"BodyLabel {{ color: {color}; background: transparent; }}"
+        setCustomStyleSheet(self.noteCount, qss, qss)
+
     def _opener_toggled(self, on):
         """只灰掉/点亮那个分钟数。落盘还是走「保存设置」——跟调试视图那种拨一下立刻生效的
         开关不一样，冷场开场白是下一次生成才用得上的偏好。"""
@@ -2310,7 +2487,10 @@ class Overlay:
         self.preferenceCard.setVisible(key == "preference")
         self.modelsCard.setVisible(key == "models")
         self.styleCard.setVisible(key == "style")
+        self.profileCard.setVisible(key == "profile")
         self.systemCard.setVisible(key == "system")
+        if key == "profile":
+            self._sync_profile_chats()  # 会话列表是活的：进来的时候现取一次
         if key == "system":
             self._sync_chatlog()  # 占用多少、有多少条，进来的时候现算一次
 
