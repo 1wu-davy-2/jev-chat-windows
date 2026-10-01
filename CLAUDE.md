@@ -100,12 +100,12 @@ CI：推 `v*` tag → `.github/workflows/release.yml` 在 windows-latest 上打�
 
 ## 远端（推代码之前先看这条）
 
-**用户不说具体是哪个远端时，一律指 `origin`** = `https://github.com/1wu-davy-2/jev-chat-windows`。
+**用户不说具体是哪个远端时，一律指 `origin`** = `git@github.com:1wu-davy-2/jev-chat-windows.git`。
 
 | 远端 | 地址 | 是什么 |
 | --- | --- | --- |
-| `origin` | `github.com/1wu-davy-2/jev-chat-windows` | **默认**，本仓库的 fork，推拉都走它 |
-| `upstream` | `github.com/jev-chat/jev-chat-windows` | 上游原作者，**只读**；要合它的代码得显式写 `upstream` |
+| `origin` | `git@github.com:1wu-davy-2/jev-chat-windows.git` | **默认**，本仓库的 fork，推拉都走它 |
+| `upstream` | `git@github.com:jev-chat/jev-chat-windows.git` | 上游原作者，**只读**；要合它的代码得显式写 `upstream` |
 
 **命令里一律把远端名写全**：
 
@@ -118,6 +118,13 @@ git merge upstream/main     # 只有明确要合上游时才写 upstream
 `main` 以前跟踪的是 `upstream/main`（裸 `git push` 会打到上游去），2026-09-28 已经改成
 `origin/main` 了，现在裸推也安全。但还是写全——写全了就不依赖本机这份 git 配置，
 换台机器、换个克隆照样对。
+
+**地址一律写 SSH 形式**（`git@github.com:...`）：本机存的凭据就是 SSH key，remote 一旦写成
+`https://`，git 就会去用 Windows 凭据管理器里那个 token 而不是这把 key（全局约定里那条）。
+
+**推之前先 `git remote -v` 扫一眼**：2026-10-01 这台机器上曾经是反的——`origin` 指着上游原作者、
+fork 叫 `mine`，照着上面敲 `git push origin main` 会直接把人推进上游仓库去（那次是靠 `git remote -v`
+看出来的，不是靠这页文档）。名字现在已经理顺，但换个克隆、换台机器仍可能不一样。
 
 ## 架构
 
