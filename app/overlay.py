@@ -2106,7 +2106,8 @@ class Overlay:
         self._settings_feedback(f"删掉了「{name}」，用它的会话会退回默认关系；点「保存设置」生效。")
 
     def _rel_count(self):
-        """框里多少字。出厂的几型都压在 200 以内，自己加写的超过这个数就该掂量一下了。"""
+        """框里多少字。超过 LIMIT 就该掂量一下了——**长不等于好**：抽象形容堆多了，
+        模型会照着说明造句，反而盖过 me 自己的口吻样本。有用的长正文是具体的词、例句、标点习惯。"""
         n = len(self.relTextEdit.toPlainText().strip())
         self.relCount.setText(f"{n} 字" + (f"，超过 {relations.LIMIT} 了，会盖过对话本身"
                                            if n > relations.LIMIT else ""))

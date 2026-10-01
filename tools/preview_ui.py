@@ -231,7 +231,7 @@ def main() -> int:
     # 演示里：判断走 OpenRouter，起草走 DeepSeek 官网；全程就两把 key，都当「已配置」。
     # --relay 换成两边都走第三方中转，把那一组字段露出来（地址是编的，不会联网）。
     configured = "" if args.state == "setup" else "demo-key"
-    demo_settings = {"context": 10,
+    demo_settings = {"context": 30,
                      # 关系模型：默认朋友；_CHAT 单独指定成「同事」（面板上那个下拉要看出是**按会话**的）；
                      # 内置那型有一条改过的、外加一条自建的，设置页两种状态都截得到
                      "relations": {"default": "friend",

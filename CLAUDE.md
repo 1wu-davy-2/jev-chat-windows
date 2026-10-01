@@ -61,7 +61,7 @@ python main.py
 # 内置自测（就这几处，跑完打印 ok）
 python core/draft.py        # 候选解析器 + 防注入过滤的断言 + 开场白那根管道
 python core/engine.py       # 判断挂了不丢候选、开场白不过 Jev、trace 留痕
-python core/relations.py    # 关系：每段正文 ≤200 字、键/名字不重、自建关系的键怎么编
+python core/relations.py    # 关系：每段正文 ≤1000 字、键/名字不重、自建关系的键怎么编
 python core/styles.py       # 场景模板：选项顺序、挑了用挑的那型、没挑退回关系那型
 python app/settings.py      # 关系模型：老配置迁移、存盘不丢别的键、按会话读回（写临时目录，不碰本机配置）
 python core/trace.py        # AI 记录库：写读回填清空、类型转换、脱敏、没配库时不建文件
@@ -517,7 +517,9 @@ scrollbar 的 `maximum()` 还是旧值，跟底得 `QTimer.singleShot(0, ...)`�
   （调试视图、桌面宠物、聊天会话存储）在加载时会真的去开窗/配库。
 - **关系**（`core/relations.py`）：这个会话里的人是谁，外加**按这个关系该怎么说话**。七型内置
   （朋友 / 恋人 / 暧昧 / 同事 / 职场 / 家人 / 18+），出厂正文在 `PRESETS` 里，**加一型**只要往那儿加一条，
-  `settings.relation_choices()` 和两个下拉就都认了。每段 **≤200 字**（`LIMIT`，自测卡着）。
+  `settings.relation_choices()` 和两个下拉就都认了。每段 **≤1000 字**（`LIMIT`，自测卡着）。
+  **长不等于好**：写长的理由是「具体」（常用词、例句、标点习惯），不是「多堆形容词」——抽象要求
+  写多了模型会照着说明造句，反而盖过口吻样本，人机味更重。
   喂给模型两处：起草提示里的 `relationship: 朋友` 那一句（喂的是**中文名**，不是键），
   以及 `scene` 那一段正文（走 `styles.resolve`）。
   存一个键 `relations`：`{default, texts, customs, chats}`——`texts` **只存跟出厂原文不一样的**

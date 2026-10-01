@@ -63,5 +63,7 @@ if __name__ == "__main__":
     # 用户改过的正文照样认
     assert resolve("friend", relation_texts={"friend": " 我改的 "}) == "我改的"
     assert resolve(FOLLOW, relation="friend", relation_texts={"friend": ""}) == ""
-    assert LIMIT == 200
+    # 上限只有一处定义（relations.LIMIT），这儿只是个别名。别在这儿抄一个数字进来——
+    # 以前这行写的是 `assert LIMIT == 200`，改 relations 的上限时它必挂，白挡一次。
+    assert LIMIT == relations.LIMIT, "styles 的上限得跟着 relations 走，别自己写死"
     print("styles ok")

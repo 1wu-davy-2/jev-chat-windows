@@ -258,7 +258,7 @@ def guidance_text(answers: dict) -> str:
     return "判断参考（Jev 给的，起草要顺着它写，但口吻仍按我的）：\n" + "\n".join(lines)
 
 
-def build_state(messages: list, relationship: str, keep: int = 10,
+def build_state(messages: list, relationship: str, keep: int = 30,
                 reply_to: str | None = None) -> dict:
     """messages: (from, text) / (from, text, name) / dict（name 可选）。from 只认 her/me。
 

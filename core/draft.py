@@ -262,7 +262,7 @@ def _prompt(messages: list, relationship: str, keep: int, reply_to: str | None,
 
 def _draft(messages: list, relationship: str, system: str, opener: bool = False,
            provider: str = "deepseek", model: str | None = None,
-           base_url: str | None = None, timeout: float = 30, keep: int = 10,
+           base_url: str | None = None, timeout: float = 30, keep: int = 30,
            reply_to: str | None = None, scene: str = "", thinking: bool = False,
            guidance: str | None = None, thinking_style: str = "",
            info: dict | None = None) -> list[str]:
@@ -327,7 +327,7 @@ def _draft(messages: list, relationship: str, system: str, opener: bool = False,
 
 def draft_candidates(messages: list, relationship: str, provider: str = "deepseek",
                      model: str | None = None, base_url: str | None = None,
-                     timeout: float = 30, keep: int = 10,
+                     timeout: float = 30, keep: int = 30,
                      reply_to: str | None = None, scene: str = "", thinking: bool = False,
                      guidance: str | None = None, thinking_style: str = "",
                      info: dict | None = None) -> list[str]:
@@ -353,7 +353,7 @@ def draft_candidates(messages: list, relationship: str, provider: str = "deepsee
 
 def draft_openers(messages: list, relationship: str, provider: str = "deepseek",
                   model: str | None = None, base_url: str | None = None,
-                  timeout: float = 30, keep: int = 10, reply_to: str | None = None,
+                  timeout: float = 30, keep: int = 30, reply_to: str | None = None,
                   scene: str = "", thinking: bool = False,
                   thinking_style: str = "", info: dict | None = None) -> list[str]:
     """冷场时的一批开场白：最后一句是 me 说的、对方一直没回，起草 3 条「主动再开一次口」的消息。
@@ -436,11 +436,18 @@ if __name__ == "__main__":
         assert got["dropped"] == [] and got["retry_reply"] == ""  # 三条齐了，没走追问补齐
 
         # 空会话（刚加的好友、只有表情/图片）：同一根管道，换成「先开口打个招呼」那套。
-        # 用户手动点得着这条路（自动那次得有「我上一条」才起算）
-        blank_user = _prompt([], "friends", 10, None, "", None, True)[0]
+        # 用户手动点得着这条路（自动那次得有「我上一条」才起算）。
+        # keep 调大（默认 30）对它是**零影响**：没有记录就是没有，多出来的额度补不进任何东西，
+        # 更不许让模型编出「上次」——下面第一条断言就是锁这个的。
+        blank_user = _prompt([], "friends", 30, None, "", None, True)[0]
+        assert blank_user == _prompt([], "friends", 10, None, "", None, True)[0], \
+            "空会话的提示跟 keep 大小无关"
         assert "一句话都没有" in blank_user, blank_user
         assert "对方一直没回" not in blank_user, "空会话没人被晾着，别照抄冷场那套"
         assert "（这个会话还没有任何文字消息）" in blank_user, "空记录得写一句，别摆个空框"
+        # 记录比 keep 短时有多少喂多少：两条消息就是两条，不补空、不截断
+        few = _prompt(msgs, "friends", 30, None, "", None, False)[0]
+        assert "her: 在忙吗" in few and "me: 刚忙完" in few, few
         got = {}
         assert draft_openers([], "friends", info=got) == ["在忙吗", "上次说的那家店还去吗", "睡了吗"]
         assert got["system"] == OPENER_BLANK_SYSTEM and got["system"] != OPENER_SYSTEM

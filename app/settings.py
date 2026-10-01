@@ -23,7 +23,11 @@ _CONFIG = os.path.join(_ROOT, "config.json")
 # 一个库文件、两张表：runs（AI 调用记录，core/trace.py）+ messages（聊天记录，core/chatlog.py）。
 # 合成一个文件只是「字节放哪儿」——两张表的开关、清空入口、默认值还是各管各的，别混。
 _DB = os.path.join(_ROOT, "jev.db")  # 已进 .gitignore
-_DEFAULT_CONTEXT = 10
+# 参考上下文默认条数（起草和判断各看最近多少条）。给到上限 30：口吻样本和「接得上话」都靠它，
+# 给少了模型手里没料，只能拿通用腔写——那就是「人机味」。
+# **没有记录时不受这条影响**：各处取的都是 messages[-keep:]，有多少喂多少；刚加的好友（空会话）
+# 走 OPENER_BLANK_SYSTEM 那套「先开口打个招呼」，样本段一条都不给（见 draft._prompt）。
+_DEFAULT_CONTEXT = 30
 # 老配置里 relationship 存的是这几个英文（安卓原版传下来的），迁移时折回内置的键
 _LEGACY_RELATION_KEYS = {"romantic partners": "romance", "friends": "friend",
                          "colleagues": "colleague", "family": "family"}

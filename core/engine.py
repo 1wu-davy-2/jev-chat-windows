@@ -26,7 +26,7 @@ def _add_usage(total: dict, one: dict | None) -> None:
 
 
 def analyze(messages: list, relationship: str, model: str | None = None,
-            timeout: float = 30, context: int = 10, provider: str = "deepseek",
+            timeout: float = 30, context: int = 30, provider: str = "deepseek",
             base_url: str | None = None, reply_to: str | None = None, scene: str = "",
             thinking: bool = False, jev_provider: str = "openrouter",
             jev_model: str | None = None, judge_path: str = "",
@@ -160,7 +160,7 @@ def analyze(messages: list, relationship: str, model: str | None = None,
 
 
 def analyze_opener(messages: list, relationship: str, model: str | None = None,
-                   timeout: float = 30, context: int = 10, provider: str = "deepseek",
+                   timeout: float = 30, context: int = 30, provider: str = "deepseek",
                    base_url: str | None = None, reply_to: str | None = None, scene: str = "",
                    thinking: bool = False, thinking_style: str = "") -> dict:
     """冷场时的一批开场白（最后一句是 me 说的、对方一直没回）：只起草，**不过 Jev**。
@@ -277,7 +277,7 @@ if __name__ == "__main__":
     assert tr["judge_state"]["chat"]["messages"][0]["text"] == "hello", "judge 收到的 state 要留着"
     assert tr["judge_error"] == "Jev HTTP 401" and "judge_answers" not in tr
     assert tr["judge_ms"] >= 0 and tr["ms"] >= 0 and "draft" in tr
-    assert tr["draft_provider"] == "deepseek" and tr["context_n"] == 10
+    assert tr["draft_provider"] == "deepseek" and tr["context_n"] == 30
 
     # 起草就挂了：材料得挂在异常上一起抛出去，调用方照样能落库（失败的那轮最该查）
     with patch("__main__.ask", return_value={"answers": {}, "usage": {}}), \
