@@ -228,6 +228,32 @@ def rewrite_tail(chat: str, rows, drop: int) -> bool:
         return False
 
 
+def replace_chat(chat: str, rows) -> bool:
+    """把某个会话的记录**整段换成** rows（界面那个五元组，时间正序）。导入专用。
+
+    跟 `rewrite_tail` 的差别只有一个：那个只换尾巴，这个从头换。导入的旧记录要按时间戳插到
+    **现有记录中间甚至前面**，尾巴那一招够不着——所以整段删了重插。
+
+    调用方（`main.import_history`）负责把新旧两批合并好、排好序再递进来；这里只管换。
+
+    `rows` 为空不删——**「清空」是另一条路**（`clear_chat`）。传空就当调用方算错了，
+    别把人家攒的记录顺手抹了。"""
+    rows = [tuple(r) for r in (rows or ())]
+    if not _ON or not chat or not rows:
+        return False
+    try:
+        with _LOCK, closing(_connect()) as c:
+            c.execute("delete from messages where chat=?", (_s(chat),))
+            c.executemany("insert into messages (chat, who, text, name, stamp, voice, ts)"
+                          " values (?, ?, ?, ?, ?, ?, ?)",
+                          [(_s(chat), _s(w), _s(t), _s(n), _s(st), _s(v), int(time.time()))
+                           for w, t, n, st, v in rows])
+            c.commit()
+            return True
+    except Exception:
+        return False
+
+
 def recent(chat: str, limit: int = 300) -> list[tuple]:
     """某个会话最近的若干条，**按时间正序**（最老的在前，最新的在最后）——跟 feeds 一个方向。
     读不出来返回空表，界面照常开。"""

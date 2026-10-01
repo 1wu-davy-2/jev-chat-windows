@@ -128,6 +128,7 @@ class _ImportBox(MessageBoxBase):
         self._rows = []
         self._names = []
         self._skipped = 0
+        self._media = 0
         self._chat = chat
         # 上次给这个会话起过的名字，这次直接套上，不用重填
         self._saved = settings.chat_remarks(chat)
@@ -144,19 +145,31 @@ class _ImportBox(MessageBoxBase):
         self.textEdit.setMinimumWidth(430)
         self.viewLayout.addWidget(self.textEdit)
 
-        row = QHBoxLayout()
-        row.setSpacing(GAP_SM)
-        row.addWidget(_label("哪个是我", FONT_SM))
-        self.meBox = ComboBox()
-        self.meBox.setMinimumWidth(200)
-        row.addWidget(self.meBox, 1)
-        self.viewLayout.addLayout(row)
+        # 「哪个是我」是**多选**：同一个人在不同场合昵称会变（真机上一个人既是那串隐形
+        # 昵称、又是转发记录里的 ZBK），单选只能认一个，另一个会被当成对方——语气就学反了。
+        # **默认一个都不勾**：以前是个默认选中第一项的下拉，用户没留意就选错了，整批
+        # 记录的主客关系全反过来（真机上踩过，全库 176 条里同一昵称横跨 me 和 her 两边）。
+        # 逼着主动勾一下，比事后查半天便宜。
+        self.viewLayout.addWidget(_label("哪个是我（可多选）", FONT_SM))
+        self.meHolder = QWidget()
+        self.meBox = QHBoxLayout(self.meHolder)
+        self.meBox.setContentsMargins(0, 0, 0, 0)
+        self.meBox.setSpacing(GAP_MD)
+        self.viewLayout.addWidget(self.meHolder)
+        self._meBoxes = {}  # {原昵称: CheckBox}
 
         # 认不出的昵称（全隐形字符）给一个改名的入口，摆在「哪个是我」**下面**——
         # 得先知道谁是谁，上面那个下拉才挑得出来。没有这种昵称时这一片是空的，不占地方。
         self.remarkBox = QVBoxLayout()
         self.remarkBox.setSpacing(GAP_XS)
         self.viewLayout.addLayout(self.remarkBox)
+
+        # 默认勾上：`[语音] 5"` 这种进上下文对模型就是噪音（它会被当成对方说的一句话）。
+        # 想留个「当时发过语音」的痕迹就取消勾选，那会儿会换成跟实时采集一样的
+        # 「🔊 语音消息 N"」占位——不滤的语音**不能**原样当正文存，见 main.import_history。
+        self.mediaBox = CheckBox("跳过非文本消息（语音 / 图片 / 表情 / 转账 / 文件）")
+        self.mediaBox.setChecked(True)
+        self.viewLayout.addWidget(self.mediaBox)
 
         self.replaceBox = CheckBox("替换这个会话现有的聊天记录（不勾就是接在后面）")
         self.viewLayout.addWidget(self.replaceBox)
@@ -169,6 +182,8 @@ class _ImportBox(MessageBoxBase):
         self.cancelButton.setText("取消")
         self.yesButton.setEnabled(False)
         self.textEdit.textChanged.connect(self._reparse)
+        # 勾选框变了要重解析一遍：滤掉的那些条数得跟着变，不然摘要里那句一直不动
+        self.mediaBox.stateChanged.connect(self._reparse)
 
     def _label_of(self, raw):
         """这个昵称显示成什么：用户起的名字优先；没起名就按 `visible()` 把隐形字符
@@ -178,11 +193,34 @@ class _ImportBox(MessageBoxBase):
         return typed or self._saved.get(raw) or paste.visible(raw)
 
     def _sync_names(self):
-        """改名之后只刷下拉框的文字，**不重建**——重建会把正在打字的那个输入框弄失焦
+        """改名之后只刷勾选框的文字，**不重建**——重建会把正在打字的那个输入框弄失焦
         （每敲一个字符都会走到这儿）。"""
-        for i in range(self.meBox.count()):
-            self.meBox.setItemText(i, self._label_of(self.meBox.itemData(i)))
+        for raw, box in self._meBoxes.items():
+            box.setText(self._label_of(raw))
         self._update_summary()
+
+    def _rebuild_me(self, names):
+        """给「哪个是我」摆一排勾选框。只在昵称集合变了的时候重建，已勾的保持勾着。"""
+        for i in reversed(range(self.meBox.count())):
+            item = self.meBox.takeAt(i)
+            holder = item.widget()
+            if holder is not None:
+                holder.deleteLater()  # 光 removeWidget 不会真删，留着等 GC 会漏一片
+        checked = {raw for raw, box in self._meBoxes.items() if box.isChecked()}
+        self._meBoxes = {}
+        for raw in names:
+            box = CheckBox(self._label_of(raw))
+            box.setChecked(raw in checked)  # setChecked 在 connect 之前，不会提前触发一次
+            box.stateChanged.connect(self._me_changed)
+            self.meBox.addWidget(box)
+            self._meBoxes[raw] = box
+
+    def _me_changed(self, *_):
+        self._update_summary()
+
+    def _picked_me(self):
+        """勾上的那些昵称（原样的，没改名之前的）。"""
+        return [raw for raw, box in self._meBoxes.items() if box.isChecked()]
 
     def _update_summary(self):
         bits = []
@@ -192,6 +230,14 @@ class _ImportBox(MessageBoxBase):
             bits.append("发言者：" + "、".join(self._label_of(n) for n in self._names))
         if self._skipped:
             bits.append(f"{self._skipped} 段认不出来，跳过")
+        if self._media:
+            bits.append(f"{self._media} 条非文本消息已跳过")
+        picked = self._picked_me()
+        if len(picked) > 1:
+            bits.append(f"「我」认了 {len(picked)} 个昵称")
+        if self._names and not picked:
+            # 一个都没勾时按钮也是灰的，得说清为什么，不然只看到「导入」点不动
+            bits.append("还没勾哪个是你")
         self.summary.setText(" · ".join(bits)
                              or "还没解析出内容——检查一下是不是「昵称 / 时间 / 正文」的格式。")
 
@@ -218,35 +264,35 @@ class _ImportBox(MessageBoxBase):
             self._remarkEdits[raw] = edit
             self.remarkBox.addWidget(holder)
 
-    def _reparse(self):
-        rows, names, skipped = paste.parse(self.textEdit.toPlainText())
-        self._rows, self._skipped = rows, skipped
-        # 只在发言者变了的时候重建下拉。每敲一个字都重建的话，用户刚选好的「哪个是我」
-        # 会被顶回第一项——正文里随便加个字都会触发 textChanged。
+    def _reparse(self, *_):
+        # `*_` 是给 stateChanged 那种带参数信号用的（textChanged 不带，两边都得吃得下）
+        rows, names, skipped, media = paste.parse(
+            self.textEdit.toPlainText(), skip_media=self.mediaBox.isChecked())
+        self._rows, self._skipped, self._media = rows, skipped, media
+        # 只在发言者变了的时候重建勾选框。每敲一个字都重建的话，用户刚勾好的「哪个是我」
+        # 会被顶掉——正文里随便加个字都会触发 textChanged。
         if names != self._names:
-            keep = self.meBox.currentData()
             self._names = names
             self._rebuild_remarks([n for n in names if paste.needs_label(n)])
-            self.meBox.blockSignals(True)
-            self.meBox.clear()
-            for n in names:
-                self.meBox.addItem(self._label_of(n), userData=n)
-            if keep in names:
-                self.meBox.setCurrentIndex(names.index(keep))
-            self.meBox.blockSignals(False)
+            self._rebuild_me(names)
         self._update_summary()
-        self.yesButton.setEnabled(bool(rows) and self.meBox.currentIndex() >= 0)
+        self.yesButton.setEnabled(bool(rows) and bool(self._picked_me()))
 
     def result_rows(self):
-        """`(rows, 哪个是我, 要不要替换, 起过的名字)`。
+        """`(rows, 哪些是我, 要不要替换, 起过的名字)`。
 
         rows 的昵称已经换成用户起的名字了——调用方直接喂 `paste.to_messages` 就行。
+        第二个是**一组**昵称：本人可能有好几个名字（隐形昵称 + 转发记录里的 ZBK），
+        `to_messages` 收得下。
         第四个是 `{原昵称: 名字}`，调用方拿它落盘，下次导入不用重填。"""
         labels = {raw: e.text().strip() for raw, e in self._remarkEdits.items()}
-        rows = [(labels.get(n) or self._saved.get(n) or n, t, s) for n, t, s in self._rows]
-        me = self.meBox.currentData() or ""
-        return rows, (labels.get(me) or self._saved.get(me) or me), \
-            self.replaceBox.isChecked(), {k: v for k, v in labels.items() if v}
+        # 跟 rows 用**同一条**改名链，否则勾出来的名字在 rows 里找不到（隐形昵称那条尤其
+        # 明显：rows 兜底留原文，_label_of 兜底换成 `·`，两边对不上）
+        def _name_of(raw):
+            return labels.get(raw) or self._saved.get(raw) or raw
+        rows = [(_name_of(n), t, s) for n, t, s in self._rows]
+        me = [_name_of(raw) for raw in self._picked_me()]
+        return rows, me, self.replaceBox.isChecked(), {k: v for k, v in labels.items() if v}
 
 
 def _label(text="", size=14, color=None, bold=False, parent=None):
@@ -880,7 +926,7 @@ class Overlay:
                  on_toggle_debug=None, on_voice_convert=None, on_opener_again=None,
                  on_settings_saved=None, on_open_history=None, on_use=None, on_pin_change=None,
                  on_relation_change=None, on_scene_change=None, on_toggle_chatlog=None,
-                 on_reread=None, on_make_shortcut=None, on_import=None):
+                 on_reread=None, on_make_shortcut=None, on_import=None, on_clear=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。
@@ -895,7 +941,8 @@ class Overlay:
         挑的是场景模板（第二项为空串 = 跟随关系）。两个都是拨一下立刻写盘、下次生成才用。
         on_toggle_chatlog(开不开) → 「聊天会话存储」那个开关，拨一下立刻生效（父进程配库）。
         on_reread() → 用户点了「重新识别」，要叫醒子进程把屏幕整个重读一遍（父进程那边发信号）。
-        on_make_shortcut() → 用户点了「创建桌面快捷方式」（写 .lnk 要 COM，界面这边不碰）。"""
+        on_make_shortcut() → 用户点了「创建桌面快捷方式」（写 .lnk 要 COM，界面这边不碰）。
+        on_clear(会话名) → 用户点了「清除」，要把这个会话的记录清掉（库和上下文在父进程那边）。"""
         self.app = QApplication.instance() or QApplication([])
         self.app.setWindowIcon(_app_icon())
         setTheme(Theme.LIGHT)
@@ -916,6 +963,7 @@ class Overlay:
         self.on_reread = on_reread
         self.on_make_shortcut = on_make_shortcut
         self.on_import = on_import
+        self.on_clear = on_clear
         self.result_of = result_of
         self._voices = {}  # {会话名: [(x0,y0,x1,y1,时长)]}，语音气泡的位置，转文字要右键它
         self._opener = {}  # {会话名: 对方多少分钟没回}，现在摆的是开场白（不是回复）的会话
@@ -1275,6 +1323,15 @@ class Overlay:
             "在微信里选中几条消息复制，粘进来当聊天记录。\n"
             "导入的对话会进喂给模型的上下文，后面起草会参考这段的语气。")
         log_row.addWidget(self.importButton, 0)
+        # 清除：把**这一个会话**的记录清干净，好从头重导。别跟设置页那个「清空聊天记录」
+        # 搞混——那个一次清全库，这个只清当前会话（见 _clear）。
+        self.clearButton = PushButton("清除")
+        self.clearButton.clicked.connect(self._clear)
+        self.clearButton.setAccessibleName("清除这个会话的聊天记录")
+        self.clearButton.setToolTip(
+            "把这个会话的聊天记录清空（只清这一个会话，别的会话不受影响）。\n"
+            "导入搞脏了、想从头来过的时候用。删了找不回来。")
+        log_row.addWidget(self.clearButton, 0)
         # 重新识别：把微信里现在这几屏**整个重读一遍**，跟下面的记录对账——漏掉的补进来、
         # 之前读花了的就地改掉（真机上出现过「?」「嗯」这种单字被 OCR 吃掉、当没说过）。
         # 采集只在画面变过才交帧，点它的时候画面多半早静止了，所以走 Capture 留的那份最近帧
@@ -2591,7 +2648,7 @@ class Overlay:
         if not self._shown:
             self.set_status("导入：先切到一个会话，再导。", "warning")
             return
-        box = _ImportBox(self, self._shown)
+        box = _ImportBox(self.win, self._shown)
         if not box.exec():
             return
         rows, me, replace, labels = box.result_rows()
@@ -2601,6 +2658,33 @@ class Overlay:
             settings.save_chat_remark(self._shown, raw, label)
         if self.on_import:
             self.on_import(self._shown, rows, me, replace)
+
+    def _clear(self):
+        """「清除」按钮：把这**一个会话**的记录清干净，好从头重导。
+
+        **跟设置页那个「清空聊天记录」方向是反的，别把两处弄混**（两边都留着说明，因为
+        这个区别最容易改错）：
+          - 设置页那个（`_clear_chatlog`）清**全库**，而且**故意不动内存**——清了内存会让
+            `_already_read` 放行，屏幕上那几屏被当成新消息重读一遍、又写回库里，等于没清干净；
+          - 这个只清**当前这个会话**，而且**有意连内存一起清**——用户就是要它从头来过
+            （真机上的用法：被几次导入搞脏了，想清干净重导）。
+        代价一样：屏幕上还留着的那几屏，下次采集会重新读进来。那是「清除」这个动作本身的
+        意思，不是 bug。
+
+        落库和写上下文都在父进程（`main.clear_history`）——这儿拿不到
+        `chats[会话]["history"]`，那份才是喂模型的东西。"""
+        if not self._shown:
+            self.set_status("清除：先切到一个会话，再清。", "warning")
+            return
+        if not _ConfirmBox(
+                "清除这个会话的聊天记录？",
+                f"「{self._shown}」在本机存的聊天记录全部删掉，删了找不回来。\n"
+                "其它会话、关系、设置都不受影响。\n\n"
+                "清完之后，微信里现在还摆在屏幕上的那几屏，下次采集会重新读进来。",
+                self.win).exec():
+            return
+        if self.on_clear:
+            self.on_clear(self._shown)
 
     def _make_shortcut(self):
         """「创建桌面快捷方式」按钮。写 .lnk 走 COM，那摊子事在 app/shortcut.py + main 那边，
@@ -2655,7 +2739,7 @@ class Overlay:
         也别把这条丢了。
 
         **不写库**：库里那一段由调用方整段重写（`chatlog.rewrite_tail`），append 追不到中间去。"""
-        entry = (who, text, name, datetime.now().strftime("%H:%M"), "")
+        entry = (who, text, name, datetime.now().strftime("%m-%d %H:%M"), "")
         lines = self.feeds.setdefault(chat, [])
         at = 0 if after is None else len(lines)  # None = 补在开头；锚点找不到才退回末尾
         if after:
@@ -2685,19 +2769,24 @@ class Overlay:
             self.hers[chat] = hers[-1]
         self._add_chat(chat)
 
-    def reset_feed(self, chat):
-        """清空一个会话的记录（导入时勾了「替换现有记录」才走这儿）。
+    def set_feed(self, chat, rows):
+        """把某个会话的记录**整段换成** rows（五元组，时间正序）。导入用。
 
-        **只动内存**——库里那份由调用方单独清（`chatlog.clear_chat`）。这个类里凡是碰库的
-        都从 `log_message` 那条路走，别在这儿开第二个口子（CLAUDE.md「聊天记录」第 1 条）。
+        `rows` 传空就是**清空**这个会话——导入勾了「替换现有记录」时走的就是这条（原来
+        这儿有个单独的 `reset_feed`，因为只服务那一个调用点，被这个替掉了）。
 
-        注意它跟设置页那个「清空聊天记录」**方向是反的**：那个故意不动内存，理由是清了
-        `feeds`/`history` 会让 `_already_read` 放行、屏幕上那几屏被当新消息重读一遍。
-        这儿反过来，是非清不可——用户就是要拿导入的那段顶掉现有的。代价一样：屏幕上的
-        实时消息下次采集时会重新进来，那是「替换」这个动作本身的意思，不是 bug。"""
-        self.feeds.pop(chat, None)
-        self.counts.pop(chat, None)
+        **只动内存**——库里那份由调用方整段重写（`chatlog.replace_chat`），道理跟
+        `insert_message` 一样：导入的旧记录要插到现有记录中间，append 追不进去，只能整段来。
+
+        `counts` 和 `hers` 跟着重算：不重算的话角标还挂着旧的条数，候选条上还摆着
+        上一句（`_sync_hers` 按位置算，比手写靠谱）。"""
+        lines = [tuple(r) for r in (rows or ())]
+        del lines[:-_LOG_LINES]
+        self.feeds[chat] = lines
+        self.counts[chat] = len(lines)
         self.hers.pop(chat, None)
+        self._sync_hers(chat)
+        self._add_chat(chat)
         if chat == self._shown:
             self._render_feed()
             self._history_title()
@@ -2709,7 +2798,7 @@ class Overlay:
         「🔊 语音消息 3"」就并成一条（微信那边本来就是一条：气泡 + 转写），对不上就单独
         一条、气泡里标一行「🔊 语音转文字」。"""
         chat = chat or self._shown
-        timestamp = timestamp or datetime.now().strftime("%H:%M")
+        timestamp = timestamp or datetime.now().strftime("%m-%d %H:%M")
         if voice and self._merge_voice(chat, who, text, name, voice):
             if who == "her":
                 self.hers[chat] = text

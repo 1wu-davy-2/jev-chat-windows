@@ -53,6 +53,9 @@ _QUIET_MAX = 30.0
 _RESTORE_LINES = 300
 _RESTORE_HISTORY = 60
 _RESTORE_CHATS = 40  # 下拉框最多接回这么多个会话，免得历史一大堆时那个框长得没法用
+# 导入时判「哪个是我」勾反了的最小重合条数（见 paste.who_conflict）。太小会误伤——
+# 两个人本来就可能有几句一模一样的话
+_WHO_CONFLICT_MIN = 3
 _REREAD_HAVE = 40  # 「重新识别」对账时往回看记录里的多少条（屏幕上一屏十来条，留够对齐的余量）
 # 子进程报回来的「被丢掉的框」是哪种丢法，翻成人话。这三道关见 app/ocr.py 的 read()
 _DROPPED_WHY = {"image": "当成图片里的字", "tiny": "当成小字", "gray": "当成灰字"}
@@ -487,14 +490,17 @@ def import_history(title, rows, me, replace):
     **三处一起写，少一处都不行**（跟 apply_reread 是同一个道理）：
       - `chats[title]["history"]` —— 喂模型的上下文。少了它，「仿照说话的语气」就不成立，
         用户导进来只是给界面看的
-      - `Overlay.feeds` —— 界面那串气泡。走 `log_message`，它顺带把库也写了
-      - `chatlog` —— 落盘。`log_message` 末尾调 `chatlog.append`，那是全工程仅有的两个
-        写库口子之一（别在这函数里再开一个）
+      - `Overlay.feeds` —— 界面那串气泡
+      - `chatlog` —— 落盘
 
-    `replace` 勾上时先把这三处的旧记录清掉（库走 `chatlog.clear_chat`，只清这一个会话）。
+    落盘走的是 `chatlog.replace_chat`（**整段换**），不是 `log_message` →
+    `chatlog.append` 那条平时的路：导入的旧记录要按时间戳插到现有记录**中间甚至前面**，
+    而表是按自增 id 排的，append 追不进去（同 apply_reread 用 rewrite_tail 的理由）。
 
-    注意导入的正文里可能夹着 key（真机案例：那段对话里有一把中转的 `sk-…`）——落盘和
-    进上下文之前都会过 `redact_secrets`，其中**按形状**那一道就是为这种「别人的 key」加的。
+    导进来的正文里可能夹着 key（真机案例：那段对话里有一把中转的 `sk-…`）——落盘和进上下文
+    之前都会过 `redact_secrets`，其中**按形状**那一道就是为这种「别人的 key」加的。
+
+    **不点火**：用户是在整理记录，不是在收新消息，所以只动 `rev`，不碰 pending / notify_until。
     """
     if not title:
         ov.set_status("导入：当前没有在看会话", "warning")
@@ -504,19 +510,75 @@ def import_history(title, rows, me, replace):
         ov.set_status("导入：没解析出消息", "warning")
         return
     chat = chat_of(title)
-    if replace:
-        chat["history"].clear()
-        ov.reset_feed(title)
-        chatlog.clear_chat(title)
-    for who, text, name, stamp in msgs:
-        chat["history"].append((who, text, name))
-        ov.log_message(who, text, name or "", stamp, chat=title)
+
+    # `[语音] N"` 换成跟实时采集同一个字串，之后真转了文字才并得上（见 paste.voice_placeholder）
+    new = [(who, paste.voice_placeholder(text), name or "", stamp, "")
+           for who, text, name, stamp in msgs]
+
+    # 已经在屏幕上的那批。**读界面那份，不是 history 那份**：界面里还有「🔊 语音消息 N"」
+    # 这种不进 history 的占位行，拿 history 对账会漏掉它们（apply_reread 里同一句提醒）
+    old = [] if replace else [tuple(r) for r in ov.feeds.get(title, ())]
+
+    # 护栏：这次勾的「哪个是我」跟已有记录**反了**就别写。真人不会换身份，重合消息里发言方
+    # 大面积相反只可能是勾错了——真机上踩过，全库 176 条里同一昵称横跨 me 和 her 两边，
+    # 语气模仿直接学反，而且是**写进去之后**才看得出来。宁可让用户重勾一次。
+    both, opp = paste.who_conflict(old, new)
+    if both >= _WHO_CONFLICT_MIN and opp * 2 > both:
+        ov.set_status(f"导入：这次勾的「哪个是我」跟已有记录反了，先没写。"
+                      f"（{both} 条重合消息里 {opp} 条发言方相反，检查一下上面那排勾选框）",
+                      "warning")
+        return
+
+    # 去重 + 按时间戳排（导入的旧记录往往要插到现有记录中间，甚至整个跑到前面去）
+    merged, dup = paste.merge_rows(old, new)
+
+    chatlog.replace_chat(title, merged)
+    ov.set_feed(title, merged)
+    chat["history"].clear()
+    for who, text, name, _stamp, _voice in merged:  # deque 自己有 maxlen，多的自己会挤掉
+        chat["history"].append((who, text, name or None))
     # 导进来的东西不该立刻触发一次模型调用——用户是在整理记录，不是来了新消息
     chat["rev"] = chat.get("rev", 0) + 1
-    ov.set_status(f"导入：{len(msgs)} 条已写入「{title}」"
-                  + ("（替换了原有记录）" if replace else ""), "success")
-    ov.log(f"导入 · {len(msgs)} 条 · 发言者我={paste.visible(me) or '（空）'}"
+    bits = [f"{len(new) - dup} 条已写入「{title}」"]
+    if dup:
+        bits.append(f"跳过 {dup} 条重复")
+    if replace:
+        bits.append("替换了原有记录")
+    ov.set_status("导入：" + " · ".join(bits), "success")
+    who_me = "、".join(paste.visible(m) for m in me) or "（空）"
+    ov.log(f"导入 · {len(new) - dup} 条" + (f" · 跳过重复 {dup}" if dup else "")
+           + f" · 发言者我={who_me}"
            + (" · 已替换原有记录" if replace else ""))
+
+
+def clear_history(title):
+    """界面上的「清除」：把这**一个会话**的记录清干净，好从头重导。
+
+    三处一起清（跟 `import_history` 同一个道理，少一处都不行）：`chats[title]["history"]`、
+    `Overlay.feeds`、`chatlog`。
+
+    **跟设置页那个「清空聊天记录」方向是反的，别把两处的道理弄混**：
+      - 设置页那个（`Overlay._clear_chatlog`）清**全库**，而且**故意不动内存**——清了内存
+        会让 `_already_read` 放行，屏幕上那几屏被当新消息重读一遍、又写回库里，等于没清干净；
+      - 这个只清**当前这一个**会话，而且**有意连内存一起清**——用户就是要它从头来过。
+    代价一样：屏幕上还留着的那几屏下次采集会重新读进来。那是「清除」这个动作本身的意思。
+
+    顺手把等着的判断取消掉：那份待办是拿**刚被清掉的**上下文排出来的，留着只会拿一份空
+    历史去问模型，白花一次钱。`rev` 也加一，正在跑的那次分析回来会对不上、自动作废。"""
+    if not title:
+        ov.set_status("清除：当前没有在看会话", "warning")
+        return
+    chat = chat_of(title)
+    chat["history"].clear()
+    ov.set_feed(title, [])
+    chatlog.clear_chat(title)
+    if state["pending"] and state["pending"][0] == title:
+        state["pending"] = None
+    chat["rev"] = chat.get("rev", 0) + 1
+    if title == ov.screen_chat() or title == state["chat"]:
+        ov.invalidate_replies()  # 手上那批候选是拿刚清掉的记录写的，留着没意义
+    ov.set_status(f"已清除「{title}」的聊天记录", "success")
+    ov.log(f"清除 · {title}")
 
 
 def set_chatlog(on):
@@ -1056,6 +1118,7 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
                  on_relation_change=set_relation, on_scene_change=set_scene,
                  on_toggle_chatlog=set_chatlog, on_reread=reread_now,
                  on_make_shortcut=make_shortcut, on_import=import_history,
+                 on_clear=clear_history,
                  result_of=lambda t: chats.get(t, {}).get("result"))
     restore_log()  # 先把上次的记录接回来，再摆固定会话、再开采集（顺序有讲究，见函数里）
     if state["pin"]:
