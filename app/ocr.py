@@ -142,12 +142,20 @@ def _engine():
     """OCR 引擎全进程共用：一个实例 ~40MB，每个会话一个 Reader，不能各带一个。
     det_limit_type 默认 'min' 会把小图放大到短边 736，裁小反而更慢；必须 'max'。
 
+    **intra_op_num_threads 必须留 1**（真机实测，同一块 726×967 的消息区）：
+    4 线程 954ms wall / 3656ms cpu，2 线程 1765ms / 2938ms，1 线程 1903ms / **1688ms**。
+    多线程不但没赚，CPU 还翻一倍多——识别那一趟是十几个小框挨个跑，onnxruntime 的线程池
+    在两次推理之间**自旋等活**，等的那部分全白烧。而这块 CPU 是应用空闲时的主要开销：
+    一次 OCR 就是 1.7~6.6 秒 CPU，来一条消息跑一次，机器上看着就是「CPU 一直二十几」。
+    换 1 线程多花的那一秒（相对 4 线程）没人看得出来：起草前本来就要等 5~10 秒静默窗口。
+    **别再调回多线程**，除非哪天量出来 ORT 不转自旋了。
+
     **别再随手调检测阈值**：`det_box_thresh` 试过 0.5 → 0.3，真机上一帧的框集合**一个没变**
     （10 个框，还是漏那两个）。限住短消息的是更上游的 `Det.thresh`（像素级二值化），
     要动它得先想清楚怎么验——详见 CLAUDE.md「技术坑」里那条未解决的。"""
     global _ENGINE
     if _ENGINE is None:
-        _ENGINE = RapidOCR(intra_op_num_threads=4, det_limit_type="max", det_limit_side_len=4000)
+        _ENGINE = RapidOCR(intra_op_num_threads=1, det_limit_type="max", det_limit_side_len=4000)
     return _ENGINE
 
 

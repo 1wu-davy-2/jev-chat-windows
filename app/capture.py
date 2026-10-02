@@ -8,6 +8,10 @@ import numpy as np
 
 u32 = ctypes.windll.user32
 
+_DIFF_STEP = 2  # 「画面变没变」先在原始缓冲上抽样比一遍的步长，见 Capture.on_frame_arrived
+_DIFF_BAND = 0.34  # 抽样只比消息区最底下这么高一条（占消息区高度的比例）
+_DIFF_BAND_MIN = 180  # 但至少这么高（px）：窗口矮的时候也得罩住一条消息
+
 
 def find_wechat_hwnd():
     """枚举可见顶层窗口，按进程名挑主窗口，没有就取第一个。
@@ -111,15 +115,33 @@ def chat_area(full, header_h=60):
     return x0, y_top, x1, y_in, bg, y0
 
 
+def _band(area):
+    """「画面变没变」看的那一条：消息区最底下这一段（新消息只会从这儿冒出来）。
+
+    返回 (y_top, y_bottom)。见 Capture.on_frame_arrived 里为什么只比这一条。"""
+    _, y0, _, y1 = area[:4]
+    return max(y0, y1 - max(_DIFF_BAND_MIN, int((y1 - y0) * _DIFF_BAND))), y1
+
+
 class Capture:
     """WGC 盯窗口。采集线程只做「跟上一帧比」；settled() 在画面停稳后交出整帧，中间帧（滚动动画、
-    新消息滑入的半截气泡）全跳过。动图表情永远停不稳，所以最多等 max_wait 秒照样交。"""
+    新消息滑入的半截气泡）全跳过。
 
-    def __init__(self, hwnd, settle=0.25, max_wait=1.0):
+    两道闸都在**没转换过**的原始缓冲上做——微信窗口一直在重绘，WGC 哪怕画面一个像素没变
+    也照发 ~72 帧/秒（真机量到的），而整帧 BGRA→RGB 一次 9.4ms（2560 宽，每秒 1GB 内存
+    流量），光这一项就吃掉三分之一个核。真机量过：两道闸上齐之前，子进程光「收帧」就烧
+    0.65 个核，其中 0.38 个是这一份白拷。
+
+    「停稳」= 消息区连着 settle 秒没再动。画面**一直在动**（动图表情、滚动条自己晃）就永远
+    停不稳，force_after 秒到了照样交一帧，不然那个会话一条消息都读不到。"""
+
+    def __init__(self, hwnd, settle=0.25, force_after=6.0):
         from windows_capture import WindowsCapture
 
-        self.settle, self.max_wait = settle, max_wait
+        self.settle, self.force_after = settle, force_after
+        self.hw = None  # 上一帧原始缓冲的 (高, 宽)
         self.shape = self.area = self.last = self.pending = None
+        self.small = None  # 上一帧抽样过的原始缓冲，便宜闸拿它比
         self.last_full = None  # 最近一帧整帧（画面变了才更新），给「重新识别」用，见 snapshot()
         self.t = self.t0 = 0.0
         # 包装层默认 cursor_capture=True，会去调 SetIsCursorCaptureEnabled。
@@ -130,20 +152,62 @@ class Capture:
         cap.event(self.on_closed)
         self.ctl = cap.start_free_threaded()
 
+    @staticmethod
+    def _rgb(buf):
+        """BGRA → RGB 整帧拷一份。回调一返回原缓冲就没了，要留必须拷；2560 宽时约 9ms，
+        所以只在**真变了**的时候调。"""
+        return np.ascontiguousarray(buf[:, :, :3][:, :, ::-1])
+
     def on_frame_arrived(self, frame, control):
-        full = np.ascontiguousarray(frame.frame_buffer[:, :, :3][:, :, ::-1])  # BGRA → RGB；缓冲区回调后就没了，必须拷
-        if full.max() == 0:
-            return
-        if self.area is None or full.shape != self.shape:
+        buf = frame.frame_buffer  # (高, 宽, 4) 的零拷贝视图
+        hw = buf.shape[:2]
+        if self.area is None or hw != self.hw:
+            self.hw, self.small = hw, None  # 换了尺寸，抽样底片作废
+            full = self._rgb(buf)
+            if full.max() == 0:
+                return
             self.shape, self.area = full.shape, chat_area(full)
+            if self.area is None:
+                return
+            self._prime(buf)  # 抽样底片先垫上，下一帧起便宜闸才拦得住
+            self._keep(full)
+            return
         if self.area is None:
             return
         x0, y0, x1, y1 = self.area[:4]  # 拿上一次的消息区做 diff 就够了，光标闪烁在输入框里，不算变化
+        # 第一道（便宜）：只在消息区**最底下那一条**上抽样比。为什么不比整块消息区——
+        # 动图表情、别人正在输入的动画都在消息区里，整块比的话它们每动一下就交一帧，
+        # 父进程那边一次 OCR 要好几秒 CPU（真机量到 6.6 秒），白烧；而**新消息只会从底下
+        # 冒出来**，底下这条没变就说明没有新东西可读。往上翻记录、切会话、窗口拉大，
+        # 底下这条都会跟着变，漏不掉。步长 2 是留余量：12px 高的字抽完还剩 36 个采样点。
+        # 抽样结果先落成连续的一块再比：直接比切片是跨步访问，numpy 走的是慢路径
+        # （真机量到 3ms 一次，75 帧/秒就是 0.24 个核），拷成连续的再比只要 0.1ms。
+        by0, by1 = _band(self.area)
+        small = np.ascontiguousarray(buf[by0:by1:_DIFF_STEP, x0:x1:_DIFF_STEP, :3])
+        if self.small is not None and small.shape == self.small.shape \
+                and np.array_equal(small, self.small):
+            return
+        self.small = small
+        # 第二道（严）：抽着比看出变了，再逐像素比一遍整块消息区。抗锯齿抖一下、鼠标划过的
+        # 高亮都会让抽样那道过，逐像素比能把它们挡回去
+        full = self._rgb(buf)
         # ponytail: diff 不含头部——公告条会滚动，带上它就永远停不稳。切会话时消息区必然也变，照样出帧。
         chat = full[y0:y1, x0:x1]
-        if self.last is not None and np.array_equal(chat, self.last):
+        if self.last is not None and chat.shape == self.last.shape \
+                and np.array_equal(chat, self.last):
             return
         self.last = chat
+        self._keep(full)
+
+    def _prime(self, buf):
+        """把「抽样底片」换成这一帧的。底片是**原始缓冲**（BGRA、没转换过）上那一条的拷贝，
+        1/4 大小，比整帧省得多。"""
+        by0, by1 = _band(self.area)
+        x0, _, x1, _ = self.area[:4]
+        self.small = np.ascontiguousarray(buf[by0:by1:_DIFF_STEP, x0:x1:_DIFF_STEP, :3])
+
+    def _keep(self, full):
+        """这一帧算数：压进 pending，等它停稳。"""
         self.last_full = full  # 画面变了才更新，所以它跟 self.last 是同一张图
         if self.pending is None:
             self.t0 = time.perf_counter()
@@ -153,11 +217,15 @@ class Capture:
         pass
 
     def settled(self):
-        """停稳了就返回整帧，否则 None。"""
+        """停稳了就返回整帧，否则 None。
+
+        force_after 是给「画面一直在动」的会话兜底的（动图表情、滚动条自己晃），交出来的多半是
+        动画中间态——所以给得很宽：正常情况（来一条消息、动一下就不动了）走的都是「停稳」那条路，
+        一条消息一次 OCR；只有一直停不下来的会话才会落到这个兜底上。"""
         if self.pending is None:
             return None
         now = time.perf_counter()
-        if now - self.t < self.settle and now - self.t0 < self.max_wait:
+        if now - self.t < self.settle and now - self.t0 < self.force_after:
             return None
         full, self.pending = self.pending, None
         return full
@@ -194,4 +262,31 @@ if __name__ == "__main__":
     assert area is not None, "这帧不该认不出来"
     assert area[3] == 300, f"输入框顶该是 300，认成了 {area[3]}"
     assert area[1] == 70, f"消息区顶该是 70，认成了 {area[1]}"
+    # 「变没变」只看最底下那一条：窗口矮的时候有个下限兜底，正常高度按比例切
+    assert _band(area) == (300 - _DIFF_BAND_MIN, 300), _band(area)
+    assert _band((0, 0, 100, 1000)) == (660, 1000), _band((0, 0, 100, 1000))
+
+    # 两道闸的判据：消息区**中段**动（动图表情、鼠标划过）不算变化，**底下**动才算。
+    # 不走 WGC，拿 __new__ 绕开构造函数，直接喂合成帧给回调——这条判据是拿真机数据
+    # 换来的（中段每动一下就白跑一次 OCR，一次好几秒 CPU），得有个东西钉住它。
+    class _FakeFrame:
+        def __init__(self, buf):
+            self.frame_buffer = buf
+
+    bgra = np.dstack([frame, np.full(frame.shape[:2], 255, np.uint8)])
+    cap = Capture.__new__(Capture)
+    cap.settle, cap.force_after = 0.25, 6.0
+    cap.hw = cap.shape = cap.area = cap.last = cap.pending = cap.small = cap.last_full = None
+    cap.t = cap.t0 = 0.0
+    cap.on_frame_arrived(_FakeFrame(bgra), None)
+    assert cap.area is not None and cap.small is not None, "第一帧就该认出消息区、垫上底片"
+    cap.pending = None
+    mid = bgra.copy()
+    mid[100:110, 40:120, :3] = 77  # band 是 120~300，这儿在它上面
+    cap.on_frame_arrived(_FakeFrame(mid), None)
+    assert cap.pending is None, "消息区中段动一下不该交帧（动图表情就是这么烧掉 CPU 的）"
+    bottom = mid.copy()
+    bottom[290:296, 40:120, :3] = 77  # 底下冒出来一条
+    cap.on_frame_arrived(_FakeFrame(bottom), None)
+    assert cap.pending is not None, "底下变了必须交帧"
     print("capture.chat_area ok")
