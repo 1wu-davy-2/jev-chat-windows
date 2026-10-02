@@ -57,9 +57,31 @@ def set_clipboard(text):
     raise RuntimeError("OpenClipboard 连续失败，剪贴板被其他程序占用")
 
 
+def _foreground_window() -> int:
+    """现在的前台窗口句柄。
+
+    **必须显式声明 restype**：64 位下 ctypes 默认把返回值当 32 位 c_int，句柄被截掉高 32 位
+    （跟本文件开头那串声明是同一件事）。句柄放不进 32 位时还会在下一步传给 Win32 时炸出来。"""
+    fn = u32.GetForegroundWindow
+    fn.restype = ctypes.c_void_p
+    return int(fn() or 0)
+
+
+def is_foreground(hwnd) -> bool:
+    """这个窗口现在是不是前台窗口。
+
+    给「自动转文字」当闸用（见 main.auto_convert_voice）：`voice.convert()` 会先把微信切到前台，
+    用户正在别的窗口打字时去点一下等于把焦点抢走——比少转一条语音烦人得多。"""
+    return _foreground_window() == int(hwnd or 0)
+
+
 def foreground(hwnd):
     """把窗口切到前台。SetForegroundWindow 有前台窗口保护，普通后台进程会被拒；AttachThreadInput 绕过。
-    app/voice.py 右键语音气泡之前也要先把微信切到前台，所以抽出来共用。"""
+    app/voice.py 右键语音气泡之前也要先把微信切到前台，所以抽出来共用。
+
+    **这一串别动**：fg 拿的是没声明 restype 的那个旧调用（返回 32 位），下面
+    `GetWindowThreadProcessId(fg, None)` 也按 32 位传——两边是配套的。换成完整的 64 位句柄
+    反而会在这里溢出。查「是不是前台」请用上面的 `is_foreground()`。"""
     fg = u32.GetForegroundWindow()
     if fg == hwnd:
         return

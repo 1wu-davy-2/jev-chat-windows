@@ -266,6 +266,8 @@ def main() -> int:
                      "check_update": True, "debug_view": args.state == "debug",
                      # 自动发送：默认关（开了会真发消息）。预览里只摆开关的样子，不发任何东西
                      "auto_send": False,
+                     # 自动转文字：同样默认关（开了程序会自己去点微信界面）
+                     "auto_voice": False,
                      # 只有宠物相关的状态才开宠物形态；其余状态保持「面板直接可见」，
                      # 不然面板从没 show 过，grab 出来是空的
                      "pet_enabled": args.state in ("pet", "pet-menu", "bar", "voice",
@@ -328,7 +330,8 @@ def main() -> int:
                            relay_base_url_text=None, relay_judge_path_text=None,
                            relay_thinking_style_text=None, pet_enabled_on=None,
                            opener_on=None, opener_minutes_n=None, history_on=None,
-                           chatlog_on=None, auto_send_on=None, rounds_n=None, profiles=None):
+                           chatlog_on=None, auto_send_on=None, rounds_n=None, profiles=None,
+                           auto_voice_on=None):
         if context_n is not None:
             demo_settings["context"] = context_n
         if rounds_n is not None:
@@ -356,7 +359,7 @@ def main() -> int:
                             ("check_update", check_update_on), ("debug_view", debug_view_on),
                             ("pet_enabled", pet_enabled_on), ("opener", opener_on),
                             ("history", history_on), ("chatlog", chatlog_on),
-                            ("auto_send", auto_send_on)):
+                            ("auto_send", auto_send_on), ("auto_voice", auto_voice_on)):
             if value is not None:
                 demo_settings[name] = bool(value)
 
@@ -424,6 +427,7 @@ def main() -> int:
         debug_view=lambda: demo_settings["debug_view"],
         pet_enabled=lambda: demo_settings["pet_enabled"],
         auto_send=lambda: demo_settings["auto_send"],
+        auto_voice=lambda: demo_settings["auto_voice"],
         history=lambda: demo_settings["history"],
         pet_pos=lambda: demo_settings["pet_pos"],
         save_pet_pos=lambda x, y: demo_settings.update(pet_pos=(x, y)),

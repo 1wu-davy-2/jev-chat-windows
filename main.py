@@ -20,7 +20,7 @@ from collections import deque
 
 from app import settings, shortcut, update, voice, worker
 from app.capture import find_wechat_hwnd
-from app.fill import fill, press_enter
+from app.fill import fill, is_foreground, press_enter
 from app.ocr import reconcile, similar
 from app.overlay import Overlay
 from app.version import VERSION
@@ -58,7 +58,8 @@ _RESTORE_CHATS = 40  # 下拉框最多接回这么多个会话，免得历史一
 _WHO_CONFLICT_MIN = 3
 _REREAD_HAVE = 40  # 「重新识别」对账时往回看记录里的多少条（屏幕上一屏十来条，留够对齐的余量）
 # 子进程报回来的「被丢掉的框」是哪种丢法，翻成人话。这三道关见 app/ocr.py 的 read()
-_DROPPED_WHY = {"image": "当成图片里的字", "tiny": "当成小字", "gray": "当成灰字"}
+_DROPPED_WHY = {"image": "当成图片里的字", "tiny": "当成小字", "gray": "当成灰字",
+                "pane": "印在面板底色上（表情包里的字就是这么混进来的）"}
 results = queue.Queue()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
 
@@ -348,6 +349,30 @@ def convert_voice():
         # 不然往上翻、把窗口拉高时露出来的旧语音，底下那条老转写会被当成新消息报上去。
         voice_until.value = time.monotonic() + _VOICE_WINDOW
     return reason
+
+
+def auto_convert_voice(title, items, fresh):
+    """对方**刚发来**的那条语音，替用户点一下「转文字」（设置里那个默认关着的开关）。
+
+    为什么要有它：微信的语音转文字是手动的一步，对方连发几条就得点几次；开着这个开关，
+    刚到的语音自动转，转出来的字照常走采集链路进记录、进上下文，接着该给建议就给建议。
+
+    三条闸，缺一条就什么都不做：
+    ① 开关开着；② 采集没停（「暂停就是先别管我」，跟开场白、自动发送一个口径）；
+    ③ **微信本来就在前台**——`voice.convert()` 会先把微信切到前台，用户正在别的窗口打字时
+       去点一下等于把焦点抢走，那比少转一条语音烦人得多。不在前台就等下次，用户自己点也行。
+
+    只转**对方**的、只转刚到的（在 fresh 里）、而且是**最底下还开着**的那条：坐标是屏幕坐标，
+    跟候选条上那个「转文字」按钮走的是同一条路（convert_voice），不另开一套。"""
+    if not settings.auto_voice() or not capture_on.is_set():
+        return
+    if not fresh or not items or items[-1] not in fresh or items[-1][5] != "her":
+        return
+    if state["hwnd"] is None or not is_foreground(state["hwnd"]):
+        return
+    reason = convert_voice()
+    if reason:  # 成功时返回空串；失败要让用户看得见（这是程序自己动的，不能静默）
+        ov.set_status(f"自动转文字没成：{reason}", "warning")
 
 
 def spawn_worker():
@@ -948,6 +973,7 @@ def drain():
                     schedule_analyze(title)
                 else:
                     state["notify_until"] = time.monotonic() + _NOTIFY_HOLD
+            auto_convert_voice(title, items, fresh)  # 设置里开着才动，默认关
             continue
         if kind == "noise":  # 画面变了、却没认出新文字：多半是对方发了表情包/图片
             # 图片读不出正文，进不了上下文（对模型是噪音，也不该喂），但它说明对方还在发。

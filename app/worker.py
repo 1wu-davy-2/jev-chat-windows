@@ -151,7 +151,7 @@ def run(q, hwnd, enabled, debug_on, voice_until=None, reread=None):
                         # 所以重读的结果自己带全，一次点击就能看
                         dropped = [(m["final"], str(m["text"]).strip(), m["rect"], m["flat"], m["ink"])
                                    for m in reader.last_metrics
-                                   if m["final"] in ("image", "tiny", "gray")
+                                   if m["final"] in ("image", "tiny", "gray", "pane")
                                    and str(m["text"]).strip()]
                         stats = {"boxes": len(reader.last_boxes), "lines": len(lines),
                                  "ms": reader.last_ms, "scale": _THOROUGH_SCALE}

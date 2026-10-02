@@ -281,6 +281,16 @@ def reply_target() -> bool:
     """群聊指定回复对象：开了才在界面上选回复给谁、才把对象喂给模型。默认关。"""
     return bool(_read("reply_target", False))
 
+def auto_voice() -> bool:
+    """**对方**刚发来的语音自动转文字：不用再点候选条上那个「转文字」，程序自己右键那条语音、
+    点菜单第一项。
+
+    默认**关**：这是 `app/voice.py` 里唯一会去点微信界面的那条路（硬约束 4 的边界），
+    手动那条是用户点出来的，这条是程序自己动的手——要开得由用户明确拨开。
+    只在「微信开着那个会话」「采集没暂停」「微信已经在前台」三条都成立时才动（见 main.drain）。"""
+    return bool(_read("auto_voice", False))
+
+
 def opener() -> bool:
     """冷场开场白：最后一句是自己说的、对方一直没有回复，等够 opener_minutes() 就起草一批
     开场白让人挑。默认关——关着的时候调模型的条件还是「只有对方来了新消息」。"""
@@ -451,7 +461,7 @@ def save(context_n: int | None = None, *,
          opener_minutes_n: int | None = None, history_on: bool | None = None,
          chatlog_on: bool | None = None, auto_send_on: bool | None = None,
          chat_pin_text: str | None = None, rounds_n: int | None = None,
-         profiles: dict | None = None) -> None:
+         profiles: dict | None = None, auto_voice_on: bool | None = None) -> None:
     """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
     jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
     draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
@@ -507,6 +517,8 @@ def save(context_n: int | None = None, *,
         "pet_enabled": flag(pet_enabled_on, pet_enabled),
         # 「绝不自动发送」那条硬约束唯一的例外（默认关）。见 auto_send() 的说明
         "auto_send": flag(auto_send_on, auto_send),
+        # 对方来语音就自动点「转文字」（默认关）。见 auto_voice() 的说明
+        "auto_voice": flag(auto_voice_on, auto_voice),
         # 「固定盯着哪个会话」也不归这儿管（界面上那个小按钮走 save_chat_pin），但同样**必须
         # 带过去**：这里是把整份配置重写一遍，漏了哪个键就等于把它删了。
         "chat_pin": keep(chat_pin_text, "chat_pin"),
@@ -781,6 +793,15 @@ if __name__ == "__main__":
     assert auto_send() is True and _load_all()["auto_send"] is True
     save(10, pet_enabled_on=False)
     assert auto_send() is True, "改别的开关不能顺手把它关掉"
+
+    # 自动转文字：同样是默认关的程序主动动作（会去点微信界面），别的键写一遍不能把它带开
+    assert auto_voice() is False, "默认必须是关的"
+    save(11)
+    assert auto_voice() is False, "save 整份重写，没提到它就得原样留着（默认仍是关）"
+    save(11, auto_voice_on=True)
+    assert auto_voice() is True and _load_all()["auto_voice"] is True
+    save(11, auto_send_on=False)
+    assert auto_voice() is True, "改别的开关不能顺手把它关掉"
 
     # 回复轮数：默认 1（一句一回），存盘夹到 1~3，不传 = 保留当前值
     assert reply_rounds() == 1, "没设置过就是 1——多轮是选项，不能默认开"

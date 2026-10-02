@@ -50,6 +50,14 @@ _RECALL_ME = re.compile(r"^你\s*(?:撤回|收回)了一条消息\s*(?:重新编
 # 名字段最多 24 个字符（单聊是「对方」，群里是昵称或「"昵称"」），且整条要以它收尾
 _RECALL_HER = re.compile(r"^.{0,24}?(?:撤回|收回)了一条消息$")
 
+# 「这一块底色就是面板底色」的容差（三通道差的绝对值之和）。真机上对方气泡是 (238,238,240)、
+# 面板底是 (250,250,250)，差 34，分得开；同色系打光的那点抖动在 6 以内。见 read() 里那道关。
+_PANE_TOL = 6
+
+# 「这条语音上一帧也在同一个位置」的容差（像素）。画面没动时同一帧的坐标是逐像素稳定的，
+# 留几像素给 chat_area() 每帧重新定位的抖动；真滚了一下（一次几十上百像素）就越过去了。
+_STILL_PX = 4
+
 
 def _is_recall(text):
     """这条是不是「撤回」提示：`"me"` = 我自己撤的（丢掉）、`"her"` = 对方撤的（算他说了话）、
@@ -246,7 +254,8 @@ class Reader:
         self.lh = None  # 正常气泡字高，头一帧定
         self.seen = []  # [(who, name, text)]，累计，封顶 500
         self.last_boxes = []  # 调试视图用：[(x0,y0,x1,y1,kind,text)]，消息区裁剪坐标
-        self.last_voice = []  # 这一帧的语音气泡 [(x0,y0,x1,y1,时长,谁)]，_under_voice 要用全部
+        self.last_voice = []  # 这一帧的语音气泡 [(x0,y0,x1,y1,时长,谁)]，_voice_above 要用全部
+        self.prev_voice = []  # 上一帧的同一样东西，_still 拿它判「这条语音是不是一直挂在屏幕上」
         self.last_voice_open = []  # 上面那些里**还没转过文字、也还没被更新的消息压过去**的，见 _open_voices
         self._w = 0  # 消息区宽度，read() 每帧更新：判「这一行跟那条语音同不同侧」要用
         self.seen_voice = []  # 已经报给父进程的语音 [(谁, 时长)]，按出现顺序攒着，new_voices 要用
@@ -271,7 +280,9 @@ class Reader:
         self.last_ms = int((time.perf_counter() - t0) * 1000)
         self.last_boxes = []
         self.last_metrics = []
-        self.last_voice = []
+        # 上一帧那串转成「再上一帧」，这一帧从空开始收：_still 判的是**上一帧**在不在，
+        # 拿新的当旧的比就永远成立，等于没这道闸
+        self.prev_voice, self.last_voice = self.last_voice, []
         self.last_voice_open = []
         W = chat.shape[1]
         self._w = W  # 给 _same_side 用（判转写和语音同不同侧）
@@ -314,13 +325,22 @@ class Reader:
                 self.last_voice.append(_bubble_extent(chat, box, bg) + (text, kind))
                 continue
             if kind == "gray":
-                on_pane = np.abs(bg - pane_bg).sum() <= 6
+                on_pane = np.abs(bg - pane_bg).sum() <= _PANE_TOL
                 taken = bool(on_pane and box[0][0] < 0.25 * W and len(text) <= 16
                              and not re.search("[:：]", text))
                 if taken:
                     name = text
                 m["final"] = "name" if taken else "gray"
                 self.last_boxes.append(rect + (m["final"], text))
+                continue
+            if (kind == "her" and bg is not None
+                    and np.abs(bg - pane_bg).sum() <= _PANE_TOL):
+                # 印在**面板底色**上的字不是消息——真消息都落在气泡里（上面 gray 那一支认群里
+                # 发言人名用的就是这条，判据取一样）。真机上报过：自己发的一张表情包（图里
+                # 写着「想你」，画在面板底色上，字号还不小）被读成对方说的一句「想你」，
+                # 还照它起草了一次——底色不绿、也不是对方气泡色，对比度又够，一路判成 her。
+                m["final"] = "pane"
+                self.last_boxes.append(rect + ("pane", text))
                 continue
             if kind is None or (self.lh and h < 0.6 * self.lh):
                 # 字比正常气泡小得多 = 图片消息（截图/表情包）里的字，不是气泡
@@ -411,43 +431,56 @@ class Reader:
             return True
         return (x > self._w / 2) == ((voice[0] + voice[2]) / 2 > self._w / 2)
 
-    def _under_voice(self, y, x=None):
-        """这一行紧跟在哪个语音气泡下面？是的话返回 `(谁, 时长)`（时长是 OCR 原样，可能是 `3"`、
-        也可能是 `)3`），不是就返回空元组——空元组在布尔位置上就是假，调用方直接当条件用。
+    def _voice_above(self, y, x=None):
+        """这一行紧跟在哪个语音气泡下面？返回那条语音（`(x0,y0,x1,y1,时长,谁)`），没有就是 None。
 
         微信的「语音转文字」是**插在那条语音气泡正下方**的，不是追加到聊天末尾——转一条老语音，
         结果落在「已知行」上面，按下面那条「只认已知行下方的」规则会被当成往上翻出来的旧消息丢掉，
         用户转完了应用却根本没看见。所以这一类单独放行。
 
-        返回时长是为了让父进程把转写并回它那条「🔊 语音消息 N"」上——同一个时长才并。
-
-        返回**谁**是因为微信把转出来的字画在一个**灰白气泡**里，自己那条语音转出来也是这个
-        颜色，按底色分类会被认成对方说的（真机上报过：自己的语音转完，界面上写着「对方刚说
-        ……」，还白问了一次模型）。谁说的以那条语音为准。
-
         `x` 是这一行的横向中心（read() 算出来的）：还得跟那条语音**同一侧**才算数。只按「紧贴」
         判的话，跟在语音下面的**普通消息**会被当成它的转写——真机上报过：对方一条「是的」正好
-        压在我那条语音下面，被记成了我语音转出来的字（谁说的、时长全错，进上下文的那份也错）。"""
+        压在我那条 3" 语音下面，被记成了我语音转出来的字（谁说的、时长全错，进上下文的那份也错）。"""
         for item in self.last_voice:
             if 0 <= y - item[3] <= 2.5 * (self.lh or 17) and self._same_side(item, x):
-                return item[5], item[4]  # (谁, 时长)  item[3] = 气泡底
-        return ()
+                return item
+        return None
+
+    def _still(self, item):
+        """这条语音上一帧是不是也挂在屏幕上的**同一个位置**。
+
+        用来分开两件几何上一模一样、只有时间不同的事：**用户刚在微信里右键转了一条老语音**
+        （气泡一直在那儿，转出来的字刚插到它下面 —— 要认），和**往上翻/把窗口拉高时连带滚出来
+        的一条老语音 + 它底下早就转过的字**（两个都是刚露出来的 —— 不能认）。差别就在气泡
+        上一帧在不在：前者在，后者不在。
+
+        容差按像素给：画面没动时同一帧里坐标是逐像素稳定的，留几像素给 chat_area() 定位抖动。
+        真的滚了一下（一次滚轮几十上百像素）就越过容差，那道闸照样拦得住。"""
+        x0, y0, x1, y1, dur, who = item
+        return any(abs(p[0] - x0) <= _STILL_PX and abs(p[1] - y0) <= _STILL_PX
+                   and abs(p[2] - x1) <= _STILL_PX and abs(p[3] - y1) <= _STILL_PX
+                   and p[4] == dur and p[5] == who for p in self.prev_voice)
 
     def new_lines(self, lines, under_voice=False):
         """去重（滚动不重复）→ 这一帧里真正新出现的 [(who, name, text, 语音时长或 "")]。
         本帧有已知行时只要已知行下方的：往上滚翻出来的旧消息在已知行上方，不算。
-        例外是语音转出来的字（见 _under_voice）：它就插在语音气泡下面，位置在已知行上方。
+        例外是语音转出来的字（见 _voice_above）：它就插在语音气泡下面，位置在已知行上方。
 
-        under_voice 才开那个例外，而且只在「用户刚点过转文字」之后开一小会儿——见
-        worker.run()。常开的话，往上翻/把窗口拉高时露出来的旧语音，底下那条老转写
-        也会被当成新消息报上去，白触发一次判断（判断不便宜，还打扰人）。
+        那个例外只在两种情形下开（其余一律还按 floor 拦）：
+        ① **这条语音上一帧就在屏幕同一个位置**（`_still`）——用户在微信里自己右键转的老语音
+           走这条。真机上报过：手动转的那条 3" 一直没进记录，因为那道口子当时只认「刚点过
+           我们那个按钮」，而用户是在微信里自己转的。
+        ② **刚点过我们那个「转文字」**（`under_voice`）——见 worker.run()。留着它是为了兜住
+           「转完微信顺手把画面往上推了一格」：那会儿气泡位置变了，① 判不出来。
+        两个都关着还开的话，往上翻/把窗口拉高时露出来的旧语音，底下那条老转写也会被当成
+        新消息报上去，白触发一次判断（判断不便宜，还打扰人）。
 
         第四个字段只给界面用（聊天记录里标/并「语音」那条）：判据就是「紧贴在某个语音
         气泡下面」，跟放不放它过 floor 无关——最新那条语音转出来的字是走正常规则进来的，
         同样得标上。实测转写贴 17px、下一条普通消息隔 69px，2.5×lh 分得开。
         转写那行的 **who 也以那条语音为准**，不看气泡底色（微信把转写画成灰白气泡，
         自己的语音转出来也长这样），而且还得跟那条语音**同一侧**——不然跟在语音下面的
-        普通消息会被当成它的转写，见 _under_voice。
+        普通消息会被当成它的转写，见 _voice_above。
 
         本帧一行已知的都没有（大图把旧文字全顶出去了、切了聊天、滚远了）：全算，宁可多算不能漏。
         ponytail: 同一人连发两句一模一样的会吞一句——对触发分析无害。
@@ -456,8 +489,10 @@ class Reader:
         floor = max(known_y) if known_y else -1
         new = []
         for w, n, t, y, *rest in lines:
-            under = self._under_voice(y, rest[0] if rest else None)
-            if not (y > floor or (under_voice and under)) or self._seen(w, n, t):
+            v = self._voice_above(y, rest[0] if rest else None)
+            under = (v[5], v[4]) if v is not None else ()
+            allow = v is not None and (self._still(v) or under_voice)
+            if not (y > floor or allow) or self._seen(w, n, t):
                 continue
             # 紧跟语音气泡的那行是转写：谁说的、时长多少都以**那条语音**为准，别看气泡底色
             new.append((under[0] if under else w, n, t, under[1] if under else ""))
@@ -561,41 +596,53 @@ if __name__ == "__main__":
         r.lh = lh
         r.seen = []
         r.last_boxes, r.last_voice, r.last_voice_open, r.seen_voice = [], [], [], []
+        r.prev_voice = []
         r.last_ms, r.last_metrics = 0, []
         return r
 
-    def _frame(ink=13, w=400, h=300):
-        """白底 + 框中间一条**细**深色横带当字：众数色 = 白（flat 过半）、墨高 = ink。
+    def _frame(ink=13, w=400, h=300, bg=238):
+        """气泡底 + 框中间一条**细**深色横带当字：众数色 = 气泡底（flat 过半）、墨高 = ink。
         带子不能填满框——填满了众数色就变成深色，墨高只剩上下两道白边那两行，
-        于是被「小字」那道当成 tiny 吃掉（第一版就这么写错了）。"""
-        f = np.full((h, w, 3), 255, np.uint8)
+        于是被「小字」那道当成 tiny 吃掉（第一版就这么写错了）。
+
+        底色**必须跟面板底色不一样**（下面 `_pane`）：真机上她的气泡是 (238,238,240)、
+        面板底是 (250,250,250)。两者一样的话会被「印在面板上的字」那道拦下——那道是给
+        表情包里的字用的，见 read()。"""
+        f = np.full((h, w, 3), bg, np.uint8)
         f[20:20 + ink, 10:200] = 40  # 框是 y 10~40，带子只占中间 13 行
         return f
 
     _box = [(10, 10), (200, 10), (200, 40), (10, 40)]
-    _white = (255, 255, 255)
+    _pane = (250, 250, 250)  # 面板底色（跟气泡底 238,238,240 差 34，见 read() 里那道关）
 
     # 自己撤回的：整条不进结果——不点火、不进上下文、也不记聊天记录
     r = _reader([(_box, "你撤回了一条消息重新编辑", 0.99)])
-    assert r.read(_frame(), _white) == [], "自己撤回的不能被当成一条消息"
+    assert r.read(_frame(), _pane) == [], "自己撤回的不能被当成一条消息"
     assert r.last_boxes[-1][4] == "recall_me", r.last_boxes
     assert r.last_metrics[-1]["final"] == "recall_me", r.last_metrics
 
     # 对方撤回的：算 her 说了句话。下面这两条都得成立——
     # ① 走 readonly 的 her 分支（不是被当灰字/小字丢掉）
     r = _reader([(_box, '"A 阿坤" 撤回了一条消息', 0.99)])
-    assert r.read(_frame(), _white) == [("her", None, '"A 阿坤" 撤回了一条消息', 10, 105.0)], \
+    assert r.read(_frame(), _pane) == [("her", None, '"A 阿坤" 撤回了一条消息', 10, 105.0)], \
         "对方撤回的要留下"
     assert r.last_boxes[-1][4] == "recall_her", r.last_boxes
     # ② 系统提示本来就比气泡字小（lh 抬到 40，墨高 13 够不着 0.6*lh），「小字」那关也不许吃它
     r = _reader([(_box, "对方撤回了一条消息", 0.99)], lh=40.0)
-    assert r.read(_frame(), _white) == [("her", None, "对方撤回了一条消息", 10, 105.0)], \
+    assert r.read(_frame(), _pane) == [("her", None, "对方撤回了一条消息", 10, 105.0)], \
         "不能被「小字」那道吃掉"
 
     # 真消息照旧：普通气泡还是一条 her（别把新加的那道拦宽了）。
     # 第 5 位是这一行的横向中心（框 10~200），_same_side 拿它判转写跟语音同不同侧
     r = _reader([(_box, "在吗", 0.99)])
-    assert r.read(_frame(), _white) == [("her", None, "在吗", 10, 105.0)]
+    assert r.read(_frame(), _pane) == [("her", None, "在吗", 10, 105.0)]
+
+    # 印在**面板底色**上的字不是消息（真消息都落在气泡里）。真机上报过：自己发的一张
+    # 表情包图里写着「想你」，画在面板底色上、字号还不小，被读成对方说的一句「想你」，
+    # 还照它起草了一次。底色不绿、也不是对方气泡色，对比度又够，一路判成 her
+    r = _reader([(_box, "想你", 0.99)])
+    assert r.read(_frame(bg=250), _pane) == [], "印在面板底上的字（表情包里的字）不能当消息"
+    assert r.last_boxes[-1][4] == "pane" and r.last_metrics[-1]["final"] == "pane"
 
     # 「重新识别」的放大重读：坐标要能折回原尺度（框是放大后给的，下游一律按原图算）
     assert _upscale(np.zeros((10, 20, 3), np.uint8), 1).shape == (10, 20, 3)
@@ -635,14 +682,28 @@ if __name__ == "__main__":
     # 转写那个口子：语音气泡底 y=50，转出来的字贴在上面 y=67（实测隔 17px），
     # 下面还有一条已知的新消息 y=130 —— 转写落在「已知行上方」，只有开了口子才认
     reader = Reader.__new__(Reader)  # 不走 __init__：那会去建 OCR 引擎，自测不该那么重
-    reader.lh, reader.last_voice = 13.0, [(0, 0, 100, 50, '4"', "her")]
+    voice = (0, 0, 100, 50, '4"', "her")
+    reader.lh, reader.last_voice, reader.prev_voice = 13.0, [voice], []
     lines = [("her", None, "在吗", 130), ("her", None, "干什么呢？快下来", 67)]
     reader.seen = [("her", None, "在吗")]
-    assert reader.new_lines(lines, under_voice=True) == [("her", None, "干什么呢？快下来", '4"')]
-    reader.seen = [("her", None, "在吗")]  # new_lines 会把这一帧的行记进 seen，比第二次前先还原
-    assert reader.new_lines(lines) == [], "没点过转文字就不认这个口子（往上翻出来的旧转写）"
+    assert reader.new_lines(lines, under_voice=True) == [("her", None, "干什么呢？快下来", '4"')], \
+        "刚点过我们那个「转文字」：口子开着（这时微信可能顺手把画面推了一格，气泡位置变了）"
+    # 用户在微信里**自己**右键转的老语音：口子没开，但那颗气泡上一帧就挂在同一个位置
+    # —— 转出来的字要认。真机上报过：手动转的那条 3" 一直进不了记录
+    reader.seen = [("her", None, "在吗")]
+    reader.prev_voice = [voice]
+    assert reader.new_lines(lines) == [("her", None, "干什么呢？快下来", '4"')], "手动转的也要认"
+    # 往上翻 / 把窗口拉高，连带滚出来的一条老语音 + 它底下早就转过的字：
+    # 两个都是刚露出来的（上一帧这条气泡不在屏幕上），不能当新消息报上去
+    reader.seen = [("her", None, "在吗")]
+    reader.prev_voice = []  # 上一帧屏幕上没有这条气泡
+    assert reader.new_lines(lines) == [], "刚滚出来的老语音底下那条老转写，不算新消息"
+    # 气泡位置动过（滚动/改窗口）也不算「一直挂着」：容差是几个像素，不是几十个
+    reader.seen = [("her", None, "在吗")]
+    reader.prev_voice = [(0, 200, 100, 250, '4"', "her")]
+    assert reader.new_lines(lines) == [], "上一帧在别的位置 = 刚滚出来的"
     # 第四位：贴着气泡的带回那条语音的时长（父进程拿它并成一条），下面那条普通消息是空串
-    reader.seen = []
+    reader.seen, reader.prev_voice = [], []
     assert reader.new_lines([("her", None, "在吗", 130), ("her", None, "刚转出来的", 67)]) == [
         ("her", None, "在吗", ""), ("her", None, "刚转出来的", '4"')]
     # 语音去重：哪些算「新出现的」——父进程拿它往聊天记录里记「🔊 语音消息 N"」。

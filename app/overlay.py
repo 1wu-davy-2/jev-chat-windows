@@ -1605,7 +1605,25 @@ class Overlay:
         box.addLayout(debug_row)
         box.addWidget(self._hint(
             "另开一个窗口实时显示截到的画面和识别框：绿 = 我、蓝 = 对方、灰 = 过滤掉的灰字、"
-            "红 = 当成图片丢掉、黄 = 小字丢掉、紫 = 语音消息丢掉。只在内存里画，不存图。"
+            "红 = 当成图片丢掉、黄 = 小字丢掉、紫 = 语音消息丢掉、石板 = 印在面板底色上丢掉。"
+            "只在内存里画，不存图。"
+        ))
+        # 自动转文字：对方来语音，程序自己右键那条语音、点「语音转文字」（见 app/voice.py）。
+        # 跟「自动发送」一样是**程序主动去动微信**，所以默认关、要点「保存设置」才生效。
+        # 摆在这一页是因为它跟调试视图、自动发送都是「本机行为」那一类
+        autovoice_row = QHBoxLayout()
+        autovoice_row.addWidget(_label("自动转文字", FONT_MD), 1)
+        self.autoVoiceSwitch = SwitchButton()
+        self.autoVoiceSwitch.setOnText("开")
+        self.autoVoiceSwitch.setOffText("关")
+        self.autoVoiceSwitch.setAccessibleName("自动转文字")
+        autovoice_row.addWidget(self.autoVoiceSwitch)
+        box.addLayout(autovoice_row)
+        box.addWidget(self._hint(
+            "对方来了语音消息就自动替你点一下「转文字」，不用再去候选条上点。只转**对方**的，"
+            "只转刚发来的那条；要微信正开着那个会话、采集没暂停、而且微信本来就在前台"
+            "（后台去点会把焦点抢走），三条都成立才动。点完转出来的字照常进记录、照常触发建议。"
+            "默认关，拨完要点下面的「保存设置」才生效。"
         ))
         # 「绝不自动发送」那条硬约束唯一的例外（见 CLAUDE.md 硬约束 4）。摆在这儿是故意的：
         # 跟调试视图挨着，用户知道自己在拨一个开发用的东西。**要点「保存设置」才生效**——
@@ -1696,7 +1714,7 @@ class Overlay:
         type_row.addWidget(self.relDelButton)
         box.addLayout(type_row)
         box.addWidget(self._hint(
-            "内置这几型（朋友、恋人、暧昧、同事、职场、家人、18+）各有出厂正文，可以随便改；自己新增的"
+            "内置这几型（朋友、恋人、暧昧、同事、职场、家人、撩播、18+、SM、炮友）各有出厂正文，可以随便改；自己新增的"
             "（前女友、老板……）名字和正文都自己写。"))
         self.relNameLabel = _label("这种关系叫什么", FONT_MD)
         box.addWidget(self.relNameLabel)
@@ -2074,6 +2092,7 @@ class Overlay:
         self.updateSwitch.setChecked(settings.check_update())
         # 自动发送没有连 checkedChanged（它按「保存设置」生效），所以不用 blockSignals
         self.autoSendSwitch.setChecked(settings.auto_send())
+        self.autoVoiceSwitch.setChecked(settings.auto_voice())
         self.set_debug_switch(settings.debug_view())  # 屏蔽信号地拨，别在加载时开关一遍窗口
         self.petSwitch.blockSignals(True)  # 同上：加载时别真去开关宠物
         self.petSwitch.setChecked(settings.pet_enabled())
@@ -2163,7 +2182,8 @@ class Overlay:
                           check_update_on=self.updateSwitch.isChecked(),
                           pet_enabled_on=self.petSwitch.isChecked(),
                           chatlog_on=self.chatlogSwitch.isChecked(),
-                          auto_send_on=self.autoSendSwitch.isChecked())
+                          auto_send_on=self.autoSendSwitch.isChecked(),
+                          auto_voice_on=self.autoVoiceSwitch.isChecked())
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return
