@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """浅色置顶回复助手：回复建议和独立设置页。发送始终由用户确认。"""
 import os
+import subprocess
 import sys
 import threading
 from datetime import datetime
@@ -2873,10 +2874,14 @@ class Overlay:
         self.win.hide()
 
     def _build_pet_menu(self):
-        """宠物右键菜单的内容：暂停采集 / 全屏（主页）/ 会话模式 / 生成开场白 / 设置。
+        """宠物右键菜单的内容：暂停采集 / 全屏（主页）/ 会话模式 / 生成开场白 / 设置 /
+        重启助手 / 退出助手。
 
-        五项都只是既有入口的快捷方式，不新增数据流。单独拆成一个方法是为了
+        前五项都只是既有入口的快捷方式，不新增数据流。单独拆成一个方法是为了
         tools/preview_ui.py 能直接摆出来截图——exec() 是嵌套事件循环，截图回调进不去。
+
+        最后那两项（重启 / 退出）是**唯一够得着**的一对：宠物是 Qt.Tool、不进任务栏，
+        也没做托盘图标，面板收起时用户手上只有这个菜单。别挪到面板里就完事。
 
         「会话模式」跟面板里那个按钮一个口径：**写的是现在是什么模式**（跟随/固定），点一下换一种，
         走的是同一个出口（_toggle_pin → 父进程 set_pin）。为什么不在菜单上写「固定会话」这种
@@ -2913,6 +2918,16 @@ class Overlay:
         prefs = Action(FIF.SETTING, "设置", menu)
         prefs.triggered.connect(self.open_settings)
         menu.addAction(prefs)
+        # 退出和重启**只能**在这儿给（2026-10-03 用户报「找不到地方退」）：宠物是 Qt.Tool，
+        # 不进任务栏，托盘里也没有图标，面板收起时屏幕上就这一个能右键的东西。
+        # 面板标题栏那个「退出助手」还在，但面板默认是收着的，等于够不着。
+        menu.addSeparator()
+        again = Action(FIF.SYNC, "重启助手", menu)
+        again.triggered.connect(self._restart)
+        menu.addAction(again)
+        bye = Action(FIF.CLOSE, "退出助手", menu)
+        bye.triggered.connect(self._quit)
+        menu.addAction(bye)
         return menu
 
     def _pet_menu(self, pos):
@@ -2926,12 +2941,45 @@ class Overlay:
             self._back_home()
 
     def _quit(self):
-        """真退出：三个窗口一起收掉。「收起」和「退出」是两回事，别混。"""
+        """真退出：三个窗口一起收掉。「收起」和「退出」是两回事，别混。
+
+        收尾在 main.py 那个 `finally: child.terminate()` 里——采集子进程是 daemon，
+        不显式收掉会留着继续抓屏（黄框也还在）。所以退出**只能**走 app.quit() 这条路，
+        别用 os._exit / 杀进程。"""
         self.hotkeys.unregister_all()
         self.pet.hide()
         self.bar.hide()
         self.win.close()
         self.app.quit()
+
+    def _restart(self):
+        """重启：先把新的一份拉起来，再把当前这份收掉。
+
+        顺序不能反：先退再拉的话中间那几秒桌面上什么都没有，而且新进程一起来就要抢
+        WGC 会话，老的那份还没走干净。反过来老的最后走，`_quit()` 里那套收尾照旧。
+
+        **只从 exe / python.exe 重新拉，不带着自己的参数**：打包版 `sys.executable`
+        就是 exe 本身；源码跑是 python.exe，得把 main.py 补上（`sys.argv[0]` 可能是相对路径，
+        所以取绝对路径——新进程的工作目录未必是这个）。工作目录跟着**程序**走：
+        打包版是 exe 那个文件夹，源码版是 main.py 那个文件夹——不是 python.exe 待的
+        `.venv\\Scripts`，那样新进程起来是在一个莫名其妙的地方。"""
+        if getattr(sys, "frozen", False):
+            cmd, cwd = [sys.executable], os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            script = os.path.abspath(sys.argv[0])
+            if not os.path.isfile(script):
+                # 源码版靠 argv[0] 找回 main.py；它要不是个真文件（IDE 里用 -c 起的之类），
+                # 拉起来的就是个莫名其妙的东西——宁可说一句「没重启成」，别乱拉
+                self.set_status("重启失败：找不到 main.py，请手动重开", "warning")
+                return
+            cmd, cwd = [sys.executable, script], os.path.dirname(script)
+        try:
+            subprocess.Popen(cmd, cwd=cwd, close_fds=True)
+        except OSError as e:
+            # 起不来就别退：退了这个提示也没人看得见，用户只会发现「点了重启，程序没了」
+            self.set_status(f"重启失败：{' '.join(str(e).split())[:120]}", "warning")
+            return
+        self._quit()
 
     def _place_panel(self):
         """把面板摆在宠物旁边：优先左边，放不下就右边，最后夹到屏幕内。"""

@@ -421,10 +421,19 @@ join 出来的碎片反而难读；加字段就往 `_COLUMNS` 里加一条，**�
 | 候选条 | `app/overlay.py:_CandidateBar` | 280px，贴宠物上方（放不下翻下方） |
 | 面板 | `app/overlay.py:_MainWindow` | 就是原来那个悬浮窗，默认收起 |
 
-宠物右键菜单（`Overlay._build_pet_menu()`，五项：暂停采集 / 全屏（主页）/ 会话模式 / 生成开场白 /
-设置）里，「暂停采集」**不是**直接调 `on_toggle_capture`，而是 `captureSwitch.setChecked(...)`
-让信号走一遍 `checkedChanged → _capture_toggled`——直接调回调的话开关自己还停在旧状态，
-两边就各说各话了。
+宠物右键菜单（`Overlay._build_pet_menu()`，七项：暂停采集 / 全屏（主页）/ 会话模式 / 生成开场白 /
+设置 / 重启助手 / 退出助手）里，「暂停采集」**不是**直接调 `on_toggle_capture`，而是
+`captureSwitch.setChecked(...)` 让信号走一遍 `checkedChanged → _capture_toggled`
+——直接调回调的话开关自己还停在旧状态，两边就各说各话了。
+
+**「重启助手」「退出助手」是唯一够得着的一对，别挪走**（2026-10-03 用户报「找不到地方退」）：
+宠物是 `Qt.Tool`、不进任务栏，也没做托盘图标，面板默认又是收着的——屏幕上能右键的东西
+就宠物一个，这两项不在菜单里用户就只能去任务管理器。面板标题栏那个「退出助手」留着，
+但它够不着。重启走 `_restart()`：**先 Popen 新的一份、再 `_quit()`**（反过来的话中间几秒
+桌面上什么都没有），打包版 `sys.executable` 就是 exe、源码版补上绝对路径的 `main.py`，
+工作目录跟着程序走而不是跟着 `python.exe` 待的 `.venv\Scripts`。退出**只能**走 `app.quit()`：
+采集子进程是 daemon，收尾在 `main.py` 那个 `finally: child.terminate()` 里，
+`os._exit` / 杀进程会把它留成孤儿继续抓屏（黄框也还在）。
 
 另两项都只是既有入口的快捷方式，不新增数据流：**会话模式**跟面板里那个按钮是同一个出口
 （`_toggle_pin` → 父进程 `set_pin`），文字也跟它同一个口径——写的是**现在是什么模式**
